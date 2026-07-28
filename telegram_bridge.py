@@ -1117,11 +1117,10 @@ def _assemble(prompt_file, question=None, include_history=True,
     if notes:
         parts.append("\nNOTES YOU'VE SHARED (durable context the user logged):\n"
                      + notes + "\n")
-    if include_history:
-        hist = recent_history_text()
-        if hist:
-            parts.append("\nRECENT CONVERSATION (context, oldest to newest):\n"
-                         + hist + "\n")
+    hist = recent_history_text() if include_history else ""
+    if hist and question is None:
+        parts.append("\nRECENT CONVERSATION (context, oldest to newest):\n"
+                     + hist + "\n")
     fit = load_fitness_profile()
     if isinstance(fit, dict):
         fit_view = {k: v for k, v in fit.items() if k != "generated_at"}
@@ -1132,6 +1131,11 @@ def _assemble(prompt_file, question=None, include_history=True,
     parts.append("\nPROFILE:\n" + read_file(PROFILE_FILE))
     parts.append("\n\n" + data_key + ":\n" + js)
     parts.append("\n\n" + DATA_USE_DIRECTIVE)
+    if hist and question is not None:
+        # Keep the immediate exchange adjacent to the question. Large profile/Garmin
+        # payloads otherwise make the model under-weight advice it gave minutes ago.
+        parts.append("\n\nRECENT CONVERSATION (context, oldest to newest):\n"
+                     + hist + "\n")
     if question is not None:
         parts.append("\n\nQUESTION:\n" + question)
     return "".join(parts), data
