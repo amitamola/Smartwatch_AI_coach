@@ -401,6 +401,36 @@ def _harvest_plan(text):
     return text
 
 
+_EXPLAN_MARKER_RE = re.compile(r"\[\[EXERCISE_PLAN:\s*(.*?)\]\]", re.IGNORECASE | re.DOTALL)
+
+
+def _extract_exercise_plan_marker(text):
+    """Pull a model-emitted [[EXERCISE_PLAN: ...]] marker off a reply. The prompts append it
+    when the user STATES what they intend to do about exercise today - including a tentative
+    'planning to rest but might bike later, will see'. Returns (clean_text, plan_or_None)."""
+    if not text:
+        return text, None
+    plans = _EXPLAN_MARKER_RE.findall(text)
+    if not plans:
+        return text, None
+    clean = _EXPLAN_MARKER_RE.sub("", text).rstrip()
+    plan = " ".join(" ".join(plans).split()).strip()
+    return clean, (plan or None)
+
+
+def _harvest_exercise_plan(text):
+    """Mark today's exercise intent as STATED once the user has told the coach their plan, so
+    the adherence check-ins stop asking something already answered in chat. Deliberately does
+    NOT clear the pending auto-debrief: a tentative plan ('might ride this evening') may still
+    become a real session, and that session should still get its wrap-up. Only upgrades from
+    'pending' so a later done/skip is never overwritten. Returns the cleaned reply text."""
+    text, plan = _extract_exercise_plan_marker(text)
+    if plan and _exercise_status() == "pending":
+        _set_exercise_status("stated")
+        log.info("Exercise intent stated - check-ins off for today: %s", plan[:120])
+    return text
+
+
 def recent_journal_text():
     try:
         with open(JOURNAL_FILE, "r", encoding="utf-8") as fh:
@@ -1165,6 +1195,7 @@ def generate_qa(question):
             append_journal(logged)  # auto-log any meal the user reported, not just 'log:'-prefixed
             text = text + "\n\n\U0001F37D\uFE0F logged \u2713"
         text = _harvest_plan(text)  # persist any multi-day training plan this answer commits to
+        text = _harvest_exercise_plan(text)  # they told me today's plan -> stop the check-ins
         append_history("user", question)
         append_history("agbot", text)
     if _is_workout_review(question):
@@ -1231,6 +1262,7 @@ def generate_images(image_paths, caption, extra=None, media_label="photo"):
         if logged:
             text = text + "\n\n\U0001F37D\uFE0F logged \u2713"
         text = _harvest_plan(text)  # persist any multi-day training plan this answer commits to
+        text = _harvest_exercise_plan(text)  # they told me today's plan -> stop the check-ins
         plural = "s" if n != 1 else ""
         label = caption or ("[shared " + str(n) + " " + media_label + plural + "]")
         append_history("user", label + " [" + media_label + plural + "]")
@@ -2130,8 +2162,9 @@ def maybe_movement_reminders():
 
 # ---- Daily exercise-adherence check-ins -------------------------------------------------
 # Ask a few times a day whether the recommended exercise got done. Fires ONLY while today is
-# unresolved; once the user replies DWRE (done -> summary) or that they're skipping/resting,
-# the check-ins stop for the day. Absence of a done/skip marker = 'pending'.
+# unresolved; once the user replies DWRE (done -> summary), says they're skipping/resting, or
+# simply TELLS the coach in chat what today's plan is ('stated'), the check-ins stop for the
+# day. Absence of any of those = 'pending'.
 EXERCISE_CHECKIN_HOURS = (12, 16, 21)
 EXERCISE_CHECKIN_CATCHUP_MIN = 55
 
@@ -2225,8 +2258,8 @@ def maybe_exercise_checkins():
     if not own:
         return
     st = _load_exercise_state()
-    if st.get("status") in ("done", "skip"):
-        return  # resolved for today - stop asking
+    if st.get("status") in ("done", "skip", "stated"):
+        return  # resolved for today (finished, opted out, or they've told me their plan)
     now = datetime.now()
     asked = list(st.get("asked") or [])
     # The coach itself prescribed rest today -> send ONE gentle rest-aware note (not the
