@@ -1117,11 +1117,7 @@ def _assemble(prompt_file, question=None, include_history=True,
     if notes:
         parts.append("\nNOTES YOU'VE SHARED (durable context the user logged):\n"
                      + notes + "\n")
-    if include_history:
-        hist = recent_history_text()
-        if hist:
-            parts.append("\nRECENT CONVERSATION (context, oldest to newest):\n"
-                         + hist + "\n")
+    hist = recent_history_text() if include_history else ""
     fit = load_fitness_profile()
     if isinstance(fit, dict):
         fit_view = {k: v for k, v in fit.items() if k != "generated_at"}
@@ -1131,6 +1127,12 @@ def _assemble(prompt_file, question=None, include_history=True,
                          + json.dumps(fit_view, indent=2, default=str) + "\n")
     parts.append("\nPROFILE:\n" + read_file(PROFILE_FILE))
     parts.append("\n\n" + data_key + ":\n" + js)
+    if hist:
+        # Sits after the bulky profile/Garmin payload so recent turns stay near the
+        # question, but BEFORE the directive - standing rules must remain the last
+        # instruction the model reads.
+        parts.append("\n\nRECENT CONVERSATION (context, oldest to newest):\n"
+                     + hist + "\n")
     parts.append("\n\n" + DATA_USE_DIRECTIVE)
     if question is not None:
         parts.append("\n\nQUESTION:\n" + question)
