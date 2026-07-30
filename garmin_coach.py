@@ -920,8 +920,14 @@ def recent_inactivity(now_utc=None):
     has been CONTINUOUSLY sedentary up to the most recent synced bucket. Lets the bridge send
     a 'get up and move' nudge ONLY when recent inactivity is confirmed (fail-closed - returns
     None on any error so the caller stays quiet). Bucket timestamps are GMT/UTC ('endGMT'),
-    compared against UTC now. Returns {data_age_min, sedentary_run_min, last_hour_steps,
-    last_level} or None."""
+    compared against UTC now.
+
+    Step buckets alone are NOT enough: Garmin derives primaryActivityLevel largely from step
+    count, so step-less work - cycling, e-bike commuting, rowing, lifting - lands in buckets
+    labelled 'sedentary' even though the user was moving hard. The intraday feed also lags a
+    sync behind. So today's ACTIVITIES are read too, and the sedentary run is never allowed to
+    reach back past the end of the last one. Returns {data_age_min, sedentary_run_min,
+    last_hour_steps, last_level, since_activity_min} or None."""
     try:
         g = client()
     except Exception:  # noqa: BLE001
@@ -951,12 +957,39 @@ def recent_inactivity(now_utc=None):
             break
     hour_cutoff = last_end - timedelta(minutes=60)
     last_hour_steps = sum((b.get("steps") or 0) for _end, b in parsed if _end > hour_cutoff)
+    since_activity_min = _minutes_since_last_activity(g, now_utc, local_today)
+    if since_activity_min is not None:
+        # Can't have been sitting longer than the time since the last workout/commute ended.
+        run_min = min(run_min, since_activity_min)
     return {
         "data_age_min": data_age_min,
         "sedentary_run_min": run_min,
         "last_hour_steps": last_hour_steps,
         "last_level": last_b.get("primaryActivityLevel"),
+        "since_activity_min": since_activity_min,
     }
+
+
+def _minutes_since_last_activity(g, now_utc, local_today):
+    """Minutes since the END of the most recent activity that STARTED today, or None when
+    there is none (or the lookup fails). Used to stop the movement nudge treating a
+    step-less workout - an e-bike commute, a ride, a lifting session - as sitting still."""
+    acts = safe(lambda: g.get_activities(0, 8))
+    if not isinstance(acts, list):
+        return None
+    latest_end = None
+    for a in acts:
+        if str(a.get("startTimeLocal") or "")[:10] != local_today:
+            continue
+        start = _parse_local_epoch(a.get("startTimeLocal"))
+        if start is None:
+            continue
+        end = start + (a.get("duration") or 0)
+        if latest_end is None or end > latest_end:
+            latest_end = end
+    if latest_end is None:
+        return None
+    return max(0, round((now_utc.timestamp() - latest_end) / 60))
 
 
 def _parse_local_epoch(s):

@@ -134,6 +134,9 @@ MOVEMENT_EVERY_H = 2
 MOVEMENT_CATCHUP_MIN = 45
 MOVEMENT_SEDENTARY_MIN = 50    # need at least this many trailing sedentary minutes to nudge
 MOVEMENT_STALE_MAX_MIN = 60    # skip if the latest intraday bucket is older than this (unconfirmed)
+MOVEMENT_POST_ACTIVITY_MIN = 60  # stay quiet this long after a logged workout/commute ends -
+                                 # step-less efforts (e-bike, cycling, lifting) look 'sedentary'
+                                 # in Garmin's step buckets, so never nudge straight after one
 MOVEMENT_MESSAGES = (
     "\U0001FA91 AgBot \u00B7 Move break - you've been sitting {mins}. Stand up, roll the "
     "shoulders and take a 2-3 min walk (kettle, stairs, a lap). Your back and energy will "
@@ -2156,6 +2159,10 @@ def maybe_movement_reminders():
             log.info("Movement %s skipped - data stale (%s min old)", slot, info.get("data_age_min"))
         elif info.get("last_level") == "sleeping":
             log.info("Movement %s skipped - resting/napping", slot)
+        elif (info.get("since_activity_min") is not None
+              and info["since_activity_min"] < MOVEMENT_POST_ACTIVITY_MIN):
+            log.info("Movement %s skipped - workout/commute ended %s min ago", slot,
+                     info.get("since_activity_min"))
         elif (info.get("sedentary_run_min") or 0) < MOVEMENT_SEDENTARY_MIN:
             log.info("Movement %s skipped - not sedentary (run=%s min)", slot,
                      info.get("sedentary_run_min"))
