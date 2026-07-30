@@ -387,6 +387,48 @@ def _logged_confirmation(on_date=None):
     return base + " \u00B7 " + label
 
 
+# When the machine sleeps or drops off the network, Telegram holds the backlog and replays it
+# on reconnect - so a photo sent at 23:57 can arrive hours later, the NEXT day. Processing
+# time is therefore not when the user ate. We remember when the message being handled was
+# actually SENT (Telegram's 'date' field) and treat that, not the wall clock, as "when".
+# The poll loop is single-threaded, so one module-level value is safe.
+_MSG_SENT_AT = None
+
+
+def _set_msg_sent_at(ts):
+    """Record the send time (unix seconds) of the message about to be handled."""
+    global _MSG_SENT_AT
+    try:
+        _MSG_SENT_AT = datetime.fromtimestamp(ts) if ts else None
+    except (TypeError, ValueError, OSError):
+        _MSG_SENT_AT = None
+
+
+def _sent_backdate():
+    """'YYYY-MM-DD' when the current message was SENT on an earlier day than today - i.e. it
+    was delivered late - else None. Used to file its food on the day it was actually eaten."""
+    if not _MSG_SENT_AT:
+        return None
+    d = _MSG_SENT_AT.date()
+    return d.isoformat() if d < date.today() else None
+
+
+def _delayed_message_note():
+    """A prompt block warning the model that this message is arriving late, so 'today',
+    'tonight' and 'just had' inside it refer to the day it was SENT, not to now."""
+    back = _sent_backdate()
+    if not back:
+        return None
+    tag = _day_tag(back) or back
+    return ("\nDELAYED MESSAGE - READ THIS FIRST: the message below was SENT at "
+            + _MSG_SENT_AT.strftime("%Y-%m-%d %H:%M") + " (" + tag + ") and only reached "
+            "you now, because the bot was offline in between. Interpret EVERY time word in "
+            "it - 'today', 'tonight', 'this evening', 'just had' - RELATIVE TO WHEN IT WAS "
+            "SENT, not to TODAY. Any food in it was eaten on " + back + ", so date the log "
+            "marker `[[LOG " + back + ": ...]]` and do the calorie/protein maths against "
+            "THAT day. Say which day you've credited it to.\n")
+
+
 _REST_MARKER_RE = re.compile(r"\[\[REST_DAY\]\]", re.IGNORECASE)
 
 
@@ -1164,6 +1206,9 @@ def _assemble(prompt_file, question=None, include_history=True,
         read_file(prompt_file),
         "\n\n---\nTODAY: " + today_human() + " (" + date.today().isoformat() + ")\n",
     ]
+    delayed = _delayed_message_note()
+    if delayed:
+        parts.append(delayed)
     if USER_NAME:
         parts.append("\nUSER: the person you are coaching is named " + USER_NAME
                      + " - you may address them by their first name.\n")
@@ -1229,6 +1274,7 @@ def generate_qa(question):
     if text:
         text, logged, log_date = _extract_log_marker(text)
         if logged:
+            log_date = log_date or _sent_backdate()  # late-delivered message -> its own day
             append_journal(logged, on_date=log_date)  # auto-log any meal the user reported, not just 'log:'-prefixed
             text = text + _logged_confirmation(log_date)
         text = _harvest_plan(text)  # persist any multi-day training plan this answer commits to
@@ -1287,6 +1333,7 @@ def generate_images(image_paths, caption, extra=None, media_label="photo"):
     text = run_llm(prompt, images=image_paths)
     if text:
         text, marker_note, log_date = _extract_log_marker(text)
+        log_date = log_date or _sent_backdate()  # late-delivered message -> its own day
         cap_low = (caption or "").strip().lower()
         explicit_log = cap_low.startswith("log:") or cap_low.startswith("log ")
         logged = False
@@ -1815,15 +1862,18 @@ ALBUM_DEBOUNCE_SEC = 3.0   # wait this long after the last album part before pro
 _album_buffer = {}  # media_group_id -> {chat_id, file_ids, caption, ts}
 
 
-def _buffer_album(chat_id, gid, file_id, caption):
+def _buffer_album(chat_id, gid, file_id, caption, sent_ts=None):
     grp = _album_buffer.get(gid)
     if grp is None:
-        grp = {"chat_id": chat_id, "file_ids": [], "caption": "", "ts": 0.0}
+        grp = {"chat_id": chat_id, "file_ids": [], "caption": "", "ts": 0.0,
+               "sent_ts": sent_ts}
         _album_buffer[gid] = grp
     if file_id:
         grp["file_ids"].append(file_id)
     if caption and not grp["caption"]:
         grp["caption"] = caption
+    if sent_ts and not grp.get("sent_ts"):
+        grp["sent_ts"] = sent_ts
     grp["ts"] = time.time()
 
 
@@ -1840,6 +1890,7 @@ def flush_ready_albums():
             continue
         log.info("Album %s complete: %d photos", gid, len(grp["file_ids"]))
         try:
+            _set_msg_sent_at(grp.get("sent_ts"))  # album may also have arrived late
             do_images(grp["chat_id"], grp["file_ids"], grp["caption"])
         except Exception as exc:  # noqa: BLE001
             log.exception("album handler error: %s", exc)
@@ -1852,10 +1903,16 @@ def dispatch(msg):
         return
     if not _owner_ok(chat_id):
         return
+    _set_msg_sent_at(msg.get("date"))
+    back = _sent_backdate()
+    if back:
+        log.info("Message delivered late - sent %s, treating its 'today' as %s",
+                 _MSG_SENT_AT.strftime("%Y-%m-%d %H:%M"), back)
     gid = msg.get("media_group_id")
     photo_fid = _photo_file_id(msg)
     if gid and photo_fid:  # one item of a photo album - buffer, handle as a set
-        _buffer_album(chat_id, gid, photo_fid, (msg.get("caption") or "").strip())
+        _buffer_album(chat_id, gid, photo_fid, (msg.get("caption") or "").strip(),
+                      sent_ts=msg.get("date"))
         return
     if _video_file(msg):
         log.info("Message kind=video")
