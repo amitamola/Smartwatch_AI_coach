@@ -86,6 +86,15 @@ VERY LAST line of your reply, a machine marker on its own line:
 
 `[[LOG: <exactly what they consumed, with a rough kcal & protein estimate if you can>]]`
 
+- **Back-date a meal reported late.** If what they describe was eaten on an EARLIER day
+  (e.g. "last night's dinner" sent the next morning, "I forgot to log yesterday's lunch",
+  "this was from Tuesday"), put that date in the marker:
+  `[[LOG 2026-07-29: <what they ate>]]` - use TODAY (given above) to work out the actual
+  date. Without a date it lands on today and wrongly inflates today's tally. Only date it
+  when they clearly mean an earlier day; a meal just eaten needs no date. Never use a future
+  date. When you back-date, ALSO base your calorie/protein maths on THAT day, not today -
+  and say which day you've credited it to.
+
 - Emit it ONLY for food/drink they actually consumed (or are clearly logging as eaten).
   Do NOT emit it when they are merely ASKING about food not eaten yet ("should I eat
   this?", "which is better?", "what should I have for dinner?") - there is nothing to log.

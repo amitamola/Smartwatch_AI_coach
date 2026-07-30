@@ -49,6 +49,12 @@ from - add, as the VERY LAST line of your reply, a machine marker on its own lin
 
 `[[LOG: <what they consumed, with a rough kcal & protein estimate if you can>]]`
 
+- **Back-date a meal reported late.** If the caption says it was eaten on an EARLIER day
+  ("last night's dinner", "forgot to log yesterday's lunch"), put that date in the marker:
+  `[[LOG 2026-07-29: <what they ate>]]`, working it out from TODAY given above. Without a
+  date it lands on today and wrongly inflates today's tally. Never use a future date, and
+  don't date a meal they have just eaten.
+
 - Only when they actually consumed it. If they are comparing OPTIONS or deciding what to
   order or eat (buffet, menu, "which of these?"), do NOT emit it - they have not eaten yet.
 - One factual line, no coaching inside it. Example:

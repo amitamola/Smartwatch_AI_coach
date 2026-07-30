@@ -332,8 +332,11 @@ def recent_history_text():
     return text
 
 
-def append_journal(text):
-    entry = {"date": date.today().isoformat(), "text": text.strip(),
+def append_journal(text, on_date=None):
+    """Journal a durable note. `on_date` ('YYYY-MM-DD') back-dates the entry - used when the
+    user reports a meal from an earlier day ('last night's dinner', shared the morning after).
+    Defaults to today. The stored `ts` always stays the real capture time."""
+    entry = {"date": on_date or date.today().isoformat(), "text": text.strip(),
              "ts": datetime.now().isoformat(timespec="seconds")}
     try:
         with open(JOURNAL_FILE, "a", encoding="utf-8") as fh:
@@ -342,7 +345,8 @@ def append_journal(text):
         log.error("journal save failed: %s", exc)
 
 
-_LOG_MARKER_RE = re.compile(r"\[\[LOG:\s*(.*?)\]\]", re.IGNORECASE | re.DOTALL)
+_LOG_MARKER_RE = re.compile(r"\[\[LOG(?:\s+(\d{4}-\d{2}-\d{2}))?:\s*(.*?)\]\]",
+                            re.IGNORECASE | re.DOTALL)
 
 
 def _extract_log_marker(text):
@@ -350,18 +354,37 @@ def _extract_log_marker(text):
 
     The qa / image prompts tell the model to append this marker whenever the user
     REPORTS actually eating or drinking something (any phrasing - no 'log:' prefix
-    needed). We strip it from the reply the user sees and return the note so the
-    bridge can journal it. Returns (clean_text, note_or_None); note is None when
-    there's nothing to log.
+    needed). An optional date - [[LOG 2026-07-29: ...]] - back-dates the entry to the
+    day it was actually eaten, so a dinner reported the next morning doesn't land on
+    today's tally. We strip it from the reply the user sees and return the note so the
+    bridge can journal it. Returns (clean_text, note_or_None, on_date_or_None).
     """
     if not text:
-        return text, None
-    notes = _LOG_MARKER_RE.findall(text)
-    if not notes:
-        return text, None
+        return text, None, None
+    found = _LOG_MARKER_RE.findall(text)
+    if not found:
+        return text, None, None
     clean = _LOG_MARKER_RE.sub("", text).rstrip()
-    note = " ".join(" ".join(notes).split()).strip()
-    return clean, (note or None)
+    note = " ".join(" ".join(n for _d, n in found).split()).strip()
+    on_date = next((d for d, _n in found if d), None)
+    if on_date and on_date > date.today().isoformat():
+        on_date = None  # never accept a future date
+    return clean, (note or None), on_date
+
+
+def _logged_confirmation(on_date=None):
+    """The 'logged' line appended after a meal is saved. Names the day whenever the entry
+    was back-dated, so it's obvious it did NOT land on today's tally."""
+    base = "\n\n\U0001F37D\uFE0F logged \u2713"
+    today = date.today().isoformat()
+    if not on_date or on_date == today:
+        return base
+    try:
+        d = date.fromisoformat(on_date)
+    except ValueError:
+        return base
+    label = "yesterday" if (date.today() - d).days == 1 else d.strftime("%a %d %b")
+    return base + " \u00B7 " + label
 
 
 _REST_MARKER_RE = re.compile(r"\[\[REST_DAY\]\]", re.IGNORECASE)
@@ -1204,10 +1227,10 @@ def generate_qa(question):
         return None, snap
     text = run_llm(prompt)
     if text:
-        text, logged = _extract_log_marker(text)
+        text, logged, log_date = _extract_log_marker(text)
         if logged:
-            append_journal(logged)  # auto-log any meal the user reported, not just 'log:'-prefixed
-            text = text + "\n\n\U0001F37D\uFE0F logged \u2713"
+            append_journal(logged, on_date=log_date)  # auto-log any meal the user reported, not just 'log:'-prefixed
+            text = text + _logged_confirmation(log_date)
         text = _harvest_plan(text)  # persist any multi-day training plan this answer commits to
         text = _harvest_exercise_plan(text)  # they told me today's plan -> stop the check-ins
         append_history("user", question)
@@ -1217,7 +1240,7 @@ def generate_qa(question):
     return text, snap
 
 
-def _journal_shared_media(caption, analysis, n, media_label):
+def _journal_shared_media(caption, analysis, n, media_label, on_date=None):
     """Record an EXPLICITLY LOGGED meal/note in the DATED journal. Only fires when
     the caption starts with 'log:' / 'log ' - i.e. the user is telling me they ATE (or did)
     something, not just asking about it. Photos they only ask about ('should I eat
@@ -1242,7 +1265,7 @@ def _journal_shared_media(caption, analysis, n, media_label):
     parts.append("(via " + media + "):")
     if summary:
         parts.append(summary)
-    append_journal(" ".join(parts).strip())
+    append_journal(" ".join(parts).strip(), on_date=on_date)
 
 
 def generate_images(image_paths, caption, extra=None, media_label="photo"):
@@ -1263,18 +1286,18 @@ def generate_images(image_paths, caption, extra=None, media_label="photo"):
         prompt += "\n\n" + extra
     text = run_llm(prompt, images=image_paths)
     if text:
-        text, marker_note = _extract_log_marker(text)
+        text, marker_note, log_date = _extract_log_marker(text)
         cap_low = (caption or "").strip().lower()
         explicit_log = cap_low.startswith("log:") or cap_low.startswith("log ")
         logged = False
         if explicit_log:
-            _journal_shared_media(caption, text, n, media_label)  # keep the richer log: summary
+            _journal_shared_media(caption, text, n, media_label, on_date=log_date)  # keep the richer log: summary
             logged = True
         elif marker_note:
-            append_journal(marker_note)  # model spotted a meal the user reported without a 'log:' prefix
+            append_journal(marker_note, on_date=log_date)  # model spotted a meal the user reported without a 'log:' prefix
             logged = True
         if logged:
-            text = text + "\n\n\U0001F37D\uFE0F logged \u2713"
+            text = text + _logged_confirmation(log_date)
         text = _harvest_plan(text)  # persist any multi-day training plan this answer commits to
         text = _harvest_exercise_plan(text)  # they told me today's plan -> stop the check-ins
         plural = "s" if n != 1 else ""
