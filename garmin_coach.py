@@ -767,6 +767,13 @@ def build_snapshot(d_today=None):
             _deficit = min(_band_deficit, _deficit_cap)
             # Never prescribe below BMR or a hard 1500 floor - no crash dieting (profile rule).
             _target = max(round(_maint - _deficit), round(_bmr), 1500)
+            # Protein: in a deficit + resistance training, protein is what decides whether the
+            # weight lost is fat or muscle, so it is anchored to bodyweight rather than left to
+            # the model to improvise. 2.2 g/kg == the "1 g per POUND" figure - the top of the
+            # evidence-based range for a lifter cutting; 1.8 g/kg is the floor to stay above.
+            _protein_target = round(2.2 * _wt_kg)
+            _protein_floor = round(1.8 * _wt_kg)
+            _protein_kcal = _protein_target * 4
             calorie_budget = {
                 "weight_kg": round(_wt_kg, 1),
                 "height_cm": round(_ht_cm),
@@ -779,6 +786,12 @@ def build_snapshot(d_today=None):
                 "deficit_kcal": _deficit,
                 "deficit_cap_kcal": _deficit_cap,
                 "target_kcal": _target,
+                "protein_target_g": _protein_target,
+                "protein_floor_g": _protein_floor,
+                "protein_kcal": _protein_kcal,
+                "protein_basis": "2.2 g/kg bodyweight (= ~1 g per pound), floor 1.8 g/kg - the "
+                                 "muscle-sparing range for training in a calorie deficit; "
+                                 "recompute from weight, never quote a fixed number.",
                 "basis": "Mifflin-St Jeor BMR x activity factor, minus a fat-loss deficit "
                          "(BMI-scaled, then capped at ~0.5% bodyweight/week to preserve muscle); "
                          "food is logged in the bot (not Garmin), so subtract logged intake "
@@ -920,8 +933,14 @@ def recent_inactivity(now_utc=None):
     has been CONTINUOUSLY sedentary up to the most recent synced bucket. Lets the bridge send
     a 'get up and move' nudge ONLY when recent inactivity is confirmed (fail-closed - returns
     None on any error so the caller stays quiet). Bucket timestamps are GMT/UTC ('endGMT'),
-    compared against UTC now. Returns {data_age_min, sedentary_run_min, last_hour_steps,
-    last_level} or None."""
+    compared against UTC now.
+
+    Step buckets alone are NOT enough: Garmin derives primaryActivityLevel largely from step
+    count, so step-less work - cycling, e-bike commuting, rowing, lifting - lands in buckets
+    labelled 'sedentary' even though the user was moving hard. The intraday feed also lags a
+    sync behind. So today's ACTIVITIES are read too, and the sedentary run is never allowed to
+    reach back past the end of the last one. Returns {data_age_min, sedentary_run_min,
+    last_hour_steps, last_level, since_activity_min} or None."""
     try:
         g = client()
     except Exception:  # noqa: BLE001
@@ -951,12 +970,39 @@ def recent_inactivity(now_utc=None):
             break
     hour_cutoff = last_end - timedelta(minutes=60)
     last_hour_steps = sum((b.get("steps") or 0) for _end, b in parsed if _end > hour_cutoff)
+    since_activity_min = _minutes_since_last_activity(g, now_utc, local_today)
+    if since_activity_min is not None:
+        # Can't have been sitting longer than the time since the last workout/commute ended.
+        run_min = min(run_min, since_activity_min)
     return {
         "data_age_min": data_age_min,
         "sedentary_run_min": run_min,
         "last_hour_steps": last_hour_steps,
         "last_level": last_b.get("primaryActivityLevel"),
+        "since_activity_min": since_activity_min,
     }
+
+
+def _minutes_since_last_activity(g, now_utc, local_today):
+    """Minutes since the END of the most recent activity that STARTED today, or None when
+    there is none (or the lookup fails). Used to stop the movement nudge treating a
+    step-less workout - an e-bike commute, a ride, a lifting session - as sitting still."""
+    acts = safe(lambda: g.get_activities(0, 8))
+    if not isinstance(acts, list):
+        return None
+    latest_end = None
+    for a in acts:
+        if str(a.get("startTimeLocal") or "")[:10] != local_today:
+            continue
+        start = _parse_local_epoch(a.get("startTimeLocal"))
+        if start is None:
+            continue
+        end = start + (a.get("duration") or 0)
+        if latest_end is None or end > latest_end:
+            latest_end = end
+    if latest_end is None:
+        return None
+    return max(0, round((now_utc.timestamp() - latest_end) / 60))
 
 
 def _parse_local_epoch(s):

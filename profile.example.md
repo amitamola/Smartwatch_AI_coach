@@ -10,6 +10,13 @@ you ("AgBot: add that I tweaked my knee")._
 
 ## Goals
 - **Primary:** _e.g. reduce body fat while building lean muscle (body recomposition)._
+- **Protein is the priority macro:** target = `calorie_budget.protein_target_g` (2.2 g/kg ≈ 1 g
+  per pound), never below `protein_floor_g` (1.8 g/kg). These recompute from current weight —
+  always quote them from the snapshot rather than a fixed remembered number. If something has to
+  give on a day, drop carbs or fat, not protein.
+- **Judge muscle retention by strength, not the scale:** _most scales report weight only
+  (`body_fat_pct` null), so use `logged_sets` progression as the proxy — load/reps climbing while
+  weight falls means recomposition is working._
 - **Secondary:** _e.g. progress cardio fitness — build, don't just maintain: raise VO2max
   and move Garmin Training Status toward Productive (not stuck at Maintaining)._
 - **Weight tracking:** _e.g. I weigh in every morning under the same conditions (fasted), so my
