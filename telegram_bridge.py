@@ -595,13 +595,40 @@ def resolve_health():
     return [(e.get("text") or "").strip() for e in cleared]
 
 
+_HEALTH_NEG_RE = re.compile(
+    r"\b(?:no|not|n'?t|never|without|zero)\s+\w*\s*"
+    r"(?:pain|sore\w*|hurt\w*|ach\w*|injur\w*|niggl\w*|stiff\w*|cramp\w*|tight\w*|sprain\w*)"
+    r"|\b(?:pain|ache)[- ]?free\b"
+    r"|\b(?:all (?:good|fine|better|clear|healed)|absolutely (?:fine|good)|"
+    r"feeling (?:good|fine|great|better)|no longer (?:hurt\w*|sore)|fully recovered|"
+    r"back to normal|0\s*/\s*10|0 pain|zero pain)\b",
+    re.IGNORECASE)
+
+_HEALTH_PAST_RE = re.compile(
+    r"\b(?:previous\w*|used to|in the past|usually|history of|tend to|tends to|"
+    r"prone to|old injur\w*|past injur\w*)\b", re.IGNORECASE)
+
+
 def _health_snippet(probe):
-    """Keep only the clause(s) that actually mention the symptom, so a long
-    multi-topic message isn't stored verbatim as a 'flag'."""
+    """Keep only the clause(s) that genuinely report a CURRENT symptom, so a long multi-topic
+    message isn't stored verbatim as a 'flag'. Drops fragments that are negated ('no pain',
+    'knee's fine'), a question ('is that fine or hurts my nutrition?'), or about a PAST/general
+    tendency ('my previous injuries') - these were the false positives that piled up. Returns ''
+    when nothing genuine remains, which tells the caller not to capture anything."""
     frags = re.split(r"(?<=[.!?])\s+|\n+", probe)
-    hits = [f.strip(" -\u2022\t") for f in frags if f.strip() and HEALTH_RE.search(f)]
-    snip = "; ".join(hits) if hits else probe
-    snip = re.sub(r"\s+", " ", snip).strip()
+    hits = []
+    for f in frags:
+        f = f.strip(" -\u2022\t")
+        if not f or not HEALTH_RE.search(f):
+            continue
+        if f.rstrip().endswith("?"):
+            continue  # a question about symptoms is not a report of one
+        if _HEALTH_NEG_RE.search(f):
+            continue  # negated or an all-clear ("no pain", "feeling fine")
+        if _HEALTH_PAST_RE.search(f):
+            continue  # a past/general tendency, not a current injury
+        hits.append(f)
+    snip = re.sub(r"\s+", " ", "; ".join(hits)).strip()
     return snip[:200]
 
 
@@ -616,6 +643,8 @@ def _maybe_capture_health(kind, text, payload):
     if not re.search(r"\b(i|i'?m|ive|i'?ve|my|me)\b", probe.lower()):
         return  # only first-person reports about the user's own state
     snippet = _health_snippet(probe)
+    if not snippet:
+        return  # nothing genuinely reported (negated, a question, or a past tendency)
     for e in _load_health():
         if e.get("status", "active") == "active" and (e.get("text") or "").strip() == snippet:
             return  # already on record
