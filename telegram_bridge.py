@@ -58,6 +58,7 @@ DEBRIEF_PROMPT_FILE = os.path.join(PROMPTS, "debrief_prompt.md")
 PERF_PROMPT_FILE = os.path.join(PROMPTS, "performance_prompt.md")
 JOURNAL_FILE = os.path.join(STATE, "journal.jsonl")
 HEALTH_FILE = os.path.join(STATE, "health.jsonl")
+ANCHOR_FILE = os.path.join(STATE, "anchors.jsonl")
 LAST_ACTIVITY_FILE = os.path.join(STATE, "last_activity_id.txt")
 PENDING_DEBRIEF_FILE = os.path.join(STATE, "pending_debrief.json")
 RED_FLAGS_FILE = os.path.join(STATE, "red_flags_date.txt")
@@ -160,6 +161,8 @@ JOURNAL_PROMPT_CHARS = 6000  # durable notes injected into every prompt (a week+
 JOURNAL_KEEP = 120          # journal lines kept on disk
 HEALTH_ACTIVE_DAYS = 45      # active injury/illness flags injected for up to this long
 HEALTH_PROMPT_CHARS = 800    # char budget for injected health flags
+ANCHOR_KEEP = 24             # capability anchors kept on disk
+ANCHOR_PROMPT_CHARS = 1200   # char budget for injected capability anchors
 ACTIVITY_CHECK_SECS = 300    # how often to poll for a finished workout
 DEBRIEF_QUIET_SECS = 90 * 60  # after the LAST logged activity, wait this long (no new
                               # activity) before the single collective debrief - a session is
@@ -618,6 +621,151 @@ def _maybe_capture_health(kind, text, payload):
             return  # already on record
     append_health(snippet)
     log.info("Captured health flag: %r", snippet[:80])
+
+
+# ---- Model-driven health-flag clearing --------------------------------------------------
+# Regex capture (above) and the exact-keyword "recovered" route are coarse: a natural all-clear
+# like "knees, shoulder and elbow are all fine now" matches neither, so old flags never clear
+# and keep surfacing in every brief. This lets the model resolve flags from ordinary phrasing,
+# and to clear ONE area while leaving others active.
+_HEALTH_CLEAR_RE = re.compile(r"\[\[HEALTH_CLEAR:\s*(.*?)\]\]", re.IGNORECASE | re.DOTALL)
+
+# body-part -> substrings that count as the same area in a stored flag's text, so clearing
+# "elbow" also resolves a flag phrased "triceps tendonitis", etc.
+_PART_SYNONYMS = {
+    "elbow": ("elbow", "tricep", "forearm"),
+    "shoulder": ("shoulder", "delt", "rotator"),
+    "knee": ("knee", "patell"),
+    "back": ("back", "lumbar", "spine"),
+    "hamstring": ("hamstring",),
+    "glute": ("glute",),
+    "quad": ("quad",),
+    "calf": ("calf", "calves"),
+    "hip": ("hip",),
+    "wrist": ("wrist",),
+    "ankle": ("ankle", "achilles"),
+    "neck": ("neck",),
+    "groin": ("groin", "adductor"),
+    "chest": ("chest", "pec"),
+    "bicep": ("bicep",),
+}
+
+
+def _extract_health_clear_marker(text):
+    if not text:
+        return text, None
+    found = _HEALTH_CLEAR_RE.findall(text)
+    if not found:
+        return text, None
+    clean = _HEALTH_CLEAR_RE.sub("", text).rstrip()
+    what = " ".join(" ".join(found).split()).strip().lower()
+    return clean, (what or None)
+
+
+def _harvest_health_clear(text):
+    """Resolve active health flags the model says the user reported better. `all` (or similar)
+    clears everything; otherwise only flags matching a named body area are cleared."""
+    text, what = _extract_health_clear_marker(text)
+    if not what:
+        return text
+    items = _load_health()
+    active = [e for e in items if e.get("status", "active") == "active"]
+    if not active:
+        return text
+    clear_all = any(w in what for w in ("all", "everything", "no injur", "nothing left",
+                                        "no more", "fully recovered", "back to normal"))
+    named = []
+    if not clear_all:
+        for part, syns in _PART_SYNONYMS.items():
+            if part in what:
+                named.extend(syns)
+    cleared = []
+    for e in active:
+        etext = (e.get("text") or "").lower()
+        if clear_all or (named and any(s in etext for s in named)):
+            e["status"] = "resolved"
+            cleared.append(e)
+    if cleared:
+        try:
+            with open(HEALTH_FILE, "w", encoding="utf-8") as fh:
+                for e in items:
+                    fh.write(json.dumps(e, ensure_ascii=False) + "\n")
+            log.info("Health cleared via marker (%r): %d flag(s)", what[:40], len(cleared))
+        except Exception as exc:  # noqa: BLE001
+            log.error("health clear (marker) failed: %s", exc)
+    return text
+
+
+# ---- Durable capability anchors (what the user ACTUALLY performed) -----------------------
+# Garmin indoor rides carry HR only (no power), and a load the user verbally reduced to lives
+# only in the 7-day chat window before scrolling away. So the weights/watts/durations they
+# actually managed are re-injected here, in full, until superseded - the model calibrates to
+# THESE.
+def append_anchor(text):
+    text = (text or "").strip()[:240]
+    if not text:
+        return
+    entry = {"date": date.today().isoformat(), "text": text,
+             "ts": datetime.now().isoformat(timespec="seconds")}
+    try:
+        with open(ANCHOR_FILE, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception as exc:  # noqa: BLE001
+        log.error("anchor save failed: %s", exc)
+
+
+def _load_anchors():
+    try:
+        with open(ANCHOR_FILE, "r", encoding="utf-8") as fh:
+            return [json.loads(ln) for ln in fh if ln.strip()]
+    except FileNotFoundError:
+        return []
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def active_anchors_text():
+    """The most recent capability anchors, oldest-last so a newer line supersedes an older one
+    for the same movement. Injected into every prompt."""
+    items = _load_anchors()[-ANCHOR_KEEP:]
+    if not items:
+        return ""
+    lines = []
+    for e in items:
+        d = e.get("date", "")
+        tag = _day_tag(d)
+        label = d + ((" (" + tag + ")") if tag else "")
+        lines.append((label + ": " + (e.get("text") or "")).strip())
+    text = "\n".join(lines)
+    if len(text) > ANCHOR_PROMPT_CHARS:
+        text = "..." + text[-ANCHOR_PROMPT_CHARS:]
+    return text
+
+
+_ANCHOR_MARKER_RE = re.compile(r"\[\[ANCHOR:\s*(.*?)\]\]", re.IGNORECASE | re.DOTALL)
+
+
+def _extract_anchor_marker(text):
+    if not text:
+        return text, None
+    found = _ANCHOR_MARKER_RE.findall(text)
+    if not found:
+        return text, None
+    clean = _ANCHOR_MARKER_RE.sub("", text).rstrip()
+    note = " ".join(" ".join(found).split()).strip()
+    return clean, (note or None)
+
+
+def _harvest_anchor(text):
+    """Persist a capability anchor the model captured (a load/watt/duration the user actually
+    did or reduced to), skipping an exact repeat of the latest one. Returns the cleaned text."""
+    text, note = _extract_anchor_marker(text)
+    if note:
+        existing = _load_anchors()
+        if not existing or (existing[-1].get("text") or "").strip() != note:
+            append_anchor(note)
+            log.info("Captured capability anchor: %r", note[:80])
+    return text
 
 
 def load_fitness_profile():
@@ -1227,6 +1375,12 @@ def _assemble(prompt_file, question=None, include_history=True,
         parts.append("\nACTIVE HEALTH FLAGS (injuries/illness the user reported and has NOT "
                      "marked recovered - respect these: adapt or rest, don't train through "
                      "them, and check how they're doing):\n" + flags + "\n")
+    anchors = active_anchors_text()
+    if anchors:
+        parts.append("\nCURRENT CAPABILITY ANCHORS (what the user ACTUALLY performed or "
+                     "adjusted to recently - calibrate weights, watts, cadence and durations "
+                     "to THESE. A later line supersedes an earlier one for the same movement, "
+                     "and these OVERRIDE stale profile/Garmin numbers):\n" + anchors + "\n")
     if include_brief:
         brief = todays_brief_text()
         if brief:
@@ -1289,6 +1443,8 @@ def generate_qa(question):
             text = text + _logged_confirmation(log_date)
         text = _harvest_plan(text)  # persist any multi-day training plan this answer commits to
         text = _harvest_exercise_plan(text)  # they told me today's plan -> stop the check-ins
+        text = _harvest_health_clear(text)  # they said an injury is better -> clear that flag
+        text = _harvest_anchor(text)  # they reported what they actually did -> save the anchor
         append_history("user", question)
         append_history("agbot", text)
     if _is_workout_review(question):
@@ -1357,6 +1513,8 @@ def generate_images(image_paths, caption, extra=None, media_label="photo"):
             text = text + _logged_confirmation(log_date)
         text = _harvest_plan(text)  # persist any multi-day training plan this answer commits to
         text = _harvest_exercise_plan(text)  # they told me today's plan -> stop the check-ins
+        text = _harvest_health_clear(text)  # they said an injury is better -> clear that flag
+        text = _harvest_anchor(text)  # they reported what they actually did -> save the anchor
         plural = "s" if n != 1 else ""
         label = caption or ("[shared " + str(n) + " " + media_label + plural + "]")
         append_history("user", label + " [" + media_label + plural + "]")
@@ -1411,6 +1569,11 @@ def generate_debrief(activities):
     if flags:
         parts.append("\nACTIVE HEALTH FLAGS (injuries/illness to respect - adapt or rest, "
                      "don't train through them):\n" + flags + "\n")
+    anchors = active_anchors_text()
+    if anchors:
+        parts.append("\nCURRENT CAPABILITY ANCHORS (what the user ACTUALLY performed recently "
+                     "- judge this session against THESE loads/watts/durations, and if they "
+                     "did more or less than last time, capture the new level):\n" + anchors + "\n")
     brief = todays_brief_text()
     if brief:
         parts.append("\nTODAY'S BRIEF YOU ALREADY SENT (the workout and recommendations you "
@@ -1458,6 +1621,7 @@ def generate_debrief(activities):
     parts.append("\n\n" + DATA_USE_DIRECTIVE)
     text = run_llm("".join(parts))
     if text:
+        text = _harvest_anchor(text)  # capture what they actually lifted/rode as the new anchor
         append_history("agbot", "[post-workout debrief] " + text)
     return text
 
