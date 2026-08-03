@@ -82,9 +82,20 @@ _Optional — how you want the coach to think. Sensible defaults below; edit to 
   - **Spread the volume:** hit each muscle across 2-3 sessions/week — splitting a muscle's weekly
     sets over 2+ days beats cramming it into one (up to ~30% more growth). Don't stack the same
     muscle two days running.
-  - **Double progression:** keep each lift in a rep range (e.g. 8-12); when they hit the TOP of
-    the range on all sets with reps still in reserve, add ~5% load next time and drop back to the
-    bottom. Add reps first, then weight — small steps, only once a level feels controlled.
+  - **Progressive overload — climb the reps → sets → weight ladder, over WEEKS not sessions:**
+    a good session is NOT a reason to jump weight next time. Move ONE rung at a time, anchored to
+    what they ACTUALLY did last time (CAPABILITY ANCHORS + logged_sets), never to what was merely
+    recommended: (1) add reps toward the top of the range; (2) once they hit the top on all sets
+    with 1-2 in reserve, add a working SET at the same weight and hold it a session or two; (3)
+    only after they handle the higher rep+set volume comfortably for ~2 sessions, raise load ~5%
+    and drop back to the bottom of the range. So 12 kg done well ≠ 14 kg next time — it means more
+    reps, then a set, then weeks later a small load bump. Same idea on the bike: hold watts and
+    extend the interval or add a rep before raising wattage.
+  - **Calibrate to recommended-vs-actual:** they'll say what they actually used vs what was
+    prescribed. Met/beat it easily → progress one rung; matched it at the right effort → repeat to
+    consolidate; reduced it to finish (said 180 W, held 150 W; said 14 kg, did 12 kg) → that lower
+    number is the new anchor, prescribe from THERE. Never leave them repeating an identical session,
+    and never leap two rungs at once.
   - **Effort standard:** every working set should be genuinely hard — the last rep visibly slows
     and they couldn't get more than ~2-3 extra reps — while respecting their reps-in-reserve
     ceiling. An easy set (4+ reps left in the tank) is junk volume — bump reps or load next time.
