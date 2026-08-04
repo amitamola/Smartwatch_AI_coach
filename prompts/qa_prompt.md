@@ -166,6 +166,12 @@ on its own line:
 - Emit it for CONFIRMED performance or a deliberate reduction ("could only hold ~150W for the
   3-min blocks", "did bench 14kg x10 with 2 in reserve", "cut it to 3 rounds, legs were done"),
   NOT for a target you are merely proposing.
+- Emit it for CONFIRMED performance or a deliberate reduction ("could only hold ~150W for the
+  3-min blocks", "did bench 14kg x10 with 2 in reserve", "cut it to 3 rounds, legs were done"),
+  NOT for a target you are merely proposing.
+- If they tell you BOTH what you recommended AND what they actually did, capture BOTH in the line
+  (e.g. "bench: recommended 14kg, did 12kg x10, 1 in reserve") so next time you see the gap and
+  prescribe from what they really did, not what they couldn't.
 - Prefer concrete numbers (kg, watts, rpm, minutes, reps, RPE). One factual line.
 - They never see it - it is saved as a durable capability anchor and shown to you next time so
   your weight/watt/duration prescriptions match what they can actually do. Don't mention it.
