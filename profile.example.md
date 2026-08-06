@@ -82,6 +82,14 @@ _Optional — how you want the coach to think. Sensible defaults below; edit to 
   - **Spread the volume:** hit each muscle across 2-3 sessions/week — splitting a muscle's weekly
     sets over 2+ days beats cramming it into one (up to ~30% more growth). Don't stack the same
     muscle two days running.
+  - **Cover the WHOLE body across the week, not just the big lifts:** the sets-per-muscle logic
+    MUST include the small / often-skipped muscles or they get dropped. Every week should touch:
+    push (chest/shoulders/triceps), pull (back/rear-delts/biceps), legs (quads/hams/glutes),
+    **calves** (~2×/wk, standing + seated raises), **direct core** (~2-3×/wk: anti-extension
+    dead-bug/plank, anti-rotation Pallof, plus controlled flexion/rotation), and grip/forearms
+    (optional). Program the small stuff as accessories or finishers on suitable days (lighter /
+    Zone-2 / recovery slots) so it never crowds out the compounds but never gets skipped. Check
+    the last ~7 days of logged_sets: if a group has had ~zero work, prioritise slotting it in.
   - **Progressive overload — climb the reps → sets → weight ladder, over WEEKS not sessions:**
     a good session is NOT a reason to jump weight next time. Move ONE rung at a time, anchored to
     what they ACTUALLY did last time (CAPABILITY ANCHORS + logged_sets), never to what was merely
@@ -99,6 +107,14 @@ _Optional — how you want the coach to think. Sensible defaults below; edit to 
   - **Effort standard:** every working set should be genuinely hard — the last rep visibly slows
     and they couldn't get more than ~2-3 extra reps — while respecting their reps-in-reserve
     ceiling. An easy set (4+ reps left in the tank) is junk volume — bump reps or load next time.
+- **Posture, prehab & recovery work:** weave a short posture / mobility / prehab piece into MOST
+  sessions, not just the big lifts — especially valuable for a desk worker or anyone with a
+  recurring low-back or shoulder niggle. Rotate: **scapular/shoulder health** (band pull-aparts,
+  face pulls, YTWs, rear-delt, light external rotations), **anti-extension/anti-rotation core**
+  (dead-bug, bird-dog, Pallof — protects the low back), **thoracic & hip mobility** (cat-cow,
+  open-books, hip hinges, hip-flexor/hamstring), and **ankle/calf mobility**. Use as warm-ups,
+  finishers, or a short prehab block on easy days; on a genuine REST day offer an optional gentle
+  mobility/posture routine rather than nothing.
 - **Build, don't just maintain (if that's your goal):** on genuinely good-recovery days
   (GREEN, or a train-ready AMBER), deliberately include vigorous aerobic / VO2max intervals
   aimed at whatever Load Focus is under target — that's what moves Garmin Training Status
