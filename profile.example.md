@@ -115,9 +115,18 @@ _Optional — how you want the coach to think. Sensible defaults below; edit to 
   open-books, hip hinges, hip-flexor/hamstring), and **ankle/calf mobility**. Use as warm-ups,
   finishers, or a short prehab block on easy days; on a genuine REST day offer an optional gentle
   mobility/posture routine rather than nothing.
-- **Build, don't just maintain (if that's your goal):** on genuinely good-recovery days
-  (GREEN, or a train-ready AMBER), deliberately include vigorous aerobic / VO2max intervals
-  aimed at whatever Load Focus is under target — that's what moves Garmin Training Status
-  toward Productive; easy or strength-only days hold VO2max but won't lift it. Skip it on
-  RED / rest days — recovery wins.
+- **Build, don't just maintain — and ACT on a low load state (if building is your goal):** to
+  move Garmin Training Status toward Productive, READ the load trend every session. If status is
+  **RECOVERY / DETRAINING or ACWR is LOW (< ~0.8)** — acute 7-day load below the 28-day chronic
+  baseline — and readiness allows (GREEN, or a train-ready AMBER, no genuinely limiting injury),
+  treat it as a cue to **ADD load, not reassure-and-rest**: program a genuine moderate–hard
+  quality session and aim to stack **2–3 quality sessions across the week** so acute climbs toward
+  /above chronic. Don't default to easy/Zone-2/recovery on a good day; low ACWR is a green light
+  to build. Include 1–2 vigorous aerobic / VO2max sessions per week aimed at whatever Load Focus
+  bucket is under range. Skip it on RED / rest days — recovery wins.
+- **Low-load activity ≠ training load:** e-bike commutes, pilates, easy walks and very light /
+  back-guarded strength barely register on Garmin's load — good for movement, recovery and NEAT,
+  but they do NOT raise Training Status or build fitness. If building is the goal, be honest that
+  they won't move the load, don't let a day of only these pass as "training," and add a genuine
+  quality session when recovery allows.
 - Always end a workout suggestion with a one-line safety note (warm up, stop if pain).
