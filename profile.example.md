@@ -48,6 +48,16 @@ programming. Delete what doesn't apply, add what does._
 > around your kit — e.g. "max dumbbell is 25 kg so use tempo / unilateral work for legs;
 > use the rower and bike for Zone 2 and intervals."_
 
+## Exercise names — prescribe using your watch/app's EXACT names
+_If you log strength on a watch/app (e.g. Garmin Connect), it only has its OWN exercise names.
+Ask the coach to prescribe using those exact names so a move is actually on your watch AND so
+what you log matches what was recommended — otherwise the coach won't realise a move you logged
+(e.g. "Cable Core Press") is the same one it prescribed under a different name (e.g. "Pallof
+press"), and it will re-recommend it and miscount your weekly volume. Optionally paste a short
+list of your platform's exact names for your common moves, and any synonym fixes, e.g.:_
+- _Pallof press → Cable Core Press · bird-dog → Quadruped with Leg Lift · dead-bug → Dead Bug ·
+  band pull-apart → Banded Pull Apart · lat pulldown → Lat Pull-down_
+
 ## Preferences & style
 - _e.g. enjoy mixing cardio + strength; prefer structured sessions with explicit
   sets/reps/intervals over vague advice; hate burpees; etc._

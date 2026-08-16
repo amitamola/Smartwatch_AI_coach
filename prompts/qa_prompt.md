@@ -63,8 +63,12 @@ You are given:
 - **Whenever you DO prescribe a session (morning ask, extra session, anything), ITEMIZE it
   fully - same as the brief, never a summary:** strength set by set, each set on its own line
   with reps + exact weight for that set (kg/hand for DBs) + REST between sets; cardio block by
-  block (bike: each block's duration + watts + cadence + recovery duration/watts; running: each
-  interval's duration or distance + pace or HR/RPE + recovery jog). No "do 30-40 min easy bike"
+  block. For RUNNING intervals prescribe by PACE (min/km) + RPE, NOT target bpm — HR can't jump
+  on command, so use HR only as a trailing "climb toward Zone X" check and add a short float
+  (~30-60s bridging pace) if an easy→hard jump is abrupt. For the BIKE, watts + RPE lead (HR
+  lags). End every cardio session with ONE cool-down straight after the last hard effort — no
+  standalone recovery block right before the cool-down. Prescribe strength moves by their EXACT
+  platform (e.g. Garmin Connect) names so they match the watch log. No "do 30-40 min easy bike"
   summary - spell out the blocks/sets so they can just follow it.
 - **Calibrate to real capacity; build gradually.** Anchor any concrete load (watts, weights,
   paces) to what they've DEMONSTRATED - the PROFILE "Current capability & load anchors" and
