@@ -29,6 +29,7 @@ import html
 import time
 import socket
 import logging
+import tempfile
 import subprocess
 import urllib.parse
 import urllib.request
@@ -191,9 +192,26 @@ def read_file(path):
         return ""
 
 
+def _atomic_write(path, text):
+    """Write text to path atomically (temp file in the same dir + os.replace) so a crash or
+    concurrent read can never see a half-written / corrupt file."""
+    d = os.path.dirname(path) or "."
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".tmp-", suffix=".swp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def write_file(path, text):
-    with open(path, "w", encoding="utf-8") as fh:
-        fh.write(text)
+    _atomic_write(path, text)
 
 
 def load_history():
@@ -204,15 +222,26 @@ def load_history():
         return []
 
 
+def _defang_markers(text):
+    """Neutralize bracketed control-marker syntax typed by the USER so it can never be
+    reflected back through history and mis-parsed as a machine command (e.g. a user literally
+    typing '[[HEALTH_CLEAR: all]]'). Inserts a zero-width space so the text looks unchanged
+    but the marker regexes ('\\[\\[NAME...') no longer match."""
+    if not text:
+        return text
+    return text.replace("[[", "[\u200b[").replace("]]", "]\u200b]")
+
+
 def append_history(role, text):
+    if role == "user":
+        text = _defang_markers(text)
     hist = load_history()
     hist.append({"role": role, "text": text,
                  "ts": datetime.now().isoformat(timespec="seconds")})
     hist = [t for t in hist if _within_days(t.get("ts"), HISTORY_KEEP_DAYS)]
     hist = hist[-MAX_STORED_TURNS:]
     try:
-        with open(HISTORY_FILE, "w", encoding="utf-8") as fh:
-            json.dump(hist, fh, ensure_ascii=False, indent=1)
+        _atomic_write(HISTORY_FILE, json.dumps(hist, ensure_ascii=False, indent=1))
     except Exception as exc:  # noqa: BLE001
         log.error("history save failed: %s", exc)
 
@@ -229,9 +258,9 @@ def save_todays_brief(text):
     coach can still reference 'the plan/recommendations' later in the day even after the
     volatile chat window has scrolled past it."""
     try:
-        with open(TODAYS_BRIEF_FILE, "w", encoding="utf-8") as fh:
-            json.dump({"date": date.today().isoformat(), "text": text},
-                      fh, ensure_ascii=False)
+        _atomic_write(TODAYS_BRIEF_FILE,
+                      json.dumps({"date": date.today().isoformat(), "text": text},
+                                 ensure_ascii=False))
     except Exception as exc:  # noqa: BLE001
         log.error("brief save failed: %s", exc)
 
@@ -260,8 +289,7 @@ def _load_pending():
 
 def _save_pending(d):
     try:
-        with open(PENDING_DEBRIEF_FILE, "w", encoding="utf-8") as fh:
-            json.dump(d, fh)
+        _atomic_write(PENDING_DEBRIEF_FILE, json.dumps(d))
     except Exception as exc:  # noqa: BLE001
         log.error("pending save failed: %s", exc)
 
@@ -587,9 +615,8 @@ def resolve_health():
         if e.get("status", "active") == "active":
             e["status"] = "resolved"
     try:
-        with open(HEALTH_FILE, "w", encoding="utf-8") as fh:
-            for e in items:
-                fh.write(json.dumps(e, ensure_ascii=False) + "\n")
+        _atomic_write(HEALTH_FILE,
+                      "".join(json.dumps(e, ensure_ascii=False) + "\n" for e in items))
     except Exception as exc:  # noqa: BLE001
         log.error("health resolve failed: %s", exc)
     return [(e.get("text") or "").strip() for e in cleared]
@@ -716,9 +743,8 @@ def _harvest_health_clear(text):
             cleared.append(e)
     if cleared:
         try:
-            with open(HEALTH_FILE, "w", encoding="utf-8") as fh:
-                for e in items:
-                    fh.write(json.dumps(e, ensure_ascii=False) + "\n")
+            _atomic_write(HEALTH_FILE,
+                          "".join(json.dumps(e, ensure_ascii=False) + "\n" for e in items))
             log.info("Health cleared via marker (%r): %d flag(s)", what[:40], len(cleared))
         except Exception as exc:  # noqa: BLE001
             log.error("health clear (marker) failed: %s", exc)
@@ -772,6 +798,9 @@ def active_anchors_text():
 
 
 _ANCHOR_MARKER_RE = re.compile(r"\[\[ANCHOR:\s*(.*?)\]\]", re.IGNORECASE | re.DOTALL)
+# Defensive catch-all for ANY bracketed uppercase control tag (incl. markers added in future),
+# used only as a final egress strip so nothing like [[FOO: ...]] can ever leak to the user.
+_ANY_CONTROL_MARKER_RE = re.compile(r"\[\[[A-Z][A-Z0-9_]*(?:\s+\d{4}-\d{2}-\d{2})?(?:\s*:[^\]]*)?\]\]")
 
 
 def _extract_anchor_marker(text):
@@ -820,8 +849,7 @@ def load_fitness_profile():
     prof = garmin_coach.fitness_profile()
     if isinstance(prof, dict) and "__error__" not in prof:
         try:
-            with open(FITNESS_FILE, "w", encoding="utf-8") as fh:
-                json.dump(prof, fh, ensure_ascii=False, indent=2)
+            _atomic_write(FITNESS_FILE, json.dumps(prof, ensure_ascii=False, indent=2))
         except Exception as exc:  # noqa: BLE001
             log.error("fitness cache save failed: %s", exc)
         return prof
@@ -965,10 +993,23 @@ def _html_to_plain(html_text):
     return html.unescape(re.sub(r"<[^>]+>", "", html_text))
 
 
+def _strip_control_markers(text):
+    """Final egress safety net: remove EVERY machine control marker ([[LOG]], [[REST_DAY]],
+    [[PLAN]], [[EXERCISE_PLAN]], [[HEALTH_CLEAR]], [[ANCHOR]], and any future [[UPPER: ...]]
+    tag) so none can ever leak into a user-facing Telegram message. Harvesting happens
+    upstream; by the time we send, no marker should remain - this catches any path that
+    forgot to strip one (e.g. the summary path)."""
+    if not text:
+        return text
+    for rgx in (_LOG_MARKER_RE, _REST_MARKER_RE, _PLAN_MARKER_RE,
+                _EXPLAN_MARKER_RE, _HEALTH_CLEAR_RE, _ANCHOR_MARKER_RE):
+        text = rgx.sub("", text)
+    text = _ANY_CONTROL_MARKER_RE.sub("", text)  # defensive catch-all for future markers
+    return text.rstrip()
+
+
 def send_message(chat_id, text):
-    if text:  # safety net: never let a raw marker ([[LOG: ...]] / [[REST_DAY]] / [[PLAN: ...]]) leak into a message
-        text = _PLAN_MARKER_RE.sub(
-            "", _REST_MARKER_RE.sub("", _LOG_MARKER_RE.sub("", text))).rstrip()
+    text = _strip_control_markers(text)  # never let a raw [[MARKER]] leak into a message
     rendered = md_to_html(text)
     for chunk in _chunks(rendered, 4000):
         if not chunk.strip():
@@ -2532,8 +2573,7 @@ def _load_exercise_state():
 def _save_exercise_state(d):
     d["date"] = date.today().isoformat()
     try:
-        with open(EXERCISE_STATE_FILE, "w", encoding="utf-8") as fh:
-            json.dump(d, fh)
+        _atomic_write(EXERCISE_STATE_FILE, json.dumps(d))
     except Exception as exc:  # noqa: BLE001
         log.error("exercise state save failed: %s", exc)
 
@@ -2873,15 +2913,21 @@ if __name__ == "__main__":
         def _ck(h, m, asked=None):
             return exercise_checkin_slots_due(datetime.now().replace(hour=h, minute=m, second=0,
                                                                      microsecond=0), asked or [])
-        assert _ck(9, 59) == [], "pre-10am empty"
-        _d10 = _ck(10, 0)
-        assert [x[0] for x in _d10] == ["c10"] and _d10[0][2], _d10
-        assert _ck(10, 40)[0][2] is True, "40m late still asks"
-        assert _ck(11, 10)[0][2] is False, "70m late suppressed"
-        assert _ck(10, 30, ["c10"]) == [], "already-asked skipped"
-        _allc = _ck(21, 0)
-        assert [x[0] for x in _allc] == ["c10", "c12", "c16", "c21"], _allc
-        assert [x[0] for x in _allc if x[2]] == ["c21"], "only c21 within catch-up"
+        # Derive expected slots from EXERCISE_CHECKIN_HOURS so the test self-adjusts if the
+        # schedule ever changes (the previous fixture hard-coded a since-removed 10am slot).
+        _hours = EXERCISE_CHECKIN_HOURS
+        _slots = ["c%02d" % h for h in _hours]
+        _h0, _s0 = _hours[0], _slots[0]
+        if _h0 >= 1:
+            assert _ck(_h0 - 1, 59) == [], "before first check-in empty"
+        _d0 = _ck(_h0, 0)
+        assert [x[0] for x in _d0] == [_s0] and _d0[0][2], _d0
+        assert _ck(_h0, 40)[0][2] is True, "40m late still asks"
+        assert _ck(_h0 + 1, 10)[0][2] is False, "70m late suppressed"
+        assert _ck(_h0, 30, [_s0]) == [], "already-asked skipped"
+        _allc = _ck(_hours[-1], 0)
+        assert [x[0] for x in _allc] == _slots, _allc
+        assert [x[0] for x in _allc if x[2]] == [_slots[-1]], "only last slot within catch-up"
         print("CHECKIN_SELFTEST_OK")
         sys.exit(0)
     if "--selftest-image" in sys.argv:
