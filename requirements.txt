@@ -4,6 +4,11 @@
 # garminconnect (>=0.3) — do not add it.
 garminconnect>=0.3.6
 
+# IANA timezone database (zoneinfo data). Needed so the bot can resolve the user's real
+# Garmin-profile timezone on platforms without a system tz database (Windows, slim
+# containers); without it the code safely falls back to the host's local timezone.
+tzdata>=2024.1
+
 # --- Optional: voice-message transcription (local, offline Whisper) ---
 # Enable to let the bot transcribe Telegram voice notes. First run downloads a
 # small model from Hugging Face and caches it. CPU-only works fine.

@@ -18,8 +18,10 @@ Exit codes for `should-brief`:
 import os
 import sys
 import json
+import tempfile
 import argparse
 from datetime import date, timedelta, datetime, timezone
+from zoneinfo import ZoneInfo
 
 from garminconnect import Garmin
 
@@ -33,6 +35,46 @@ SETS_CACHE = os.path.join(STATE_DIR, "exercise_sets_cache.json")
 EDITABLE_DAYS = 3
 # A night is considered "logged" once at least this much sleep is recorded.
 MIN_SLEEP_SECONDS = 90 * 60
+
+# The user's real local timezone (IANA name from their Garmin profile), cached at module
+# level during build_snapshot so date resolution + local wall-time parsing stay correct even
+# when the server clock runs in a different timezone than the user. None -> fall back to the
+# host's local timezone (a no-op when host tz == user tz, e.g. running on the user's own box).
+_LOCAL_TZ_NAME = None
+
+
+def _set_local_tz(name):
+    global _LOCAL_TZ_NAME
+    if name:
+        _LOCAL_TZ_NAME = name
+
+
+def _local_zone():
+    """The user's local timezone (Garmin profile) when known and loadable, else host local."""
+    if _LOCAL_TZ_NAME:
+        try:
+            return ZoneInfo(_LOCAL_TZ_NAME)
+        except Exception:  # noqa: BLE001 - missing tzdata / bad name -> host local
+            pass
+    return datetime.now().astimezone().tzinfo
+
+
+def _atomic_write(path, text):
+    """Write text to path atomically (temp file in the same dir + os.replace) so a crash or
+    concurrent read can never see a half-written / corrupt file."""
+    d = os.path.dirname(path) or "."
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".tmp-", suffix=".swp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def token_dir():
@@ -94,9 +136,7 @@ def cmd_should_brief(args):
 
 
 def cmd_mark_sent(args):
-    os.makedirs(STATE_DIR, exist_ok=True)
-    with open(BRIEF_STATE, "w", encoding="utf-8") as fh:
-        fh.write(iso(date.today()))
+    _atomic_write(BRIEF_STATE, iso(date.today()))
     print(f"marked {iso(date.today())}")
     return 0
 
@@ -724,6 +764,8 @@ def build_snapshot(d_today=None):
             "preferred_long_training_days": _ud.get("preferredLongTrainingDays"),
             "habitual_sleep_window": _win,
         }.items() if v is not None} or None
+        if profile_config:
+            _set_local_tz(profile_config.get("timezone"))
 
     # ---- Daily calorie budget (deterministic fat-loss target) -----------------------
     # The user logs food in the BOT, not Garmin, so Garmin's remaining_kcal is bogus (it
@@ -946,7 +988,7 @@ def recent_inactivity(now_utc=None):
     except Exception:  # noqa: BLE001
         return None
     now_utc = now_utc or datetime.now(timezone.utc)
-    local_today = now_utc.astimezone().date().isoformat()
+    local_today = now_utc.astimezone(_local_zone()).date().isoformat()
     buckets = safe(lambda: g.get_steps_data(local_today))
     if not isinstance(buckets, list) or not buckets:
         return None
@@ -1006,9 +1048,11 @@ def _minutes_since_last_activity(g, now_utc, local_today):
 
 
 def _parse_local_epoch(s):
-    """startTimeLocal ('YYYY-MM-DD HH:MM:SS') -> POSIX epoch (naive = local), or None."""
+    """startTimeLocal ('YYYY-MM-DD HH:MM:SS') -> POSIX epoch, interpreting the naive wall
+    time in the user's real local timezone (not the host's), or None."""
     try:
-        return datetime.strptime((s or "")[:19], "%Y-%m-%d %H:%M:%S").timestamp()
+        dt = datetime.strptime((s or "")[:19], "%Y-%m-%d %H:%M:%S")
+        return dt.replace(tzinfo=_local_zone()).timestamp()
     except (ValueError, TypeError):
         return None
 
@@ -1358,9 +1402,7 @@ def _load_sets_cache():
 
 def _save_sets_cache(cache):
     try:
-        os.makedirs(STATE_DIR, exist_ok=True)
-        with open(SETS_CACHE, "w", encoding="utf-8") as fh:
-            json.dump(cache, fh, ensure_ascii=False)
+        _atomic_write(SETS_CACHE, json.dumps(cache, ensure_ascii=False))
     except Exception:  # noqa: BLE001
         pass
 
