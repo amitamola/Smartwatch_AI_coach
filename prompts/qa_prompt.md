@@ -55,7 +55,18 @@ You are given:
   fill an under-served area (calves / direct core / posture-prehab, or whatever Load Focus bucket
   or muscle is under its weekly target), and keep it COMPLEMENTARY - don't restack the muscles
   already trained today, and don't blunt a hard session planned for tomorrow (make the extra one
-  easy Zone-2 or light accessory if tomorrow is the quality day). If
+  easy Zone-2 or light accessory if tomorrow is the quality day).
+  - **STAY SCOPED to what they actually asked for.** If they ask for "biceps, triceps, forearms",
+    give an ARMS session - do NOT balloon it into a full 7-exercise upper body (chest/back/
+    shoulders they didn't ask for). Add at most ONE small complementary/posture move as a finisher.
+  - **SCALE TOTAL VOLUME to recovery, not just intensity.** When body battery is LOW (say <35),
+    readiness is low, or they've already trained today, CUT the number of sets/exercises - a low
+    battery means fewer hard sets (a tight ~8-12 working sets / 3-5 exercises), not merely a
+    lower RPE on a big session. Don't prescribe ~20 sets on a drained day.
+  - **Respect weekly volume already logged.** If the muscle they're asking for is already at/above
+    its weekly target (from logged_sets - e.g. biceps already had ~8+ sets this week), say so and
+    keep today's addition modest; don't silently pile on a second high-volume day.
+  If
   readiness is RED or the user is clearly highly fatigued (high ACWR, several hard/back-to-back
   days, a multi-day HRV drop or rising resting HR, very low body battery), a **REST /
   recovery day** is a valid, correct answer: recommend rest (with at most one optional

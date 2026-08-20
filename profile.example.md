@@ -125,6 +125,10 @@ _Optional — how you want the coach to think. Sensible defaults below; edit to 
   open-books, hip hinges, hip-flexor/hamstring), and **ankle/calf mobility**. Use as warm-ups,
   finishers, or a short prehab block on easy days; on a genuine REST day offer an optional gentle
   mobility/posture routine rather than nothing.
+  - **When the low/mid back is flagged or freshly niggly:** "seated" is NOT automatically safe —
+    avoid overhead pressing and overhead (behind-head) triceps extension (both load the lumbar
+    spine into extension), plus any loaded hinge/carry. Use zero-spinal-load subs: cable triceps
+    PUSHDOWNS, lying/chest-supported presses, chest-supported rows, incline-braced curls.
 - **Build, don't just maintain — and ACT on a low load state (if building is your goal):** to
   move Garmin Training Status toward Productive, READ the load trend every session. If status is
   **RECOVERY / DETRAINING or ACWR is LOW (< ~0.8)** — acute 7-day load below the 28-day chronic
