@@ -1142,6 +1142,38 @@ def _scrub(text):
     return "\n".join(lines).strip()
 
 
+# The model runner can be briefly unreachable - e.g. GitHub Copilot auth/OAuth 503s during a
+# GitHub outage. Flag when the LAST run failed that way so the user gets a clear "model outage,
+# please resend" notice instead of a vague "try again", and knows missed messages aren't queued.
+_LLM_OUTAGE_RE = re.compile(
+    r"could not be validated|OAuth|No server is currently available|\b503\b|"
+    r"service unavailable|temporarily unavailable|Authentication token|Failed to fetch",
+    re.IGNORECASE)
+_llm_last_outage = False
+
+
+def _is_llm_outage(stderr):
+    """True if backend stderr looks like a transient auth-or-availability outage of the model
+    service (vs a genuine local error), so callers can say so and ask the user to resend."""
+    return bool(stderr) and bool(_LLM_OUTAGE_RE.search(stderr))
+
+
+def _llm_fail_notice(chat_id, what="answer"):
+    """Fallback sent when run_llm returned nothing. If the failure looked like a model-service
+    outage, say so and ask the user to RESEND (missed messages are NOT auto-processed - the
+    Telegram offset advances on receipt); otherwise a brief generic retry note."""
+    if _llm_last_outage:
+        send_message(chat_id,
+                     "\u26A0\uFE0F AgBot: my AI service is having an outage right now, so I got "
+                     "your message but can't process it yet. I won't reply to or log THIS message "
+                     "until it's back - please resend it once I'm working again. I recover on my "
+                     "own, but I can't queue messages I missed.")
+    else:
+        send_message(chat_id,
+                     "\U0001F916 AgBot: sorry, I couldn't %s just now - please try again in a "
+                     "minute." % what)
+
+
 def run_llm(prompt, image=None, images=None):
     """Generate a reply from the configured model/agent backend.
 
@@ -1151,6 +1183,8 @@ def run_llm(prompt, image=None, images=None):
     below. `images` is a list of local image file paths; only vision-capable
     backends use them (text-only backends simply ignore them).
     """
+    global _llm_last_outage
+    _llm_last_outage = False
     if len(prompt) > 120000:
         log.warning("prompt is very large (%d chars, ~%dK tokens)", len(prompt), len(prompt) // 4000)
     imgs = list(images or [])
@@ -1203,7 +1237,11 @@ def _llm_copilot(prompt, images):
         log.error("copilot timed out after %ss", COPILOT_TIMEOUT)
         return None
     if res.returncode != 0:
-        log.error("copilot exit %s: %s", res.returncode, (res.stderr or "")[:600])
+        stderr = res.stderr or ""
+        log.error("copilot exit %s: %s", res.returncode, stderr[:600])
+        global _llm_last_outage
+        if _is_llm_outage(stderr):
+            _llm_last_outage = True
     return _scrub(res.stdout or "") or None
 
 
@@ -1378,6 +1416,20 @@ DATA_USE_DIRECTIVE = (
     "walk, very light/back-guarded strength) add ~no Garmin training load and won't raise Training "
     "Status, so a day of only those does not count toward building - name a genuine quality "
     "session instead when recovery allows.\n"
+    "- Exercise naming + volume matching: prescribe strength moves by the workout platform's EXACT "
+    "names (e.g. Garmin Connect's own exercise names; the profile may list a palette) - the user "
+    "logs on the watch and logged_sets come back with those names, so a wrong name (e.g. 'Pallof "
+    "press', which Garmin doesn't have) isn't on the watch AND isn't recognised when they log the "
+    "real move ('Cable Core Press'). When tallying weekly sets-per-muscle from logged_sets, match "
+    "by the platform name + known synonyms so something already logged isn't prescribed again the "
+    "same week.\n"
+    "- Cardio prescription realism: for RUNNING intervals prescribe by PACE (min/km) + RPE, NOT an "
+    "instantaneous bpm - HR lags effort ~30-60s and can't jump up or drop on command, so a 'run at "
+    "174-184 bpm' step right after a warm-up is unachievable; use HR only as a trailing 'let it "
+    "climb toward Zone X' check, and add a short float (~30-60s bridging pace) if an easy->hard "
+    "switch is abrupt. On the bike, watts + RPE lead (HR still lags). ALWAYS end a cardio session "
+    "with ONE cool-down straight after the final hard effort - never a standalone recovery block "
+    "immediately before the cool-down (the cool-down is that recovery).\n"
     "Cross-check these against each other: don't program a hard or heavy session when readiness is "
     "LOW / ACWR is high / recovery-time is still counting down / skin temp + RHR + respiration point "
     "to illness / the same muscles were hit in the last ~48h; match intensity to recovery and pick "
@@ -1428,6 +1480,19 @@ DATA_USE_DIRECTIVE = (
     "REPORTS a NEW injury or illness in their message, lead with ONE caring, specific "
     "clarifying question (what exactly, where, how bad, since when, and are they up for gentle "
     "movement or need rest) and clearly restate what you've noted, BEFORE any training push. "
+    "LOW-BACK / SPINE FLAG SPECIFICS: when an ACTIVE flag involves the low/mid back (or it's a "
+    "FRESH flare, i.e. reported in the last ~2 days), 'seated/supported' is NOT automatically "
+    "back-safe - AVOID axial/overhead loading that drives lumbar extension or compression: skip "
+    "overhead pressing AND overhead (behind-head) triceps extension even seated, and any loaded "
+    "hinge/carry. Prefer zero-spinal-load options: cable triceps PUSHDOWNS (not overhead ext), "
+    "chest-supported or lying presses, chest-supported rows, incline-bench-braced curls, and "
+    "neutral cable/band work. Overhead shoulder pressing waits until the back is clear. "
+    "SURFACE THE LOAD CONTEXT: when they ask about doing (or adding) a session, briefly state the "
+    "load picture in ONE clause (training_status + ACWR + acute-vs-chronic - e.g. 'plenty of "
+    "headroom: ACWR 0.8, acute below chronic') so the reasoning is visible; but weight it "
+    "correctly - training load is HR/EPOC-based so a low-HR strength/arm session barely moves it, "
+    "meaning ACWR mainly governs CARDIO scheduling, while body-battery/readiness/weekly-volume/"
+    "injury govern a strength day. "
     "Never invent numbers - if a field is missing say so rather than guessing."
 )
 
@@ -1713,7 +1778,7 @@ def do_summary(chat_id, auto=False):
                      + str(snap["__error__"])[:180] + "). I'll try again later.")
         return
     if not text:
-        send_message(chat_id, "\U0001F916 AgBot: I hit a problem generating your brief. Try again in a minute.")
+        _llm_fail_notice(chat_id, "generate your brief")
         return
     send_message(chat_id, text)
     write_file(LAST_SUMMARY_FILE, date.today().isoformat())
@@ -1726,7 +1791,7 @@ def do_qa(chat_id, question):
         send_message(chat_id, "\U0001F916 AgBot: I couldn't read your Garmin data right now. Try again shortly.")
         return
     if not text:
-        send_message(chat_id, "\U0001F916 AgBot: Sorry, I couldn't generate an answer just now. Try again in a minute.")
+        _llm_fail_notice(chat_id, "generate an answer")
         return
     send_message(chat_id, text)
 
@@ -1738,7 +1803,7 @@ def do_weekly(chat_id):
         send_message(chat_id, "\U0001F916 AgBot: couldn't pull your weekly data right now. Try again shortly.")
         return
     if not text:
-        send_message(chat_id, "\U0001F916 AgBot: I couldn't build your weekly review just now. Try again in a minute.")
+        _llm_fail_notice(chat_id, "build your weekly review")
         return
     send_message(chat_id, text)
 
@@ -1750,7 +1815,7 @@ def do_nutrition(chat_id):
         send_message(chat_id, "\U0001F916 AgBot: couldn't read your Garmin data for nutrition targets. Try again shortly.")
         return
     if not text:
-        send_message(chat_id, "\U0001F916 AgBot: I couldn't work out your targets just now. Try again in a minute.")
+        _llm_fail_notice(chat_id, "work out your targets")
         return
     send_message(chat_id, text)
 
@@ -1773,7 +1838,7 @@ def do_performance(chat_id):
         send_message(chat_id, "\U0001F916 AgBot: couldn't read your Garmin data right now. Try again shortly.")
         return
     if not text:
-        send_message(chat_id, "\U0001F916 AgBot: I couldn't build your performance card just now. Try again in a minute.")
+        _llm_fail_notice(chat_id, "build your performance card")
         return
     send_message(chat_id, text)
 
@@ -1820,8 +1885,7 @@ def do_images(chat_id, file_ids, caption, extra=None, media_label="photo"):
             return
         text, _snap = generate_images(paths, caption, extra=extra, media_label=media_label)
         if not text:
-            send_message(chat_id, "\U0001F916 AgBot: I couldn't analyze %s just now. Try again in a minute."
-                         % ("those" if n > 1 else "that photo"))
+            _llm_fail_notice(chat_id, "analyze " + ("those" if n > 1 else "that photo"))
             return
         send_message(chat_id, text)
     finally:
@@ -1870,7 +1934,7 @@ def do_video(chat_id, msg):
         text, _snap = generate_images(frames, (msg.get("caption") or "").strip(),
                                       extra="\n".join(bits), media_label="video frame")
         if not text:
-            send_message(chat_id, "\U0001F916 AgBot: I couldn't analyze that video just now. Try again in a minute.")
+            _llm_fail_notice(chat_id, "analyze that video")
             return
         send_message(chat_id, text)
     finally:

@@ -103,11 +103,22 @@ Line 1 - exact signature: `🤖 AgBot · Morning Brief · <TODAY, e.g. Fri 03 Ju
      `- Set 1: 12 reps @ 12kg`
      `- Set 2: 12 reps @ 12kg`
      `- Set 3: 10 reps @ 14kg · rest 90s between sets`
-   - **Cardio — bike:** block by block: for EACH block the DURATION, target WATTS (from
-     capability anchors), cadence, and the RECOVERY duration + easy watts between — plus
-     warm-up and cool-down blocks. E.g. `Block 1: 3 min @ 150W, 80rpm → 2 min easy @ 85W`.
-   - **Cardio — running:** block by block: each interval's DURATION (or distance), target pace
-     or HR zone / RPE, and the RECOVERY jog duration between, plus warm-up and cool-down.
+   - **Cardio — bike:** block by block, warm-up → work/recovery repeats → cool-down. For EACH
+     work block: DURATION, target WATTS (from capability anchors) + cadence; for EACH recovery:
+     DURATION + easy watts. Watts + RPE LEAD — HR lags effort by ~30–60s, so treat any bpm as
+     "let it climb toward Zone X by the end of the rep", never a number to hit instantly.
+     E.g. `Block 1: 3 min @ 150W, 80rpm → recover 2 min @ 85W`.
+   - **Cardio — running:** PRESCRIBE BY PACE (+ RPE), NOT by target bpm. The user can change pace
+     on command but HR can't jump up (or drop) instantly, so "warm up at 130–145 then run at
+     174–184 bpm" is unachievable — the HR only arrives ~1–2 min into the effort. Give each work
+     interval a DURATION (or distance) + target PACE (min/km) + RPE; each recovery a DURATION +
+     easy jog/walk PACE. Use HR ONLY as a trailing check ("HR should drift up into Zone 4–5 across
+     the rep"), never the per-step target. If a jump from easy to hard feels abrupt, add a short
+     **float** (~30–60s at a moderate bridging pace) between them rather than an instant switch.
+   - **Cardio structure (bike & run):** the LAST block is the cool-down, straight after the final
+     hard effort — do NOT put a standalone recovery block right before the cool-down (the
+     cool-down IS that recovery; a recover-then-cooldown is redundant). Shape:
+     warm-up → (hard, recover) × (n−1) → final hard → cool-down.
    Use "-" bullets / numbered lines so it's scannable. Keep every load calibrated to their
    capability anchors and the RPE-8 / 1–2-in-reserve ceiling. 20-75 min.
    - **Calibrate loads to what they can actually DO, and build gradually:** anchor concrete
