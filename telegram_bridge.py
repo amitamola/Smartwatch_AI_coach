@@ -685,6 +685,10 @@ def _maybe_capture_health(kind, text, payload):
 # and keep surfacing in every brief. This lets the model resolve flags from ordinary phrasing,
 # and to clear ONE area while leaving others active.
 _HEALTH_CLEAR_RE = re.compile(r"\[\[HEALTH_CLEAR:\s*(.*?)\]\]", re.IGNORECASE | re.DOTALL)
+# Symmetric with HEALTH_CLEAR: lets the MODEL persist a NEW injury it recognized from the
+# user's message when the coarse first-person regex capture missed it (oblique phrasing, or a
+# turn routed outside qa/log). Format: [[HEALTH_FLAG: area | short description]].
+_HEALTH_FLAG_RE = re.compile(r"\[\[HEALTH_FLAG:\s*(.*?)\]\]", re.IGNORECASE | re.DOTALL)
 
 # body-part -> substrings that count as the same area in a stored flag's text, so clearing
 # "elbow" also resolves a flag phrased "triceps tendonitis", etc.
@@ -749,6 +753,31 @@ def _harvest_health_clear(text):
         except Exception as exc:  # noqa: BLE001
             log.error("health clear (marker) failed: %s", exc)
     return text
+
+
+def _harvest_health_flag(text):
+    """Persist a NEW injury/pain the MODEL flagged from the user's message when the coarse
+    regex capture missed it. Symmetric with _harvest_health_clear. Each
+    [[HEALTH_FLAG: area | note]] becomes an active flag, deduped against existing active ones."""
+    if not text:
+        return text
+    found = _HEALTH_FLAG_RE.findall(text)
+    clean = _HEALTH_FLAG_RE.sub("", text).rstrip()
+    if not found:
+        return clean
+    existing = [(e.get("text") or "").strip().lower()
+                for e in _load_health() if e.get("status", "active") == "active"]
+    for raw in found:
+        snippet = " ".join((raw or "").replace("|", " - ").split()).strip()[:200]
+        if not snippet:
+            continue
+        low = snippet.lower()
+        if any(low in ex or ex in low for ex in existing):
+            continue  # already on record
+        append_health(snippet)
+        existing.append(low)
+        log.info("Health flag added via marker: %r", snippet[:80])
+    return clean
 
 
 # ---- Durable capability anchors (what the user ACTUALLY performed) -----------------------
@@ -1002,7 +1031,7 @@ def _strip_control_markers(text):
     if not text:
         return text
     for rgx in (_LOG_MARKER_RE, _REST_MARKER_RE, _PLAN_MARKER_RE,
-                _EXPLAN_MARKER_RE, _HEALTH_CLEAR_RE, _ANCHOR_MARKER_RE):
+                _EXPLAN_MARKER_RE, _HEALTH_CLEAR_RE, _HEALTH_FLAG_RE, _ANCHOR_MARKER_RE):
         text = rgx.sub("", text)
     text = _ANY_CONTROL_MARKER_RE.sub("", text)  # defensive catch-all for future markers
     return text.rstrip()
@@ -1471,6 +1500,24 @@ DATA_USE_DIRECTIVE = (
     "switch is abrupt. On the bike, watts + RPE lead (HR still lags). ALWAYS end a cardio session "
     "with ONE cool-down straight after the final hard effort - never a standalone recovery block "
     "immediately before the cool-down (the cool-down is that recovery).\n"
+    "- Intensity must match the label: a session you call 'light', 'easy', 'recovery' or "
+    "'back-safe' must actually be low-effort - cap working sets at ~RPE 6-7 (3-4 reps in "
+    "reserve), NOT RPE 8, whenever readiness is AMBER/RED, HRV is below their balanced band, body "
+    "battery is low (<~40), or an injury is freshly flared. Never pair a 'light/recovery day' "
+    "verdict with RPE-8 loading - the effort and the words must agree.\n"
+    "- Protect the quality run: when a hard/quality RUN (VO2, PacePro, intervals, tempo, or a "
+    "long run) is scheduled within ~48h (their own plan / preferred_long_training_days), keep the "
+    "calves and lower legs FRESH - avoid direct calf work and heavy/eccentric leg loading in the "
+    "48h before it, since fatigued calves/Achilles blunt running economy and elastic return and "
+    "raise injury risk in the intervals. Schedule calf/lower-leg volume AFTER the run instead.\n"
+    "- Sedentary / strain framing: the platform's sedentary hours (day_stats / yesterday "
+    "sedentary_h) are STEP-DERIVED, so step-less training - strength/lifting, pilates, yoga, "
+    "cycling/e-bike - is bucketed as 'sedentary' even though they trained hard (sleep is a "
+    "SEPARATE bucket, NOT added in). Before describing sedentary time, CROSS-CHECK it against "
+    "logged activities and intensity minutes (moderate/vigorous): if they trained that day, do "
+    "NOT call it a 'desk day' or imply they sat still - frame it as 'low-step time (includes your "
+    "step-less strength/pilates/yoga)' and acknowledge the session. Only call it a genuine "
+    "sedentary/desk day when NO training was logged.\n"
     "Cross-check these against each other: don't program a hard or heavy session when readiness is "
     "LOW / ACWR is high / recovery-time is still counting down / skin temp + RHR + respiration point "
     "to illness / the same muscles were hit in the last ~48h; match intensity to recovery and pick "
@@ -1521,6 +1568,11 @@ DATA_USE_DIRECTIVE = (
     "REPORTS a NEW injury or illness in their message, lead with ONE caring, specific "
     "clarifying question (what exactly, where, how bad, since when, and are they up for gentle "
     "movement or need rest) and clearly restate what you've noted, BEFORE any training push. "
+    "PERSIST NEW INJURIES: for each NEW injury/pain/illness they report that is NOT already in "
+    "ACTIVE HEALTH FLAGS, append a marker [[HEALTH_FLAG: area | short description]] (e.g. "
+    "[[HEALTH_FLAG: knee | left knee clicking on stairs, since yesterday]]) so it is stored "
+    "durably and shapes future sessions, not just this chat - it is stripped before sending. "
+    "Do NOT emit it for something already flagged, a past/hypothetical mention, or a question. "
     "LOW-BACK / SPINE FLAG SPECIFICS: when an ACTIVE flag involves the low/mid back (or it's a "
     "FRESH flare, i.e. reported in the last ~2 days), 'seated/supported' is NOT automatically "
     "back-safe - AVOID axial/overhead loading that drives lumbar extension or compression: skip "
@@ -1627,6 +1679,7 @@ def generate_qa(question):
         text = _harvest_plan(text)  # persist any multi-day training plan this answer commits to
         text = _harvest_exercise_plan(text)  # they told me today's plan -> stop the check-ins
         text = _harvest_health_clear(text)  # they said an injury is better -> clear that flag
+        text = _harvest_health_flag(text)  # they reported a NEW injury -> persist it durably
         text = _harvest_anchor(text)  # they reported what they actually did -> save the anchor
         append_history("user", question)
         append_history("agbot", text)
@@ -1697,6 +1750,7 @@ def generate_images(image_paths, caption, extra=None, media_label="photo"):
         text = _harvest_plan(text)  # persist any multi-day training plan this answer commits to
         text = _harvest_exercise_plan(text)  # they told me today's plan -> stop the check-ins
         text = _harvest_health_clear(text)  # they said an injury is better -> clear that flag
+        text = _harvest_health_flag(text)  # they reported a NEW injury -> persist it durably
         text = _harvest_anchor(text)  # they reported what they actually did -> save the anchor
         plural = "s" if n != 1 else ""
         label = caption or ("[shared " + str(n) + " " + media_label + plural + "]")
@@ -1805,6 +1859,7 @@ def generate_debrief(activities):
     text = run_llm("".join(parts))
     if text:
         text = _harvest_anchor(text)  # capture what they actually lifted/rode as the new anchor
+        text = _harvest_health_flag(text)  # they reported a NEW injury mid-debrief -> persist it
         append_history("agbot", "[post-workout debrief] " + text)
     return text
 
