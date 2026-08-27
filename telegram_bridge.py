@@ -139,6 +139,11 @@ MOVEMENT_STALE_MAX_MIN = 60    # skip if the latest intraday bucket is older tha
 MOVEMENT_POST_ACTIVITY_MIN = 60  # stay quiet this long after a logged workout/commute ends -
                                  # step-less efforts (e-bike, cycling, lifting) look 'sedentary'
                                  # in Garmin's step buckets, so never nudge straight after one
+# ...and never nudge DURING a step-less workout that hasn't saved yet (indoor bike, rowing):
+# a fresh, elevated heart rate means the user is exercising right now even with ~zero steps.
+MOVEMENT_HR_ACTIVE_DELTA = 30    # bpm over resting that flags "currently exercising"
+MOVEMENT_HR_ACTIVE_FLOOR = 100   # ...and an absolute bpm floor
+MOVEMENT_HR_MAX_AGE = 20         # only trust an HR reading this fresh (minutes)
 MOVEMENT_MESSAGES = (
     "\U0001FA91 AgBot \u00B7 Move break - you've been sitting {mins}. Stand up, roll the "
     "shoulders and take a 2-3 min walk (kettle, stairs, a lap). Your back and energy will "
@@ -1485,7 +1490,15 @@ DATA_USE_DIRECTIVE = (
     "a green light to add load. Be HONEST that low-load activities (e-bike commute, pilates, easy "
     "walk, very light/back-guarded strength) add ~no Garmin training load and won't raise Training "
     "Status, so a day of only those does not count toward building - name a genuine quality "
-    "session instead when recovery allows.\n"
+    "session instead when recovery allows. INJURY-vs-LOAD CONFLICT: if an ACTIVE injury rules "
+    "out loaded/axial STRENGTH (e.g. a low-back / spine flag) but NOT low-impact CARDIO, the "
+    "load-building quality session should be BACK-SAFE CARDIO - an indoor-bike threshold/VO2 or "
+    "Zone 3-4 interval block (spine-neutral cardio the user tolerates) - NOT a 'back-safe' "
+    "STRENGTH session, which stays low-HR and won't raise Training Status. Don't answer a 'build "
+    "the load' day (RECOVERY/DETRAINING status, low ACWR, energy available) with the very lifting "
+    "the injury forces you to keep light: pick the modality that BOTH respects the injury AND "
+    "raises HR/EPOC load. Only fall back to gentle strength/mobility if cardio is genuinely "
+    "contraindicated or readiness is truly RED.\n"
     "- Exercise naming + volume matching: prescribe strength moves by the workout platform's EXACT "
     "names (e.g. Garmin Connect's own exercise names; the profile may list a palette) - the user "
     "logs on the watch and logged_sets come back with those names, so a wrong name (e.g. 'Pallof "
@@ -2617,6 +2630,17 @@ def _movement_mins_phrase(mins):
     return "about %d min" % mins
 
 
+def _movement_hr_active(info):
+    """True when a fresh, elevated intraday HR shows the user is exercising right now - covers
+    step-less workouts (indoor bike, rowing, lifting) that read 'sedentary' on step buckets."""
+    hr = info.get("last_hr")
+    age = info.get("last_hr_age_min")
+    if hr is None or age is None or age > MOVEMENT_HR_MAX_AGE:
+        return False
+    rest = info.get("resting_hr") or 60
+    return hr >= max(rest + MOVEMENT_HR_ACTIVE_DELTA, MOVEMENT_HR_ACTIVE_FLOOR)
+
+
 def maybe_movement_reminders():
     """Gentle 'get up and move' nudge - fires ONLY when Garmin confirms a long recent sedentary
     stretch (fail-closed). Never on stale data, during a nap, or when the user has been moving.
@@ -2654,6 +2678,10 @@ def maybe_movement_reminders():
               and info["since_activity_min"] < MOVEMENT_POST_ACTIVITY_MIN):
             log.info("Movement %s skipped - workout/commute ended %s min ago", slot,
                      info.get("since_activity_min"))
+        elif _movement_hr_active(info):
+            log.info("Movement %s skipped - HR %s bpm shows an active workout now "
+                     "(resting %s, %s min old)", slot, info.get("last_hr"),
+                     info.get("resting_hr"), info.get("last_hr_age_min"))
         elif (info.get("sedentary_run_min") or 0) < MOVEMENT_SEDENTARY_MIN:
             log.info("Movement %s skipped - not sedentary (run=%s min)", slot,
                      info.get("sedentary_run_min"))
