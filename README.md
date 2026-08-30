@@ -1,7 +1,7 @@
-# 🏃 Garmin AI Coach
+# 🏃 Smartwatch AI coach
 
 A personal, self-hosted AI fitness coach that lives in **Telegram** and runs on your
-own **Garmin Connect** data. Every morning it reads your recovery, sleep, training
+own smartwatch's (currently set up for Garmin Connect) data. Every morning it reads your recovery, sleep, training
 load and workouts, then gives you a readiness-adapted brief and a specific workout
 built around *your* equipment. You can chat with it all day — ask questions, send
 photos of your meals or gym machines, log food, report an injury — and it keeps
