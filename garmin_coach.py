@@ -970,6 +970,31 @@ def hydration_today(d_today=None):
     return (logged, goal)
 
 
+def _recent_hr(g, now_utc):
+    """Most recent intraday heart-rate sample as (bpm, age_min, resting_hr), or (None, None, rhr).
+    Lets the mover-nudge detect that the user is CURRENTLY exercising even when the workout is
+    step-less (indoor bike, rowing, lifting) and not yet saved as an activity - HR stays high
+    while step buckets read 'sedentary'."""
+    local_today = now_utc.astimezone(_local_zone()).date().isoformat()
+    hr = safe(lambda: g.get_heart_rates(local_today))
+    if not isinstance(hr, dict) or "__error__" in hr:
+        return None, None, None
+    resting = hr.get("restingHeartRate")
+    last_ts = last_bpm = None
+    for pair in (hr.get("heartRateValues") or []):
+        if not isinstance(pair, (list, tuple)) or len(pair) < 2:
+            continue
+        ts, bpm = pair[0], pair[1]
+        if bpm is None or not isinstance(ts, (int, float)):
+            continue
+        if last_ts is None or ts > last_ts:
+            last_ts, last_bpm = ts, bpm
+    if last_bpm is None:
+        return None, None, resting
+    age_min = round((now_utc.timestamp() - last_ts / 1000.0) / 60)
+    return last_bpm, age_min, resting
+
+
 def recent_inactivity(now_utc=None):
     """Look at today's 15-min intraday step buckets (Garmin) and report how long the user
     has been CONTINUOUSLY sedentary up to the most recent synced bucket. Lets the bridge send
@@ -1016,12 +1041,16 @@ def recent_inactivity(now_utc=None):
     if since_activity_min is not None:
         # Can't have been sitting longer than the time since the last workout/commute ended.
         run_min = min(run_min, since_activity_min)
+    last_hr, last_hr_age_min, resting_hr = _recent_hr(g, now_utc)
     return {
         "data_age_min": data_age_min,
         "sedentary_run_min": run_min,
         "last_hour_steps": last_hour_steps,
         "last_level": last_b.get("primaryActivityLevel"),
         "since_activity_min": since_activity_min,
+        "last_hr": last_hr,
+        "last_hr_age_min": last_hr_age_min,
+        "resting_hr": resting_hr,
     }
 
 
