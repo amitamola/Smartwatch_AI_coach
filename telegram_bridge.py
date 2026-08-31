@@ -628,7 +628,7 @@ def resolve_health():
 
 
 _HEALTH_NEG_RE = re.compile(
-    r"\b(?:no|not|n'?t|never|without|zero)\s+\w*\s*"
+    r"\b(?:no|not|n'?t|never|without|zero)\s+(?:\w+\s+){0,3}"
     r"(?:pain|sore\w*|hurt\w*|ach\w*|injur\w*|niggl\w*|stiff\w*|cramp\w*|tight\w*|sprain\w*)"
     r"|\b(?:pain|ache)[- ]?free\b"
     r"|\b(?:all (?:good|fine|better|clear|healed)|absolutely (?:fine|good)|"
@@ -701,7 +701,9 @@ _PART_SYNONYMS = {
     "elbow": ("elbow", "tricep", "forearm"),
     "shoulder": ("shoulder", "delt", "rotator"),
     "knee": ("knee", "patell"),
-    "back": ("back", "lumbar", "spine"),
+    "back": ("back", "lumbar", "spine", "thoracic", "t4", "t-4", "mid-back", "mid back"),
+    "thoracic": ("thoracic", "t4", "t-4", "mid-back", "mid back"),
+    "t4": ("t4", "t-4", "thoracic"),
     "hamstring": ("hamstring",),
     "glute": ("glute",),
     "quad": ("quad",),
