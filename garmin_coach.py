@@ -1412,6 +1412,7 @@ def _parse_exercise_sets(xs):
         a = agg[name]
         reps = a["reps"]
         out.append({
+            "order": len(out) + 1,
             "exercise": name.replace("_", " ").title(),
             "sets": a["sets"],
             "reps": (f"{min(reps)}-{max(reps)}" if reps and min(reps) != max(reps)

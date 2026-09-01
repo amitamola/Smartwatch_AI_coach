@@ -1508,6 +1508,13 @@ DATA_USE_DIRECTIVE = (
     "real move ('Cable Core Press'). When tallying weekly sets-per-muscle from logged_sets, match "
     "by the platform name + known synonyms so something already logged isn't prescribed again the "
     "same week.\n"
+    "- Exercise SEQUENCE (order performed): logged_sets are listed in the ACTUAL ORDER the user "
+    "performed them - the 'order' field (1,2,3...) is the real within-session sequence. For ANY "
+    "ordering, fatigue or interference reasoning (e.g. 'what tired my arms before the curls', "
+    "'did X pre-fatigue Y'), use this REAL logged sequence - do NOT assume they followed the "
+    "brief's prescribed order; they often reorder. Only an exercise with a LOWER order number "
+    "(done earlier) can have pre-fatigued a later one. If unsure of the order, say so rather "
+    "than guessing.\n"
     "- Cardio prescription realism: for RUNNING intervals prescribe by PACE (min/km) + RPE, NOT an "
     "instantaneous bpm - HR lags effort ~30-60s and can't jump up or drop on command, so a 'run at "
     "174-184 bpm' step right after a warm-up is unachievable; use HR only as a trailing 'let it "
@@ -1848,7 +1855,8 @@ def generate_debrief(activities):
             sets = garmin_coach.exercise_sets(a.get("activity_id"))
             if sets:
                 parts.append("\n\nLOGGED_SETS for " + json.dumps(a.get("name") or a.get("type"))
-                             + " (per exercise: #sets, rep range, top weight kg):\n"
+                             + " (per exercise, IN THE ORDER ACTUALLY PERFORMED - the 'order' "
+                             + "field is the real sequence; #sets, rep range, top weight kg):\n"
                              + json.dumps(sets, indent=2, default=str))
     if len(activities) > 1:
         header = ("SESSION_JUST_FINISHED - these " + str(len(activities)) + " activities were "
