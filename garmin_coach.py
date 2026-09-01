@@ -212,6 +212,39 @@ def _epoch_ms_local(ms):
         return None
 
 
+def _training_rhythm(g, d_today):
+    """Consecutive training-day streak + most recent rest day, so the coach can PROACTIVELY
+    schedule rest instead of only resting on a RED-readiness day. A 'training day' = a day with
+    any logged activity; a true REST day has none. The streak counts back from today (or from
+    yesterday when nothing is logged yet today)."""
+    acts = safe(lambda: g.get_activities(0, 50))
+    if not isinstance(acts, list) or not acts:
+        return None
+    active = set()
+    for a in acts:
+        if isinstance(a, dict):
+            d = str(a.get("startTimeLocal", ""))[:10]
+            if d:
+                active.add(d)
+    if not active:
+        return None
+    cur = d_today
+    if cur.isoformat() not in active:  # nothing logged yet today -> start the streak at yesterday
+        cur = cur - timedelta(days=1)
+    streak = 0
+    while cur.isoformat() in active:
+        streak += 1
+        cur = cur - timedelta(days=1)
+    last_rest = cur.isoformat()  # first non-active day walking back = most recent rest day
+    rest_last_7 = sum(1 for i in range(7)
+                      if (d_today - timedelta(days=i)).isoformat() not in active)
+    return {
+        "consecutive_training_days": streak,
+        "last_rest_day": last_rest,
+        "rest_days_last_7": rest_last_7,
+    }
+
+
 def build_snapshot(d_today=None):
     if d_today is None:
         d_today = date.today()
@@ -895,6 +928,7 @@ def build_snapshot(d_today=None):
         "hrv": hrv,
         "training_status": train_status,
         "recent_activities_7d": activities,
+        "training_rhythm": _training_rhythm(g, d_today),
         "wellness_today": wellness,
         "strain_yesterday": strain_yesterday,
         "body_battery_current": bb_current,

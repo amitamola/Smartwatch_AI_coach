@@ -169,6 +169,9 @@ HEALTH_ACTIVE_DAYS = 45      # active injury/illness flags injected for up to th
 HEALTH_PROMPT_CHARS = 800    # char budget for injected health flags
 ANCHOR_KEEP = 24             # capability anchors kept on disk
 ANCHOR_PROMPT_CHARS = 1200   # char budget for injected capability anchors
+PREF_FILE = os.path.join(STATE, "preferences.jsonl")
+PREF_KEEP = 30               # standing preferences / coaching rules kept on disk
+PREF_PROMPT_CHARS = 1400     # char budget for injected standing preferences
 ACTIVITY_CHECK_SECS = 300    # how often to poll for a finished workout
 DEBRIEF_QUIET_SECS = 90 * 60  # after the LAST logged activity, wait this long (no new
                               # activity) before the single collective debrief - a session is
@@ -862,6 +865,77 @@ def _harvest_anchor(text):
     return text
 
 
+# ---- Durable standing preferences / coaching rules (do's & don'ts stated in chat) --------
+# Unlike anchors (numbers they performed) or health flags (injuries), these are LASTING coaching
+# rules: exercise substitutions, movements to avoid, equipment habits, scheduling choices
+# ("from now on prefer single-leg RDL over normal RDL", "always offer the lumbar belt for
+# hinges"). The model emits [[PREF: ...]] to persist one; they're injected into EVERY prompt
+# and must be honoured. A later line supersedes/updates an earlier one.
+PREF_MARKER = "PREF"
+
+
+def append_pref(text):
+    text = (text or "").strip()[:240]
+    if not text:
+        return
+    entry = {"date": date.today().isoformat(), "text": text,
+             "ts": datetime.now().isoformat(timespec="seconds")}
+    try:
+        with open(PREF_FILE, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception as exc:  # noqa: BLE001
+        log.error("pref save failed: %s", exc)
+
+
+def _load_prefs():
+    try:
+        with open(PREF_FILE, "r", encoding="utf-8") as fh:
+            return [json.loads(ln) for ln in fh if ln.strip()]
+    except FileNotFoundError:
+        return []
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def active_prefs_text():
+    """The most recent standing preferences/rules, oldest-last so a newer line supersedes an
+    older one. Injected into every prompt."""
+    items = _load_prefs()[-PREF_KEEP:]
+    if not items:
+        return ""
+    lines = [((e.get("date", "") + ": " + (e.get("text") or "")).strip()) for e in items]
+    text = "\n".join(lines)
+    if len(text) > PREF_PROMPT_CHARS:
+        text = "..." + text[-PREF_PROMPT_CHARS:]
+    return text
+
+
+_PREF_MARKER_RE = re.compile(r"\[\[PREF:\s*(.*?)\]\]", re.IGNORECASE | re.DOTALL)
+
+
+def _harvest_pref(text):
+    """Persist a standing preference/rule the user stated (exercise substitution, movement to
+    avoid, equipment habit, scheduling choice), skipping a near-duplicate of an existing one."""
+    if not text:
+        return text
+    found = _PREF_MARKER_RE.findall(text)
+    clean = _PREF_MARKER_RE.sub("", text).rstrip()
+    if not found:
+        return clean
+    existing = [(e.get("text") or "").strip().lower() for e in _load_prefs()]
+    for raw in found:
+        note = " ".join((raw or "").split()).strip()[:240]
+        if not note:
+            continue
+        low = note.lower()
+        if any(low == ex or low in ex or ex in low for ex in existing):
+            continue  # already captured (or a subset of an existing rule)
+        append_pref(note)
+        existing.append(low)
+        log.info("Captured standing preference: %r", note[:80])
+    return clean
+
+
 def load_fitness_profile():
     """Return the cached slow-changing fitness profile (fitness age, race
     predictions, endurance/hill score, VO2max-driven metrics, FTP, weekly
@@ -1038,7 +1112,8 @@ def _strip_control_markers(text):
     if not text:
         return text
     for rgx in (_LOG_MARKER_RE, _REST_MARKER_RE, _PLAN_MARKER_RE,
-                _EXPLAN_MARKER_RE, _HEALTH_CLEAR_RE, _HEALTH_FLAG_RE, _ANCHOR_MARKER_RE):
+                _EXPLAN_MARKER_RE, _HEALTH_CLEAR_RE, _HEALTH_FLAG_RE, _ANCHOR_MARKER_RE,
+                _PREF_MARKER_RE):
         text = rgx.sub("", text)
     text = _ANY_CONTROL_MARKER_RE.sub("", text)  # defensive catch-all for future markers
     return text.rstrip()
@@ -1501,6 +1576,17 @@ DATA_USE_DIRECTIVE = (
     "the injury forces you to keep light: pick the modality that BOTH respects the injury AND "
     "raises HR/EPOC load. Only fall back to gentle strength/mobility if cardio is genuinely "
     "contraindicated or readiness is truly RED.\n"
+    "- Proactive REST DAYS: recovery and adaptation happen on REST days, not just training days "
+    "- a rest day is when fitness is CONSOLIDATED, not a failure or lost progress. ALWAYS read "
+    "training_rhythm (consecutive_training_days, last_rest_day, rest_days_last_7). When "
+    "consecutive_training_days is >=4 you MUST, in that day's recommendation, (a) NAME the streak "
+    "explicitly ('that's your Nth straight training day; last rest was <date>'), and (b) state "
+    "when their NEXT rest day should fall - even if today is still a training day. When it is "
+    ">=6, OR fatigue is stacking (readiness AMBER-low/RED, resting HR up, HRV down, ACWR high, "
+    "body battery low, sleep short), LEAD with a FULL REST day (or genuine easy active-recovery "
+    "like a short walk) as today's recommendation - don't bury it under a workout, and don't wait "
+    "for a RED day or for them to ask. Balance against load-building: build when fresh, but never "
+    "stack quality days indefinitely - aim for at least ~1 rest day per 5-7 days.\n"
     "- Exercise naming + volume matching: prescribe strength moves by the workout platform's EXACT "
     "names (e.g. Garmin Connect's own exercise names; the profile may list a palette) - the user "
     "logs on the watch and logged_sets come back with those names, so a wrong name (e.g. 'Pallof "
@@ -1595,6 +1681,15 @@ DATA_USE_DIRECTIVE = (
     "[[HEALTH_FLAG: knee | left knee clicking on stairs, since yesterday]]) so it is stored "
     "durably and shapes future sessions, not just this chat - it is stripped before sending. "
     "Do NOT emit it for something already flagged, a past/hypothetical mention, or a question. "
+    "PERSIST STANDING PREFERENCES: STANDING PREFERENCES / RULES lists durable do's & don'ts the "
+    "user has stated - HONOUR every one on EVERY recommendation (never prescribe a movement they "
+    "asked to avoid; use their stated substitute instead; apply their equipment and scheduling "
+    "rules). When they state a NEW durable preference/rule in their message - a lasting choice, "
+    "not a one-off ('from now on...', 'I prefer...', 'avoid X, give me Y instead', 'I always "
+    "wear...', 'don't program X') - append a marker [[PREF: <concise rule>]] (e.g. [[PREF: avoid "
+    "standard/normal RDL and conventional deadlift - substitute single-leg RDL or bench-supported "
+    "RDL (back-sensitive)]]) so it persists, stripped before sending. Only for LASTING rules, not "
+    "a one-time change for today; don't re-emit one already listed. "
     "LOW-BACK / SPINE FLAG SPECIFICS: when an ACTIVE flag involves the low/mid back (or it's a "
     "FRESH flare, i.e. reported in the last ~2 days), 'seated/supported' is NOT automatically "
     "back-safe - AVOID axial/overhead loading that drives lumbar extension or compression: skip "
@@ -1638,6 +1733,13 @@ def _assemble(prompt_file, question=None, include_history=True,
                      "adjusted to recently - calibrate weights, watts, cadence and durations "
                      "to THESE. A later line supersedes an earlier one for the same movement, "
                      "and these OVERRIDE stale profile/Garmin numbers):\n" + anchors + "\n")
+    prefs = active_prefs_text()
+    if prefs:
+        parts.append("\nSTANDING PREFERENCES / RULES (durable do's & don'ts the user has stated "
+                     "- exercise substitutions, movements to AVOID, equipment habits, scheduling "
+                     "choices. HONOUR every one: never prescribe something they asked to avoid - "
+                     "use their stated substitute instead - and apply their equipment/scheduling "
+                     "rules. A later line supersedes an earlier one):\n" + prefs + "\n")
     if include_brief:
         brief = todays_brief_text()
         if brief:
@@ -1703,6 +1805,7 @@ def generate_qa(question):
         text = _harvest_health_clear(text)  # they said an injury is better -> clear that flag
         text = _harvest_health_flag(text)  # they reported a NEW injury -> persist it durably
         text = _harvest_anchor(text)  # they reported what they actually did -> save the anchor
+        text = _harvest_pref(text)  # they stated a durable do/don't -> persist it as a rule
         append_history("user", question)
         append_history("agbot", text)
     if _is_workout_review(question):
@@ -1774,6 +1877,7 @@ def generate_images(image_paths, caption, extra=None, media_label="photo"):
         text = _harvest_health_clear(text)  # they said an injury is better -> clear that flag
         text = _harvest_health_flag(text)  # they reported a NEW injury -> persist it durably
         text = _harvest_anchor(text)  # they reported what they actually did -> save the anchor
+        text = _harvest_pref(text)  # they stated a durable do/don't -> persist it as a rule
         plural = "s" if n != 1 else ""
         label = caption or ("[shared " + str(n) + " " + media_label + plural + "]")
         append_history("user", label + " [" + media_label + plural + "]")
@@ -1833,6 +1937,10 @@ def generate_debrief(activities):
         parts.append("\nCURRENT CAPABILITY ANCHORS (what the user ACTUALLY performed recently "
                      "- judge this session against THESE loads/watts/durations, and if they "
                      "did more or less than last time, capture the new level):\n" + anchors + "\n")
+    prefs = active_prefs_text()
+    if prefs:
+        parts.append("\nSTANDING PREFERENCES / RULES (durable do's & don'ts the user has stated "
+                     "- honour them and, if they state a new one now, persist it):\n" + prefs + "\n")
     brief = todays_brief_text()
     if brief:
         parts.append("\nTODAY'S BRIEF YOU ALREADY SENT (the workout and recommendations you "
@@ -1883,6 +1991,7 @@ def generate_debrief(activities):
     if text:
         text = _harvest_anchor(text)  # capture what they actually lifted/rode as the new anchor
         text = _harvest_health_flag(text)  # they reported a NEW injury mid-debrief -> persist it
+        text = _harvest_pref(text)  # they stated a durable do/don't -> persist it as a rule
         append_history("agbot", "[post-workout debrief] " + text)
     return text
 
