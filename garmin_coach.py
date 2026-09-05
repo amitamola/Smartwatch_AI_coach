@@ -212,30 +212,48 @@ def _epoch_ms_local(ms):
         return None
 
 
+# Activity types that are transport / commute or trivial - NOT a training session. A day whose
+# only activities are these (each below a genuine training load) counts as a REST day for the
+# streak, so an e-bike commute or a short walk doesn't inflate the consecutive-training count.
+_COMMUTE_TYPES = {"e_bike_fitness", "e_biking", "walking", "indoor_walking",
+                  "transition", "other"}
+_GENUINE_LOAD = 50.0  # a normally-commute activity carrying load this high still counts as training
+
+
+def _is_training_activity(a):
+    """True when an activity is a genuine training session (not a commute/stroll). A non-commute
+    type always counts; a commute type counts only if it carried real training load."""
+    t = ((a.get("activityType") or {}).get("typeKey") or "").lower()
+    if t not in _COMMUTE_TYPES:
+        return True
+    load = a.get("activityTrainingLoad")
+    return isinstance(load, (int, float)) and load >= _GENUINE_LOAD
+
+
 def _training_rhythm(g, d_today):
     """Consecutive training-day streak + most recent rest day, so the coach can PROACTIVELY
     schedule rest instead of only resting on a RED-readiness day. A 'training day' = a day with
-    any logged activity; a true REST day has none. The streak counts back from today (or from
-    yesterday when nothing is logged yet today)."""
+    a genuine training activity (an e-bike commute or short walk does NOT count); a REST day has
+    none. The streak counts back from today (or from yesterday when nothing is logged yet)."""
     acts = safe(lambda: g.get_activities(0, 50))
     if not isinstance(acts, list) or not acts:
         return None
     active = set()
     for a in acts:
-        if isinstance(a, dict):
+        if isinstance(a, dict) and _is_training_activity(a):
             d = str(a.get("startTimeLocal", ""))[:10]
             if d:
                 active.add(d)
     if not active:
         return None
     cur = d_today
-    if cur.isoformat() not in active:  # nothing logged yet today -> start the streak at yesterday
+    if cur.isoformat() not in active:  # no genuine training yet today -> start streak at yesterday
         cur = cur - timedelta(days=1)
     streak = 0
     while cur.isoformat() in active:
         streak += 1
         cur = cur - timedelta(days=1)
-    last_rest = cur.isoformat()  # first non-active day walking back = most recent rest day
+    last_rest = cur.isoformat()  # first non-training day walking back = most recent rest day
     rest_last_7 = sum(1 for i in range(7)
                       if (d_today - timedelta(days=i)).isoformat() not in active)
     return {
