@@ -1,0 +1,61 @@
+certifi==2026.6.17
+    # via
+    #   -c C:/Users/amitamola/.copilot/session-state/0b837ef1-c79b-4b5d-b124-3aaf3160f375/files/runtime-constraints.txt
+    #   curl-cffi
+    #   requests
+cffi==2.0.0
+    # via
+    #   -c C:/Users/amitamola/.copilot/session-state/0b837ef1-c79b-4b5d-b124-3aaf3160f375/files/runtime-constraints.txt
+    #   curl-cffi
+charset-normalizer==3.4.7
+    # via
+    #   -c C:/Users/amitamola/.copilot/session-state/0b837ef1-c79b-4b5d-b124-3aaf3160f375/files/runtime-constraints.txt
+    #   requests
+curl-cffi==0.15.0
+    # via
+    #   -c C:/Users/amitamola/.copilot/session-state/0b837ef1-c79b-4b5d-b124-3aaf3160f375/files/runtime-constraints.txt
+    #   garminconnect
+garminconnect==0.3.6
+    # via
+    #   -c C:/Users/amitamola/.copilot/session-state/0b837ef1-c79b-4b5d-b124-3aaf3160f375/files/runtime-constraints.txt
+    #   -r requirements.txt
+idna==3.18
+    # via
+    #   -c C:/Users/amitamola/.copilot/session-state/0b837ef1-c79b-4b5d-b124-3aaf3160f375/files/runtime-constraints.txt
+    #   requests
+markdown-it-py==4.2.0
+    # via
+    #   -c C:/Users/amitamola/.copilot/session-state/0b837ef1-c79b-4b5d-b124-3aaf3160f375/files/runtime-constraints.txt
+    #   rich
+mdurl==0.1.2
+    # via
+    #   -c C:/Users/amitamola/.copilot/session-state/0b837ef1-c79b-4b5d-b124-3aaf3160f375/files/runtime-constraints.txt
+    #   markdown-it-py
+pycparser==3.0 ; implementation_name != 'PyPy'
+    # via
+    #   -c C:/Users/amitamola/.copilot/session-state/0b837ef1-c79b-4b5d-b124-3aaf3160f375/files/runtime-constraints.txt
+    #   cffi
+pygments==2.20.0
+    # via
+    #   -c C:/Users/amitamola/.copilot/session-state/0b837ef1-c79b-4b5d-b124-3aaf3160f375/files/runtime-constraints.txt
+    #   rich
+requests==2.34.2
+    # via
+    #   -c C:/Users/amitamola/.copilot/session-state/0b837ef1-c79b-4b5d-b124-3aaf3160f375/files/runtime-constraints.txt
+    #   garminconnect
+rich==15.0.0
+    # via
+    #   -c C:/Users/amitamola/.copilot/session-state/0b837ef1-c79b-4b5d-b124-3aaf3160f375/files/runtime-constraints.txt
+    #   curl-cffi
+tzdata==2026.3
+    # via
+    #   -c C:/Users/amitamola/.copilot/session-state/0b837ef1-c79b-4b5d-b124-3aaf3160f375/files/runtime-constraints.txt
+    #   -r requirements.txt
+ua-generator==2.1.2
+    # via
+    #   -c C:/Users/amitamola/.copilot/session-state/0b837ef1-c79b-4b5d-b124-3aaf3160f375/files/runtime-constraints.txt
+    #   garminconnect
+urllib3==2.7.0
+    # via
+    #   -c C:/Users/amitamola/.copilot/session-state/0b837ef1-c79b-4b5d-b124-3aaf3160f375/files/runtime-constraints.txt
+    #   requests

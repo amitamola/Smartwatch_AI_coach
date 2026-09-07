@@ -4,6 +4,13 @@ profile.md
 # Runtime state & secrets (bot token, chat id, journal, conversation, caches, uploads)
 state/
 logs/
+backups/
+releases/
+*.sqlite*
+*.db
+*.db-*
+model-evaluation/
+private/
 
 # Local secrets
 .env

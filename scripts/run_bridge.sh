@@ -10,7 +10,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"   # repo root (parent of
 SCRIPT="$ROOT/telegram_bridge.py"
 
 # Prefer a local virtualenv if present, else fall back to python3 on PATH.
-PY="$ROOT/.venv/bin/python"
+PY="${AGBOT_PYTHON:-$ROOT/.venv/bin/python}"
 [ -x "$PY" ] || PY="python3"
 
 export PYTHONIOENCODING="utf-8"
@@ -23,12 +23,15 @@ export PYTHONUTF8="1"
 # export AGBOT_LLM_TIMEOUT="600"       # raise for slow high-reasoning models
 
 # Load .env (simple KEY=VALUE lines) if present.
-if [ -f "$ROOT/.env" ]; then
+export AGBOT_DATA_DIR="${AGBOT_DATA_DIR:-$ROOT}"
+BOOTSTRAP_DATA_DIR="$AGBOT_DATA_DIR"
+if [ -f "$AGBOT_DATA_DIR/.env" ]; then
     set -a
     # shellcheck disable=SC1090
-    . "$ROOT/.env"
+    . "$AGBOT_DATA_DIR/.env"
     set +a
 fi
+export AGBOT_DATA_DIR="$BOOTSTRAP_DATA_DIR"
 
 echo "Starting coach bridge: $SCRIPT"
 exec "$PY" "$SCRIPT"

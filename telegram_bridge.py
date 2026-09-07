@@ -31,14 +31,24 @@ import socket
 import logging
 import tempfile
 import subprocess
+import threading
 import urllib.parse
 import urllib.request
 import urllib.error
 from datetime import datetime, date, timedelta
 
 BASE = os.path.dirname(os.path.abspath(__file__))
-STATE = os.path.join(BASE, "state")
-LOGS = os.path.join(BASE, "logs")
+DATA_DIR = os.path.abspath(os.path.expanduser(os.environ.get("AGBOT_DATA_DIR", BASE)))
+# Test-mode isolation is established before any directories, logs or state are opened.
+_selftest_dir = None
+if any(arg.startswith("--selftest-") for arg in sys.argv):
+    _selftest_dir = tempfile.TemporaryDirectory(prefix="coach-selftest-")
+    original_profile = os.environ.get("AGBOT_PROFILE", os.path.join(DATA_DIR, "profile.md"))
+    os.environ["AGBOT_PROFILE"] = original_profile
+    DATA_DIR = _selftest_dir.name
+    os.environ["AGBOT_DATA_DIR"] = DATA_DIR
+STATE = os.path.join(DATA_DIR, "state")
+LOGS = os.path.join(DATA_DIR, "logs")
 os.makedirs(STATE, exist_ok=True)
 os.makedirs(LOGS, exist_ok=True)
 
@@ -49,7 +59,7 @@ LAST_SUMMARY_FILE = os.path.join(STATE, "last_summary_date.txt")
 HISTORY_FILE = os.path.join(STATE, "conversation.json")
 TODAYS_BRIEF_FILE = os.path.join(STATE, "todays_brief.json")
 PROMPTS = os.path.join(BASE, "prompts")
-PROFILE_FILE = os.path.join(BASE, "profile.md")
+PROFILE_FILE = os.environ.get("AGBOT_PROFILE", os.path.join(DATA_DIR, "profile.md"))
 SUMMARY_PROMPT_FILE = os.path.join(PROMPTS, "summary_prompt.md")
 QA_PROMPT_FILE = os.path.join(PROMPTS, "qa_prompt.md")
 IMAGE_PROMPT_FILE = os.path.join(PROMPTS, "image_prompt.md")
@@ -85,7 +95,7 @@ USER_NAME = os.environ.get("AGBOT_USER_NAME", "").strip()
 # `/model` in an interactive `copilot` session (e.g. "gpt-5.6-luna", "claude-sonnet-4.5",
 # or "auto"). AGBOT_REASONING_EFFORT is one of none|minimal|low|medium|high|xhigh|max.
 COPILOT_MODEL = os.environ.get("AGBOT_MODEL", "").strip()
-COPILOT_REASONING_EFFORT = (os.environ.get("AGBOT_REASONING_EFFORT", "").strip() or "low")
+COPILOT_REASONING_EFFORT = (os.environ.get("AGBOT_REASONING_EFFORT", "").strip() or "medium")
 
 # Auto-summary window (local time). If no summary has been sent yet today and the
 # current time falls in this window, one is pushed automatically.
@@ -145,13 +155,12 @@ MOVEMENT_HR_ACTIVE_DELTA = 30    # bpm over resting that flags "currently exerci
 MOVEMENT_HR_ACTIVE_FLOOR = 100   # ...and an absolute bpm floor
 MOVEMENT_HR_MAX_AGE = 20         # only trust an HR reading this fresh (minutes)
 MOVEMENT_MESSAGES = (
-    "\U0001FA91 AgBot \u00B7 Move break - you've been sitting {mins}. Stand up, roll the "
-    "shoulders and take a 2-3 min walk (kettle, stairs, a lap). Your back and energy will "
-    "thank you.",
-    "\U0001F9CD AgBot \u00B7 You've been seated {mins}. Switch to the standing desk for a "
-    "while, or grab some water and walk it back - frequent little breaks beat one big one.",
-    "\U0001FA91 AgBot \u00B7 Long sit ({mins}). Quick reset: stand, 10 easy squats or a "
-    "short walk, loosen the hips, then back to it. Keeps posture and focus sharp.",
+    "\U0001FA91 AgBot \u00B7 Move break - Garmin suggests little recent movement "
+    "({mins}). If you aren't already active and it feels comfortable, take a short break.",
+    "\U0001F9CD AgBot \u00B7 Movement check ({mins} with little recorded movement). "
+    "A comfortable change of position or brief walk may be useful; skip anything painful.",
+    "\U0001FA91 AgBot \u00B7 Break reminder - limited movement recorded for {mins}. "
+    "If appropriate, pause work and move comfortably. The watch cannot confirm your posture.",
 )
 
 POLL_TIMEOUT = 50          # long-poll seconds
@@ -165,13 +174,7 @@ HISTORY_PROMPT_TURNS = 300  # safety ceiling on injected turns after the day-win
 HISTORY_PROMPT_CHARS = 16000  # char budget for injected history (~a week of chat; oldest truncated if over)
 JOURNAL_PROMPT_CHARS = 6000  # durable notes injected into every prompt (a week+ of food / coach-plan notes)
 JOURNAL_KEEP = 120          # journal lines kept on disk
-HEALTH_ACTIVE_DAYS = 45      # active injury/illness flags injected for up to this long
-HEALTH_PROMPT_CHARS = 800    # char budget for injected health flags
-ANCHOR_KEEP = 24             # capability anchors kept on disk
-ANCHOR_PROMPT_CHARS = 1200   # char budget for injected capability anchors
 PREF_FILE = os.path.join(STATE, "preferences.jsonl")
-PREF_KEEP = 30               # standing preferences / coaching rules kept on disk
-PREF_PROMPT_CHARS = 1400     # char budget for injected standing preferences
 ACTIVITY_CHECK_SECS = 300    # how often to poll for a finished workout
 DEBRIEF_QUIET_SECS = 90 * 60  # after the LAST logged activity, wait this long (no new
                               # activity) before the single collective debrief - a session is
@@ -189,6 +192,55 @@ log = logging.getLogger("agbot")
 
 sys.path.insert(0, BASE)
 import garmin_coach  # noqa: E402
+from coach_memory import MemoryStore
+from coach_plan import TrainingStore, parse_plans, render_plans, unsupported_claims
+from coach_runtime import RuntimeStore, SnapshotCache, message_key
+
+_memory_store = None
+_training_store = None
+_runtime_store = None
+_snapshot_cache = SnapshotCache(garmin_coach.build_snapshot,
+                                int(os.environ.get("AGBOT_SNAPSHOT_TTL", "120")))
+_current_request = None
+_send_sequence = 0
+_generation_sequence = 0
+_worker_started = None
+_last_progress = time.time()
+_stop = threading.Event()
+_delivery_lock = threading.Lock()
+
+
+def memory_store():
+    global _memory_store
+    if _memory_store is None:
+        _memory_store = MemoryStore(os.path.join(STATE, "coach.sqlite3"))
+        _memory_store.migrate_legacy(STATE)
+    return _memory_store
+
+
+def training_store():
+    global _training_store
+    if _training_store is None:
+        _training_store = TrainingStore(os.path.join(STATE, "coach.sqlite3"))
+    return _training_store
+
+
+def runtime_store():
+    global _runtime_store
+    if _runtime_store is None:
+        _runtime_store = RuntimeStore(os.path.join(STATE, "transport.sqlite3"))
+    return _runtime_store
+
+
+def get_snapshot(force=False):
+    started = time.monotonic()
+    result = _snapshot_cache.get(force=force)
+    if isinstance(result, dict) and "__error__" not in result:
+        training_store().record_activities(result.get("recent_activities_7d"))
+    log.info("stage=snapshot seconds=%.2f cached_age=%s", time.monotonic() - started,
+             (result.get("snapshot_cache") or {}).get("age_seconds")
+             if isinstance(result, dict) else None)
+    return result
 
 
 # --------------------------------------------------------------------- helpers
@@ -244,8 +296,13 @@ def append_history(role, text):
     if role == "user":
         text = _defang_markers(text)
     hist = load_history()
+    if _current_request and any(t.get("request_id") == _current_request
+                               and t.get("role") == role and t.get("text") == text for t in hist):
+        return
     hist.append({"role": role, "text": text,
-                 "ts": datetime.now().isoformat(timespec="seconds")})
+                 "request_id": _current_request,
+                 "ts": ((_MSG_SENT_AT if role == "user" and _MSG_SENT_AT else datetime.now())
+                        .isoformat(timespec="seconds"))})
     hist = [t for t in hist if _within_days(t.get("ts"), HISTORY_KEEP_DAYS)]
     hist = hist[-MAX_STORED_TURNS:]
     try:
@@ -357,18 +414,24 @@ def recent_history_text():
     hist = load_history()
     hist = [t for t in hist if _within_days(t.get("ts"), HISTORY_PROMPT_DAYS)]
     hist = hist[-HISTORY_PROMPT_TURNS:]
-    lines = []
-    for turn in hist:
+    # Older user statements are more useful than repeatedly injecting long bot answers.
+    last_assistants = {id(t) for t in [t for t in hist if t.get("role") != "user"][-4:]}
+    hist = [t for t in hist if t.get("role") == "user" or id(t) in last_assistants]
+    lines, used, omitted = [], 0, 0
+    for turn in reversed(hist):
         who = "You" if turn.get("role") == "user" else "AgBot"
         raw = turn.get("ts") or ""
         short = raw[:16].replace("T", " ")
         tag = _day_tag(raw)
         stamp = ("[" + short + ((" " + tag) if tag else "") + "] ") if raw else ""
-        lines.append(stamp + who + ": " + (turn.get("text") or "").strip())
-    text = "\n".join(lines)
-    if len(text) > HISTORY_PROMPT_CHARS:
-        text = "..." + text[-HISTORY_PROMPT_CHARS:]
-    return text
+        line = stamp + who + ": " + (turn.get("text") or "").strip()
+        if used + len(line) + 1 > HISTORY_PROMPT_CHARS:
+            omitted += 1
+            continue
+        lines.append(line)
+        used += len(line) + 1
+    prefix = f"[Bounded context: {omitted} older/oversized turns omitted.]\n" if omitted else ""
+    return prefix + "\n".join(reversed(lines))
 
 
 def append_journal(text, on_date=None):
@@ -376,12 +439,15 @@ def append_journal(text, on_date=None):
     user reports a meal from an earlier day ('last night's dinner', shared the morning after).
     Defaults to today. The stored `ts` always stays the real capture time."""
     entry = {"date": on_date or date.today().isoformat(), "text": text.strip(),
-             "ts": datetime.now().isoformat(timespec="seconds")}
-    try:
-        with open(JOURNAL_FILE, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    except Exception as exc:  # noqa: BLE001
-        log.error("journal save failed: %s", exc)
+             "ts": datetime.now().isoformat(timespec="seconds"), "request_id": _current_request}
+    if _current_request:
+        for line in read_file(JOURNAL_FILE).splitlines():
+            old = json.loads(line)
+            if (old.get("request_id") == _current_request and old.get("date") == entry["date"]
+                    and old.get("text") == entry["text"]):
+                return
+    with open(JOURNAL_FILE, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
 _LOG_MARKER_RE = re.compile(r"\[\[LOG(?:\s+(\d{4}-\d{2}-\d{2}))?:\s*(.*?)\]\]",
@@ -430,7 +496,7 @@ def _logged_confirmation(on_date=None):
 # on reconnect - so a photo sent at 23:57 can arrive hours later, the NEXT day. Processing
 # time is therefore not when the user ate. We remember when the message being handled was
 # actually SENT (Telegram's 'date' field) and treat that, not the wall clock, as "when".
-# The poll loop is single-threaded, so one module-level value is safe.
+# Only the serial coaching worker modifies this; polling/publishing do not.
 _MSG_SENT_AT = None
 
 
@@ -483,31 +549,6 @@ def _extract_rest_marker(text):
 
 _PLAN_MARKER_RE = re.compile(r"\[\[PLAN:\s*(.*?)\]\]", re.IGNORECASE | re.DOTALL)
 
-
-def _extract_plan_marker(text):
-    """Pull a model-emitted [[PLAN: ...]] marker off a reply. The prompts append it when
-    AgBot commits to a MULTI-DAY training intent (e.g. 'I'll program vigorous VO2max
-    intervals over the next few days'), so the plan survives beyond a single chat and can
-    be re-surfaced each morning. Returns (clean_text, plan_or_None)."""
-    if not text:
-        return text, None
-    plans = _PLAN_MARKER_RE.findall(text)
-    if not plans:
-        return text, None
-    clean = _PLAN_MARKER_RE.sub("", text).rstrip()
-    plan = " ".join(" ".join(plans).split()).strip()
-    return clean, (plan or None)
-
-
-def _harvest_plan(text):
-    """Extract any [[PLAN: ...]] marker and journal it as durable coach context so it
-    persists into future briefs/answers. Returns the cleaned reply text."""
-    text, plan = _extract_plan_marker(text)
-    if plan:
-        append_journal("[coach plan] " + plan)
-    return text
-
-
 _EXPLAN_MARKER_RE = re.compile(r"\[\[EXERCISE_PLAN:\s*(.*?)\]\]", re.IGNORECASE | re.DOTALL)
 
 
@@ -553,287 +594,35 @@ def recent_journal_text():
         d = e.get("date", "")
         tag = _day_tag(d)
         label = d + ((" (" + tag + ")") if tag else "")
-        entries.append((label + ": " + (e.get("text") or "")).strip())
-    text = "\n".join(entries)
-    if len(text) > JOURNAL_PROMPT_CHARS:
-        text = "..." + text[-JOURNAL_PROMPT_CHARS:]
-    return text
-
-
-HEALTH_RE = re.compile(
-    r"\b("
-    r"injur\w*|hurts?|hurting|"
-    r"pain\w*|sore(?:ness)?|aching|aches?|"
-    r"sprain\w*|strained|straining|pulled|tweak\w*|twisted|"
-    r"sick|ill|unwell|fever\w*|the flu|a cold|coughing|sore throat|"
-    r"nause\w*|dizzy|migraine|headache|cramp\w*|"
-    r"swollen|swelling|stiff\w*|niggl\w*|"
-    r"food poisoning|throwing up|vomit\w*|"
-    r"can'?t (?:walk|run|lift|train|move)"
-    r")\b", re.IGNORECASE)
-
-
-def append_health(text, status="active"):
-    text = (text or "").strip()[:240]
-    if not text:
-        return
-    entry = {"date": date.today().isoformat(), "text": text, "status": status,
-             "ts": datetime.now().isoformat(timespec="seconds")}
-    try:
-        with open(HEALTH_FILE, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    except Exception as exc:  # noqa: BLE001
-        log.error("health save failed: %s", exc)
-
-
-def _load_health():
-    try:
-        with open(HEALTH_FILE, "r", encoding="utf-8") as fh:
-            return [json.loads(ln) for ln in fh if ln.strip()]
-    except FileNotFoundError:
-        return []
-    except Exception:  # noqa: BLE001
-        return []
-
+        if not (e.get("text") or "").startswith("[coach plan]"):
+            entries.append((d, (label + ": " + (e.get("text") or "")).strip()))
+    selected, size, omitted = [], 0, 0
+    for day, line in reversed(entries):
+        if day != date.today().isoformat() and size + len(line) > JOURNAL_PROMPT_CHARS:
+            omitted += 1
+            continue
+        selected.append(line)
+        size += len(line) + 1
+    prefix = f"[{omitted} older journal records omitted; plans are in TRAINING_STATE.]\n"
+    return (prefix if omitted else "") + "\n".join(reversed(selected))
 
 def active_health_text():
     """Injuries/illness the user reported and hasn't marked recovered - injected into EVERY
     prompt so no recommendation ignores them, and they don't scroll out of chat."""
-    items = _load_health()
-    if not items:
-        return ""
-    cutoff = (date.today() - timedelta(days=HEALTH_ACTIVE_DAYS)).isoformat()
-    active = [e for e in items if e.get("status", "active") == "active"
-              and str(e.get("date", "")) >= cutoff]
-    if not active:
-        return ""
-    lines = [(str(e.get("date", "")) + ": " + (e.get("text") or "")).strip() for e in active]
-    text = "\n".join(lines)
-    if len(text) > HEALTH_PROMPT_CHARS:
-        text = text[-HEALTH_PROMPT_CHARS:]
-    return text
+    return memory_store().render("health")
 
 
-def resolve_health():
-    items = _load_health()
-    cleared = [e for e in items if e.get("status", "active") == "active"]
-    if not cleared:
-        return []
-    for e in items:
-        if e.get("status", "active") == "active":
-            e["status"] = "resolved"
-    try:
-        _atomic_write(HEALTH_FILE,
-                      "".join(json.dumps(e, ensure_ascii=False) + "\n" for e in items))
-    except Exception as exc:  # noqa: BLE001
-        log.error("health resolve failed: %s", exc)
-    return [(e.get("text") or "").strip() for e in cleared]
-
-
-_HEALTH_NEG_RE = re.compile(
-    r"\b(?:no|not|n'?t|never|without|zero)\s+(?:\w+\s+){0,3}"
-    r"(?:pain|sore\w*|hurt\w*|ach\w*|injur\w*|niggl\w*|stiff\w*|cramp\w*|tight\w*|sprain\w*)"
-    r"|\b(?:pain|ache)[- ]?free\b"
-    r"|\b(?:all (?:good|fine|better|clear|healed)|absolutely (?:fine|good)|"
-    r"feeling (?:good|fine|great|better)|no longer (?:hurt\w*|sore)|fully recovered|"
-    r"back to normal|0\s*/\s*10|0 pain|zero pain)\b",
-    re.IGNORECASE)
-
-_HEALTH_PAST_RE = re.compile(
-    r"\b(?:previous\w*|used to|in the past|usually|history of|tend to|tends to|"
-    r"prone to|old injur\w*|past injur\w*)\b", re.IGNORECASE)
-
-
-def _health_snippet(probe):
-    """Keep only the clause(s) that genuinely report a CURRENT symptom, so a long multi-topic
-    message isn't stored verbatim as a 'flag'. Drops fragments that are negated ('no pain',
-    'knee's fine'), a question ('is that fine or hurts my nutrition?'), or about a PAST/general
-    tendency ('my previous injuries') - these were the false positives that piled up. Returns ''
-    when nothing genuine remains, which tells the caller not to capture anything."""
-    frags = re.split(r"(?<=[.!?])\s+|\n+", probe)
-    hits = []
-    for f in frags:
-        f = f.strip(" -\u2022\t")
-        if not f or not HEALTH_RE.search(f):
-            continue
-        if f.rstrip().endswith("?"):
-            continue  # a question about symptoms is not a report of one
-        if _HEALTH_NEG_RE.search(f):
-            continue  # negated or an all-clear ("no pain", "feeling fine")
-        if _HEALTH_PAST_RE.search(f):
-            continue  # a past/general tendency, not a current injury
-        hits.append(f)
-    snip = re.sub(r"\s+", " ", "; ".join(hits)).strip()
-    return snip[:200]
-
-
-def _maybe_capture_health(kind, text, payload):
-    """Durably record a self-reported injury/illness so it's injected into every future
-    prompt (until the user says 'recovered'), not just the ephemeral chat window."""
-    if kind not in ("qa", "log"):
-        return
-    probe = ((payload if kind == "log" else text) or "").strip()
-    if not probe or not HEALTH_RE.search(probe):
-        return
-    if not re.search(r"\b(i|i'?m|ive|i'?ve|my|me)\b", probe.lower()):
-        return  # only first-person reports about the user's own state
-    snippet = _health_snippet(probe)
-    if not snippet:
-        return  # nothing genuinely reported (negated, a question, or a past tendency)
-    for e in _load_health():
-        if e.get("status", "active") == "active" and (e.get("text") or "").strip() == snippet:
-            return  # already on record
-    append_health(snippet)
-    log.info("Captured health flag: %r", snippet[:80])
-
-
-# ---- Model-driven health-flag clearing --------------------------------------------------
-# Regex capture (above) and the exact-keyword "recovered" route are coarse: a natural all-clear
-# like "knees, shoulder and elbow are all fine now" matches neither, so old flags never clear
-# and keep surfacing in every brief. This lets the model resolve flags from ordinary phrasing,
-# and to clear ONE area while leaving others active.
+def resolve_health(source_text="recovered"):
+    return [r["text"] for r in memory_store().resolve_health(
+        ["all"], source_text=source_text, allow_all=True)]
+# Legacy markers are recognized only to prevent old control text leaking to Telegram.
 _HEALTH_CLEAR_RE = re.compile(r"\[\[HEALTH_CLEAR:\s*(.*?)\]\]", re.IGNORECASE | re.DOTALL)
-# Symmetric with HEALTH_CLEAR: lets the MODEL persist a NEW injury it recognized from the
-# user's message when the coarse first-person regex capture missed it (oblique phrasing, or a
-# turn routed outside qa/log). Format: [[HEALTH_FLAG: area | short description]].
 _HEALTH_FLAG_RE = re.compile(r"\[\[HEALTH_FLAG:\s*(.*?)\]\]", re.IGNORECASE | re.DOTALL)
 
-# body-part -> substrings that count as the same area in a stored flag's text, so clearing
-# "elbow" also resolves a flag phrased "triceps tendonitis", etc.
-_PART_SYNONYMS = {
-    "elbow": ("elbow", "tricep", "forearm"),
-    "shoulder": ("shoulder", "delt", "rotator"),
-    "knee": ("knee", "patell"),
-    "back": ("back", "lumbar", "spine", "thoracic", "t4", "t-4", "mid-back", "mid back"),
-    "thoracic": ("thoracic", "t4", "t-4", "mid-back", "mid back"),
-    "t4": ("t4", "t-4", "thoracic"),
-    "hamstring": ("hamstring",),
-    "glute": ("glute",),
-    "quad": ("quad",),
-    "calf": ("calf", "calves"),
-    "hip": ("hip",),
-    "wrist": ("wrist",),
-    "ankle": ("ankle", "achilles"),
-    "neck": ("neck",),
-    "groin": ("groin", "adductor"),
-    "chest": ("chest", "pec"),
-    "bicep": ("bicep",),
-}
 
-
-def _extract_health_clear_marker(text):
-    if not text:
-        return text, None
-    found = _HEALTH_CLEAR_RE.findall(text)
-    if not found:
-        return text, None
-    clean = _HEALTH_CLEAR_RE.sub("", text).rstrip()
-    what = " ".join(" ".join(found).split()).strip().lower()
-    return clean, (what or None)
-
-
-def _harvest_health_clear(text):
-    """Resolve active health flags the model says the user reported better. `all` (or similar)
-    clears everything; otherwise only flags matching a named body area are cleared."""
-    text, what = _extract_health_clear_marker(text)
-    if not what:
-        return text
-    items = _load_health()
-    active = [e for e in items if e.get("status", "active") == "active"]
-    if not active:
-        return text
-    clear_all = any(w in what for w in ("all", "everything", "no injur", "nothing left",
-                                        "no more", "fully recovered", "back to normal"))
-    named = []
-    if not clear_all:
-        for part, syns in _PART_SYNONYMS.items():
-            if part in what:
-                named.extend(syns)
-    cleared = []
-    for e in active:
-        etext = (e.get("text") or "").lower()
-        if clear_all or (named and any(s in etext for s in named)):
-            e["status"] = "resolved"
-            cleared.append(e)
-    if cleared:
-        try:
-            _atomic_write(HEALTH_FILE,
-                          "".join(json.dumps(e, ensure_ascii=False) + "\n" for e in items))
-            log.info("Health cleared via marker (%r): %d flag(s)", what[:40], len(cleared))
-        except Exception as exc:  # noqa: BLE001
-            log.error("health clear (marker) failed: %s", exc)
-    return text
-
-
-def _harvest_health_flag(text):
-    """Persist a NEW injury/pain the MODEL flagged from the user's message when the coarse
-    regex capture missed it. Symmetric with _harvest_health_clear. Each
-    [[HEALTH_FLAG: area | note]] becomes an active flag, deduped against existing active ones."""
-    if not text:
-        return text
-    found = _HEALTH_FLAG_RE.findall(text)
-    clean = _HEALTH_FLAG_RE.sub("", text).rstrip()
-    if not found:
-        return clean
-    existing = [(e.get("text") or "").strip().lower()
-                for e in _load_health() if e.get("status", "active") == "active"]
-    for raw in found:
-        snippet = " ".join((raw or "").replace("|", " - ").split()).strip()[:200]
-        if not snippet:
-            continue
-        low = snippet.lower()
-        if any(low in ex or ex in low for ex in existing):
-            continue  # already on record
-        append_health(snippet)
-        existing.append(low)
-        log.info("Health flag added via marker: %r", snippet[:80])
-    return clean
-
-
-# ---- Durable capability anchors (what the user ACTUALLY performed) -----------------------
-# Garmin indoor rides carry HR only (no power), and a load the user verbally reduced to lives
-# only in the 7-day chat window before scrolling away. So the weights/watts/durations they
-# actually managed are re-injected here, in full, until superseded - the model calibrates to
-# THESE.
-def append_anchor(text):
-    text = (text or "").strip()[:240]
-    if not text:
-        return
-    entry = {"date": date.today().isoformat(), "text": text,
-             "ts": datetime.now().isoformat(timespec="seconds")}
-    try:
-        with open(ANCHOR_FILE, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    except Exception as exc:  # noqa: BLE001
-        log.error("anchor save failed: %s", exc)
-
-
-def _load_anchors():
-    try:
-        with open(ANCHOR_FILE, "r", encoding="utf-8") as fh:
-            return [json.loads(ln) for ln in fh if ln.strip()]
-    except FileNotFoundError:
-        return []
-    except Exception:  # noqa: BLE001
-        return []
-
-
-def active_anchors_text():
-    """The most recent capability anchors, oldest-last so a newer line supersedes an older one
-    for the same movement. Injected into every prompt."""
-    items = _load_anchors()[-ANCHOR_KEEP:]
-    if not items:
-        return ""
-    lines = []
-    for e in items:
-        d = e.get("date", "")
-        tag = _day_tag(d)
-        label = d + ((" (" + tag + ")") if tag else "")
-        lines.append((label + ": " + (e.get("text") or "")).strip())
-    text = "\n".join(lines)
-    if len(text) > ANCHOR_PROMPT_CHARS:
-        text = "..." + text[-ANCHOR_PROMPT_CHARS:]
-    return text
+def active_anchors_text(query=""):
+    """Retrieve source-labelled capability records by entity, not just recency."""
+    return memory_store().render("anchor", query=query, max_chars=8000)
 
 
 _ANCHOR_MARKER_RE = re.compile(r"\[\[ANCHOR:\s*(.*?)\]\]", re.IGNORECASE | re.DOTALL)
@@ -841,100 +630,12 @@ _ANCHOR_MARKER_RE = re.compile(r"\[\[ANCHOR:\s*(.*?)\]\]", re.IGNORECASE | re.DO
 # used only as a final egress strip so nothing like [[FOO: ...]] can ever leak to the user.
 _ANY_CONTROL_MARKER_RE = re.compile(r"\[\[[A-Z][A-Z0-9_]*(?:\s+\d{4}-\d{2}-\d{2})?(?:\s*:[^\]]*)?\]\]")
 
-
-def _extract_anchor_marker(text):
-    if not text:
-        return text, None
-    found = _ANCHOR_MARKER_RE.findall(text)
-    if not found:
-        return text, None
-    clean = _ANCHOR_MARKER_RE.sub("", text).rstrip()
-    note = " ".join(" ".join(found).split()).strip()
-    return clean, (note or None)
-
-
-def _harvest_anchor(text):
-    """Persist a capability anchor the model captured (a load/watt/duration the user actually
-    did or reduced to), skipping an exact repeat of the latest one. Returns the cleaned text."""
-    text, note = _extract_anchor_marker(text)
-    if note:
-        existing = _load_anchors()
-        if not existing or (existing[-1].get("text") or "").strip() != note:
-            append_anchor(note)
-            log.info("Captured capability anchor: %r", note[:80])
-    return text
-
-
-# ---- Durable standing preferences / coaching rules (do's & don'ts stated in chat) --------
-# Unlike anchors (numbers they performed) or health flags (injuries), these are LASTING coaching
-# rules: exercise substitutions, movements to avoid, equipment habits, scheduling choices
-# ("from now on prefer single-leg RDL over normal RDL", "always offer the lumbar belt for
-# hinges"). The model emits [[PREF: ...]] to persist one; they're injected into EVERY prompt
-# and must be honoured. A later line supersedes/updates an earlier one.
-PREF_MARKER = "PREF"
-
-
-def append_pref(text):
-    text = (text or "").strip()[:240]
-    if not text:
-        return
-    entry = {"date": date.today().isoformat(), "text": text,
-             "ts": datetime.now().isoformat(timespec="seconds")}
-    try:
-        with open(PREF_FILE, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    except Exception as exc:  # noqa: BLE001
-        log.error("pref save failed: %s", exc)
-
-
-def _load_prefs():
-    try:
-        with open(PREF_FILE, "r", encoding="utf-8") as fh:
-            return [json.loads(ln) for ln in fh if ln.strip()]
-    except FileNotFoundError:
-        return []
-    except Exception:  # noqa: BLE001
-        return []
-
-
 def active_prefs_text():
-    """The most recent standing preferences/rules, oldest-last so a newer line supersedes an
-    older one. Injected into every prompt."""
-    items = _load_prefs()[-PREF_KEEP:]
-    if not items:
-        return ""
-    lines = [((e.get("date", "") + ": " + (e.get("text") or "")).strip()) for e in items]
-    text = "\n".join(lines)
-    if len(text) > PREF_PROMPT_CHARS:
-        text = "..." + text[-PREF_PROMPT_CHARS:]
-    return text
+    """Active standing constraints are never silently omitted."""
+    return memory_store().render("preference")
 
 
 _PREF_MARKER_RE = re.compile(r"\[\[PREF:\s*(.*?)\]\]", re.IGNORECASE | re.DOTALL)
-
-
-def _harvest_pref(text):
-    """Persist a standing preference/rule the user stated (exercise substitution, movement to
-    avoid, equipment habit, scheduling choice), skipping a near-duplicate of an existing one."""
-    if not text:
-        return text
-    found = _PREF_MARKER_RE.findall(text)
-    clean = _PREF_MARKER_RE.sub("", text).rstrip()
-    if not found:
-        return clean
-    existing = [(e.get("text") or "").strip().lower() for e in _load_prefs()]
-    for raw in found:
-        note = " ".join((raw or "").split()).strip()[:240]
-        if not note:
-            continue
-        low = note.lower()
-        if any(low == ex or low in ex or ex in low for ex in existing):
-            continue  # already captured (or a subset of an existing rule)
-        append_pref(note)
-        existing.append(low)
-        log.info("Captured standing preference: %r", note[:80])
-    return clean
-
 
 def load_fitness_profile():
     """Return the cached slow-changing fitness profile (fitness age, race
@@ -947,7 +648,7 @@ def load_fitness_profile():
             cached = json.load(fh)
     except Exception:  # noqa: BLE001
         cached = None
-    if isinstance(cached, dict):
+    if isinstance(cached, dict) and cached.get("schema_version") == 2:
         try:
             age_h = ((datetime.now()
                       - datetime.fromisoformat(cached.get("generated_at")))
@@ -963,7 +664,10 @@ def load_fitness_profile():
         except Exception as exc:  # noqa: BLE001
             log.error("fitness cache save failed: %s", exc)
         return prof
-    return cached  # stale cache (or None) if the refresh failed
+    if isinstance(cached, dict):
+        cached["cache_status"] = "stale: refresh failed"
+        cached["refresh_error"] = prof.get("__error__") if isinstance(prof, dict) else "no response"
+    return cached
 
 
 def load_token():
@@ -976,12 +680,12 @@ def load_token():
     return m.group(0)
 
 
-TOKEN = load_token()
-API = "https://api.telegram.org/bot" + TOKEN
+def telegram_api():
+    return "https://api.telegram.org/bot" + load_token()
 
 
 def tg(method, params=None, timeout=60):
-    url = API + "/" + method
+    url = telegram_api() + "/" + method
     data = urllib.parse.urlencode(params).encode("utf-8") if params else None
     req = urllib.request.Request(url, data=data)
     with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -990,7 +694,7 @@ def tg(method, params=None, timeout=60):
 
 def _post(method, params, timeout=30):
     """POST that returns Telegram's JSON even on HTTP 4xx (never raises)."""
-    url = API + "/" + method
+    url = telegram_api() + "/" + method
     data = urllib.parse.urlencode(params).encode("utf-8")
     req = urllib.request.Request(url, data=data)
     try:
@@ -1119,30 +823,50 @@ def _strip_control_markers(text):
     return text.rstrip()
 
 
-def send_message(chat_id, text):
-    text = _strip_control_markers(text)  # never let a raw [[MARKER]] leak into a message
+def send_message(chat_id, text, summary_date=None):
+    global _send_sequence
+    text = _strip_control_markers(text)
     rendered = md_to_html(text)
-    for chunk in _chunks(rendered, 4000):
+    keys = []
+    chunks = [chunk for chunk in _chunks(rendered, 4000) if chunk.strip()]
+    for index, chunk in enumerate(chunks):
         if not chunk.strip():
             continue
-        resp = _post("sendMessage", {
-            "chat_id": chat_id,
-            "text": chunk,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": "true",
-        })
-        if resp.get("ok"):
-            continue
-        # Telegram rejected the markup - resend as plain text so nothing is lost.
-        log.warning("HTML send failed (%s); retrying as plain text",
-                    resp.get("description"))
-        resp = _post("sendMessage", {
-            "chat_id": chat_id,
-            "text": _html_to_plain(chunk),
-            "disable_web_page_preview": "true",
-        })
-        if not resp.get("ok"):
-            log.error("sendMessage failed (plain too): %s", resp.get("description"))
+        _send_sequence += 1
+        key = message_key(_current_request, _send_sequence, chat_id, chunk)
+        payload = {"text": chunk, "parse_mode": "HTML", "disable_web_page_preview": "true"}
+        if summary_date:
+            payload.update(_summary_date=summary_date, _summary_complete=index == len(chunks) - 1)
+        runtime_store().enqueue(key, chat_id, payload)
+        keys.append(key)
+    return keys
+
+
+def flush_outbox():
+    if not _delivery_lock.acquire(blocking=False):
+        return
+    try:
+        for item in runtime_store().due_messages():
+            params = {k: v for k, v in item["payload"].items() if not k.startswith("_")}
+            params["chat_id"] = item["chat_id"]
+            response = _post("sendMessage", params)
+            if (not response.get("ok") and response.get("error_code") == 400
+                    and "parse" in str(response.get("description", "")).lower()):
+                params.pop("parse_mode", None)
+                params["text"] = _html_to_plain(params["text"])
+                response = _post("sendMessage", params)
+            if response.get("ok"):
+                runtime_store().delivered(item["id"], response.get("result", {}).get("message_id"))
+                if item["payload"].get("_summary_complete"):
+                    write_file(LAST_SUMMARY_FILE, item["payload"]["_summary_date"])
+            else:
+                description = response.get("description", "Telegram rejected delivery")
+                retry = (response.get("parameters") or {}).get("retry_after")
+                runtime_store().delivery_failed(item["id"], description, retry)
+                log.error("stage=delivery queued_for_retry=true error=%s", description)
+                break  # Preserve chunk order while the endpoint is unavailable.
+    finally:
+        _delivery_lock.release()
 
 
 def owner():
@@ -1169,10 +893,15 @@ def download_file(file_id):
     fp = (info.get("result") or {}).get("file_path")
     if not fp:
         return None
-    url = "https://api.telegram.org/file/bot" + TOKEN + "/" + fp
+    url = "https://api.telegram.org/file/bot" + load_token() + "/" + fp
     ext = os.path.splitext(fp)[1] or ".jpg"
-    dest = os.path.join(INCOMING, "img_" + str(int(time.time())) + ext)
-    urllib.request.urlretrieve(url, dest)
+    fd, dest = tempfile.mkstemp(prefix="attachment_", suffix=ext, dir=INCOMING)
+    os.close(fd)
+    try:
+        urllib.request.urlretrieve(url, dest)
+    except Exception:
+        os.remove(dest)
+        raise
     return dest
 
 
@@ -1305,25 +1034,12 @@ _llm_last_outage = False
 
 
 def _is_llm_outage(stderr):
-    """True if backend stderr looks like a transient auth-or-availability outage of the model
-    service (vs a genuine local error), so callers can say so and ask the user to resend."""
+    """Identify a likely model-service outage for diagnostics."""
     return bool(stderr) and bool(_LLM_OUTAGE_RE.search(stderr))
 
 
 def _llm_fail_notice(chat_id, what="answer"):
-    """Fallback sent when run_llm returned nothing. If the failure looked like a model-service
-    outage, say so and ask the user to RESEND (missed messages are NOT auto-processed - the
-    Telegram offset advances on receipt); otherwise a brief generic retry note."""
-    if _llm_last_outage:
-        send_message(chat_id,
-                     "\u26A0\uFE0F AgBot: my AI service is having an outage right now, so I got "
-                     "your message but can't process it yet. I won't reply to or log THIS message "
-                     "until it's back - please resend it once I'm working again. I recover on my "
-                     "own, but I can't queue messages I missed.")
-    else:
-        send_message(chat_id,
-                     "\U0001F916 AgBot: sorry, I couldn't %s just now - please try again in a "
-                     "minute." % what)
+    raise RuntimeError("Model unavailable while trying to " + what)
 
 
 def run_llm(prompt, image=None, images=None):
@@ -1335,8 +1051,14 @@ def run_llm(prompt, image=None, images=None):
     below. `images` is a list of local image file paths; only vision-capable
     backends use them (text-only backends simply ignore them).
     """
-    global _llm_last_outage
+    global _llm_last_outage, _generation_sequence
     _llm_last_outage = False
+    _generation_sequence += 1
+    cache_key = (f"{_current_request}:generation:{_generation_sequence}"
+                 if _current_request else None)
+    cached = runtime_store().saved_generation(cache_key)
+    if cached is not None:
+        return cached
     if len(prompt) > 120000:
         log.warning("prompt is very large (%d chars, ~%dK tokens)", len(prompt), len(prompt) // 4000)
     imgs = list(images or [])
@@ -1347,11 +1069,15 @@ def run_llm(prompt, image=None, images=None):
         log.error("Unknown AGBOT_LLM backend %r (available: %s)",
                   LLM_BACKEND, ", ".join(sorted(_LLM_BACKENDS)))
         return None
+    started = time.monotonic()
     try:
-        return backend(prompt, imgs)
-    except Exception as exc:  # noqa: BLE001
-        log.error("LLM backend %r failed: %s", LLM_BACKEND, exc)
-        return None
+        result = backend(prompt, imgs)
+        if result:
+            runtime_store().save_generation(cache_key, result)
+        return result
+    finally:
+        log.info("stage=llm model=%s seconds=%.2f prompt_chars=%d images=%d",
+                 COPILOT_MODEL, time.monotonic() - started, len(prompt), len(imgs))
 
 
 def _llm_copilot(prompt, images):
@@ -1368,11 +1094,11 @@ def _llm_copilot(prompt, images):
     env.setdefault("PYTHONUTF8", "1")
     cmd = [
         COPILOT_EXE, "-s",
-        "--no-ask-user", "--allow-all-tools",
+        "--no-ask-user", "--available-tools=",
         "--no-custom-instructions",
-        "--disable-builtin-mcps",
+        "--disable-builtin-mcps", "--disable-mcp-server", "garmin",
         "--no-color", "--no-remote", "--no-remote-export",
-        "--reasoning-effort", COPILOT_REASONING_EFFORT,
+        "--reasoning-effort", COPILOT_REASONING_EFFORT, "--context", "default",
     ]
     if COPILOT_MODEL:
         cmd += ["--model", COPILOT_MODEL]
@@ -1394,6 +1120,7 @@ def _llm_copilot(prompt, images):
         global _llm_last_outage
         if _is_llm_outage(stderr):
             _llm_last_outage = True
+        return None
     return _scrub(res.stdout or "") or None
 
 
@@ -1447,271 +1174,120 @@ def today_human():
     return datetime.now().strftime("%a %d %b")
 
 
-# Injected into every generation path (summary, Q&A, image, weekly, nutrition,
-# performance). Forces the model to reason over the WHOLE data picture, not a
-# single metric, then report tightly. The bot's standing coaching directive.
-DATA_USE_DIRECTIVE = (
-    "COACHING DIRECTIVE - read before you answer:\n"
-    "Ground every recommendation in the user's FULL data picture above, never one metric in "
-    "isolation. Weigh together, and only use fields that are actually present:\n"
-    "- Recovery: for a morning brief prefer morning_readiness (wake-time, WELL_RECOVERED etc.); "
-    "otherwise training-readiness score + sub-factors, recovery-time hours, HRV vs baseline, "
-    "body_battery_current (Garmin's most-recent value; matches the Connect app/web), sleep "
-    "score/duration/stages plus Garmin's own verdict on the night (last_night_sleep.score_feedback_garmin "
-    "and score_personalized_insight) and its per-dimension sub_scores - name the weak dimension (e.g. REM "
-    "or deep below its optimal band) instead of only the overall number, naps_today (daytime naps add "
-    "recovery and alertness - factor them in, don't discuss overnight sleep alone), stress.\n"
-    "- Sleep need & timing: last_night_sleep.sleep_need_tonight_h is Garmin's PERSONALISED sleep "
-    "target for tonight (compare with sleep_need_baseline_h; sleep_need_tonight_feedback and "
-    "sleep_need_tonight_adjustments explain why it moved - sleep debt, HRV, or today's nap). Turn it "
-    "into a concrete bedtime, and read bed_time_local / wake_time_local against "
-    "profile_config.habitual_sleep_window (the user's usual bed/wake schedule) to flag late or irregular "
-    "timing rather than judging total hours alone.\n"
-    "- Illness / overreaching watch: last_night_sleep.skin_temp_deviation_c is the deviation from "
-    "the user's ~19-day baseline. A notable swing (roughly >=+/-0.5C) - ESPECIALLY together with a "
-    "raised resting HR (wellness_today.rhr_today vs rhr_7d_avg), elevated respiration "
-    "(wellness_today.respiration_sleep_avg / waking), low HRV, or breathing_disruptions - suggests "
-    "the body is fighting illness, alcohol, heat or under-recovery; when several line up, back off "
-    "intensity and say why. A small deviation with everything else normal is noise - don't alarm.\n"
-    "- Day strain: wellness_today sedentary_h vs active_h/highly_active_h (long sedentary days are "
-    "their own load), the stress-duration split (rest/low/medium/high_stress_min + stress_qualifier) "
-    "plus stress_curve_hourly (WHEN stress peaked through the day, e.g. a stressful evening), "
-    "and the resting-HR trend (rhr_today vs rhr_7d_avg - a multi-day rise is an early fatigue flag).\n"
-    "- Load & direction: ACWR + acute/chronic load, training status/trend, and the last 7 days of "
-    "sessions - including logged_sets (exercises, reps, top weight) so you know which muscle groups "
-    "were just trained. Use training_status.load_focus (aerobic-low / aerobic-high / anaerobic load "
-    "vs Garmin's target ranges + its feedback phrase, e.g. AEROBIC_LOW_FOCUS) to steer WHICH kind of "
-    "session to add so the 4-week balance moves toward target. Each recent session also carries "
-    "Garmin's training_effect_label (e.g. RECOVERY / TEMPO / VO2MAX), its bb_cost (body-battery drain) "
-    "and per-session intensity minutes - use these to judge how taxing each workout actually was. When "
-    "scheduling, respect profile_config.available_training_days / preferred_long_training_days, and read "
-    "weekly_trends (last 8 weeks of avg daily steps and avg stress) for overall direction.\n"
-    "- Fitness: VO2max, fitness age, endurance score, hill score, race predictions, lactate-threshold "
-    "HR, cycling FTP, weekly_intensity (total_toward_goal vs weekly_goal - the WHO 150-min target, "
-    "vigorous counts double), and personal_records (nudge when a session is within reach of a PR).\n"
-    "- Body & context: weight trend (plus latest_weigh_in_30d body_water_pct / bone_mass_g when a "
-    "composition weigh-in exists), sweat_loss_ml (post-sweaty-session "
-    "rehydration nudge vs hydration_goal_ml), and the NOTES the user logged.\n"
-    "- Calories: calorie_budget is the user's deterministic daily plan, computed from their OWN "
-    "body stats (weight, height, age, BMI) - calorie_budget.target_kcal is their fat-loss intake "
-    "TARGET (maintenance_kcal minus a BMI-scaled deficit_kcal). Present calories as THREE numbers "
-    "when they ask or when you nudge food: TARGET (calorie_budget.target_kcal) - EATEN (tally what "
-    "they have actually LOGGED today) - REMAINING (target minus eaten). NEVER use Garmin's "
-    "remaining_kcal / net_calorie_goal (they log food in the bot, not Garmin, so wellness_today."
-    "calorie_intake_tracked_in_garmin is false and those fields are bogus - they ignore what the "
-    "user ate and grow as they train). energy_burned_so_far_kcal / today_so_far.total_kcal are "
-    "burn SO FAR, not a budget. If nothing is logged yet, just state the target; keep it "
-    "encouraging, not restrictive, and if calorie_budget is null fall back to protein + portion "
-    "guidance.\n"
-    "- Protein: use calorie_budget.protein_target_g as THE daily protein target and "
-    "protein_floor_g as the do-not-drop-below line. These are computed from their CURRENT "
-    "weight (2.2 g/kg, i.e. ~1 g per pound, floor 1.8 g/kg) - quote those numbers, never "
-    "invent or carry over a different figure. Protein is the single biggest lever on whether "
-    "the weight being lost comes off as fat or muscle, so treat the target as the priority "
-    "macro: if something has to be missed on a given day, miss carbs or fat, not protein. "
-    "Track it the same way as calories - TARGET, EATEN so far, REMAINING - and when they're "
-    "short late in the day name a concrete high-protein option they actually have. Roughly "
-    "4 kcal per gram, so protein_kcal of target_kcal is already spoken for; build the rest of "
-    "the day's food around it. EXCEPTION: do NOT apply this protein-first framing to a "
-    "PRE-WORKOUT meal - see the pre-workout rule next; before training, carbs are the right fuel "
-    "and protein can come after.\n"
-    "- Pre-workout fuelling is about CARBS, not protein, and MEAL TIMING vs training sets the "
-    "macro priority. When a workout is planned or pending today and the user is eating BEFOREHAND "
-    "(they haven't trained yet), a carb-forward / high-GI pre-workout meal (fruit, sweet potato, "
-    "oats, rice cakes, toast/honey, rice) is CORRECT FUEL - AFFIRM it. Do NOT call it 'too "
-    "carb-heavy', do NOT frame the low protein as a gap or failure, and do NOT push a protein "
-    "anchor 'now'. Protein on a training day is best placed POST-workout and spread across the "
-    "REST of the day; the daily protein target is met over the whole day, never forced onto the "
-    "pre-session meal (a big protein hit right before can also sit heavy). If the user says "
-    "they'll 'have protein later', accept that plan and don't re-push it in the same reply. Never "
-    "offer whey/eggs/chicken (protein) AS a 'quick carb' / energy option before training. Only "
-    "emphasise protein-now when the meal is NOT pre-workout.\n"
-    "- Hydration: the Garmin hydration goal is a BASELINE FLOOR for the day, NOT a quota to "
-    "finish, a cap, or a task with a deadline. Treat it accordingly: (a) work out whether they "
-    "are actually behind by comparing intake against the time of day, and if they are ON or "
-    "AHEAD of pace SAY SO - never manufacture a deficit or tell them to 'catch up' when they "
-    "aren't behind; (b) once the goal is met, note it ONCE and switch to thirst-led language "
-    "('you're covered - drink to thirst from here'), don't keep counting up or imply they have "
-    "finished drinking for the day; (c) NEVER suggest downing several glasses at once to close a "
-    "gap - surplus is simply excreted, and steady sipping beats catch-up chugging; (d) don't "
-    "append a hydration line to every reply - raise it when they're genuinely behind, after a "
-    "high sweat_loss_ml session, or when they ask; (e) late in the evening prefer sips to volume, "
-    "since a big pre-bed load costs them sleep.\n"
-    "- Post-workout only: ACTIVITY_EXTRAS gives time-in-HR-zone (minutes per zone -> was it truly "
-    "easy/hard, and did it match the plan) and, for outdoor sessions, the weather (heat/humidity "
-    "context for pace and HR).\n"
-    "- Progression: when you prescribe sets/reps/weights (or watts/duration for cardio), START "
-    "from what the user ACTUALLY did last time - read CAPABILITY ANCHORS first, then recent "
-    "logged_sets - never from a number they could not complete. Move exactly ONE rung on the reps "
-    "-> sets -> weight ladder (profile has the rule): add reps within range; once the top of the "
-    "range is hit on all sets with 1-2 in reserve, add a SET at the same load; only after they "
-    "handle that higher volume for ~2 sessions, raise load ~5% and drop to the bottom of the "
-    "range. A single good session is NOT a reason to jump weight, and never leap two rungs. If "
-    "they say they reduced a prescribed load to finish, treat the lower number as the new anchor. "
-    "State the one-line reasoning ('last time 12kg x16-22 clean, so today hold 12kg and add a 4th "
-    "set'). Same on the bike: hold watts and extend the interval/add a rep before raising wattage.\n"
-    "- Whole-body coverage + posture/prehab: don't default to only the big compounds. Check the "
-    "last ~7 days of logged_sets and make sure the WEEK also covers the often-skipped bits per the "
-    "profile - CALVES, direct CORE (dead-bug/plank/Pallof), and a short POSTURE/PREHAB piece "
-    "(band pull-aparts, face pulls, thoracic/hip mobility) that matters for a desk worker with "
-    "recurring low-back/shoulder niggles. If calves, core or prehab have had ~zero work lately, "
-    "slot them into a suitable lighter/accessory/recovery session (as a finisher or warm-up) "
-    "rather than piling more onto muscles already trained; even a rest day can carry an optional "
-    "gentle mobility/posture routine.\n"
-    "- Load-building (why Training Status may be stuck LOW): check training_status_key + acwr + "
-    "acute vs chronic load. If status is RECOVERY/DETRAINING or ACWR is LOW (< ~0.8) - acute "
-    "7-day load below the 28-day chronic baseline - and readiness allows with no genuinely "
-    "limiting injury, treat it as a cue to BUILD: program a real moderate-hard quality session "
-    "and aim to stack 2-3 across the week to lift acute load toward chronic. Do NOT default to "
-    "easy/Zone-2/recovery on a GOOD day, and don't let 'low ACWR' become mere reassurance - it's "
-    "a green light to add load. Be HONEST that low-load activities (e-bike commute, pilates, easy "
-    "walk, very light/back-guarded strength) add ~no Garmin training load and won't raise Training "
-    "Status, so a day of only those does not count toward building - name a genuine quality "
-    "session instead when recovery allows. INJURY-vs-LOAD CONFLICT: if an ACTIVE injury rules "
-    "out loaded/axial STRENGTH (e.g. a low-back / spine flag) but NOT low-impact CARDIO, the "
-    "load-building quality session should be BACK-SAFE CARDIO - an indoor-bike threshold/VO2 or "
-    "Zone 3-4 interval block (spine-neutral cardio the user tolerates) - NOT a 'back-safe' "
-    "STRENGTH session, which stays low-HR and won't raise Training Status. Don't answer a 'build "
-    "the load' day (RECOVERY/DETRAINING status, low ACWR, energy available) with the very lifting "
-    "the injury forces you to keep light: pick the modality that BOTH respects the injury AND "
-    "raises HR/EPOC load. Only fall back to gentle strength/mobility if cardio is genuinely "
-    "contraindicated or readiness is truly RED.\n"
-    "- Proactive REST DAYS: recovery and adaptation happen on REST days, not just training days "
-    "- a rest day is when fitness is CONSOLIDATED, not a failure or lost progress. ALWAYS read "
-    "training_rhythm (consecutive_training_days, last_rest_day, rest_days_last_7). When "
-    "consecutive_training_days is >=4 you MUST, in that day's recommendation, (a) NAME the streak "
-    "explicitly ('that's your Nth straight training day; last rest was <date>'), and (b) state "
-    "when their NEXT rest day should fall - even if today is still a training day. When it is "
-    ">=6, OR fatigue is stacking (readiness AMBER-low/RED, resting HR up, HRV down, ACWR high, "
-    "body battery low, sleep short), LEAD with a FULL REST day (or genuine easy active-recovery "
-    "like a short walk) as today's recommendation - don't bury it under a workout, and don't wait "
-    "for a RED day or for them to ask. Balance against load-building: build when fresh, but never "
-    "stack quality days indefinitely - aim for at least ~1 rest day per 5-7 days.\n"
-    "- Exercise naming + volume matching: prescribe strength moves by the workout platform's EXACT "
-    "names (e.g. Garmin Connect's own exercise names; the profile may list a palette) - the user "
-    "logs on the watch and logged_sets come back with those names, so a wrong name (e.g. 'Pallof "
-    "press', which Garmin doesn't have) isn't on the watch AND isn't recognised when they log the "
-    "real move ('Cable Core Press'). When tallying weekly sets-per-muscle from logged_sets, match "
-    "by the platform name + known synonyms so something already logged isn't prescribed again the "
-    "same week.\n"
-    "- Exercise SEQUENCE (order performed): logged_sets are listed in the ACTUAL ORDER the user "
-    "performed them - the 'order' field (1,2,3...) is the real within-session sequence. For ANY "
-    "ordering, fatigue or interference reasoning (e.g. 'what tired my arms before the curls', "
-    "'did X pre-fatigue Y'), use this REAL logged sequence - do NOT assume they followed the "
-    "brief's prescribed order; they often reorder. Only an exercise with a LOWER order number "
-    "(done earlier) can have pre-fatigued a later one. If unsure of the order, say so rather "
-    "than guessing.\n"
-    "- Cardio prescription realism: for RUNNING intervals prescribe by PACE (min/km) + RPE, NOT an "
-    "instantaneous bpm - HR lags effort ~30-60s and can't jump up or drop on command, so a 'run at "
-    "174-184 bpm' step right after a warm-up is unachievable; use HR only as a trailing 'let it "
-    "climb toward Zone X' check, and add a short float (~30-60s bridging pace) if an easy->hard "
-    "switch is abrupt. On the bike, watts + RPE lead (HR still lags). ALWAYS end a cardio session "
-    "with ONE cool-down straight after the final hard effort - never a standalone recovery block "
-    "immediately before the cool-down (the cool-down is that recovery).\n"
-    "- Intensity must match the label: a session you call 'light', 'easy', 'recovery' or "
-    "'back-safe' must actually be low-effort - cap working sets at ~RPE 6-7 (3-4 reps in "
-    "reserve), NOT RPE 8, whenever readiness is AMBER/RED, HRV is below their balanced band, body "
-    "battery is low (<~40), or an injury is freshly flared. Never pair a 'light/recovery day' "
-    "verdict with RPE-8 loading - the effort and the words must agree.\n"
-    "- Protect the quality run: when a hard/quality RUN (VO2, PacePro, intervals, tempo, or a "
-    "long run) is scheduled within ~48h (their own plan / preferred_long_training_days), keep the "
-    "calves and lower legs FRESH - avoid direct calf work and heavy/eccentric leg loading in the "
-    "48h before it, since fatigued calves/Achilles blunt running economy and elastic return and "
-    "raise injury risk in the intervals. Schedule calf/lower-leg volume AFTER the run instead.\n"
-    "- Sedentary / strain framing: the platform's sedentary hours (day_stats / yesterday "
-    "sedentary_h) are STEP-DERIVED, so step-less training - strength/lifting, pilates, yoga, "
-    "cycling/e-bike - is bucketed as 'sedentary' even though they trained hard (sleep is a "
-    "SEPARATE bucket, NOT added in). Before describing sedentary time, CROSS-CHECK it against "
-    "logged activities and intensity minutes (moderate/vigorous): if they trained that day, do "
-    "NOT call it a 'desk day' or imply they sat still - frame it as 'low-step time (includes your "
-    "step-less strength/pilates/yoga)' and acknowledge the session. Only call it a genuine "
-    "sedentary/desk day when NO training was logged.\n"
-    "Cross-check these against each other: don't program a hard or heavy session when readiness is "
-    "LOW / ACWR is high / recovery-time is still counting down / skin temp + RHR + respiration point "
-    "to illness / the same muscles were hit in the last ~48h; match intensity to recovery and pick "
-    "novelty that avoids what was just trained; tie any nutrition advice to today's load and calorie "
-    "budget. After reasoning over everything, report tightly and name the 2-3 signals that actually "
-    "drove the advice. For body battery always use body_battery_current (Garmin's canonical value, "
-    "same as the Connect app/web). It is whatever the watch reported at the last sync, and that IS "
-    "the latest available - so DON'T say 'Garmin's feed is catching up', 'trailing real time', or "
-    "imply more up-to-date data is coming. If body_battery_current_age_min is above ~15, simply "
-    "state that the figure is as of the last sync (use last_sync_age_min / body_battery_current_as_of), "
-    "e.g. 'body battery 95 - as of your last sync ~21 min ago'. Present it plainly as the current "
-    "reading from that sync; no 'catching up' language and no implying the watch is unsynced. "
-    "When present, wellness_today.body_battery_feedback is Garmin's own plain-English read of the day's "
-    "battery (e.g. DAY_BALANCED_AND_INACTIVE) and wellness_today.body_battery_events lists daytime "
-    "recovery/nap periods (e.g. RESTFUL_PERIOD) with their battery impact - use them to explain WHY the "
-    "battery sits where it does. "
-    "TIMEZONE: treat profile_config.timezone as the user's real local timezone for any time-of-day or "
-    "'as of' reasoning - it is authoritative when they are travelling and the server clock may differ. "
-    "NOTES and RECENT CONVERSATION lines are DATE-STAMPED with a relative tag (today / "
-    "yesterday / N days ago): attribute food, workouts and events to the day they happened, "
-    "count only TODAY's entries (and anything the user shared today) as today's, and never "
-    "present an earlier day's log as if it were today. "
-    "PLANNED FOOD RULE: a meal counts as planned for today ONLY if the user, in a message from "
-    "today, says they still intend to eat it (today or on a named upcoming day). Food they "
-    "mentioned on an earlier day was eaten that day - treat it as already consumed, never "
-    "as an upcoming meal, unless they restate it today. Read what they have eaten or plan to "
-    "eat from the USER's own messages and logs, not from your own earlier replies; if you are "
-    "unsure whether a meal is still coming, ask instead of assuming. "
-    "PLAN / LOCATION CHANGES: when the user describes a change of plan or location (e.g. 'no "
-    "water at home so I came to the office; I'll run in the office area this afternoon, ebike "
-    "home tonight'), TRACK where they now ARE and where each activity will actually happen. An "
-    "incidental logistics detail (a home water outage, travel, a closed gym, roadworks) explains "
-    "WHY the plan changed - do NOT carry it over to a DIFFERENT place or time as if it still "
-    "applied (e.g. don't tell them to carry water for a run at the OFFICE because their HOME "
-    "building was dry). Only keep such a detail as live advice if it genuinely affects the new "
-    "location or activity; otherwise just acknowledge it and move on. "
-    "HOLISTIC CONTEXT: you are given the user's FULL picture every time - recovery/vitals, "
-    "training load, their logged and PLANNED food, and any ACTIVE HEALTH FLAGS. Use all of "
-    "it together and connect the dots; don't answer as if you only know the last message. "
-    "FOOD <-> TRAINING: tie them together - shape refuel/nutrition advice around what they "
-    "have already eaten today and any meal they have genuinely planned for later today (don't "
-    "re-recommend protein/calories they have already had; when they have a later meal planned "
-    "today, say whether it fits or should change), and factor fuelling into session "
-    "recommendations. "
-    "HEALTH: if ACTIVE HEALTH FLAGS lists an injury or illness, RESPECT it - do not program "
-    "through it: adapt the modality to avoid the affected area, cut intensity, or recommend "
-    "REST/recovery outright when they're unwell, and briefly check how it's doing. If the user "
-    "REPORTS a NEW injury or illness in their message, lead with ONE caring, specific "
-    "clarifying question (what exactly, where, how bad, since when, and are they up for gentle "
-    "movement or need rest) and clearly restate what you've noted, BEFORE any training push. "
-    "PERSIST NEW INJURIES: for each NEW injury/pain/illness they report that is NOT already in "
-    "ACTIVE HEALTH FLAGS, append a marker [[HEALTH_FLAG: area | short description]] (e.g. "
-    "[[HEALTH_FLAG: knee | left knee clicking on stairs, since yesterday]]) so it is stored "
-    "durably and shapes future sessions, not just this chat - it is stripped before sending. "
-    "Do NOT emit it for something already flagged, a past/hypothetical mention, or a question. "
-    "PERSIST STANDING PREFERENCES: STANDING PREFERENCES / RULES lists durable do's & don'ts the "
-    "user has stated - HONOUR every one on EVERY recommendation (never prescribe a movement they "
-    "asked to avoid; use their stated substitute instead; apply their equipment and scheduling "
-    "rules). When they state a NEW durable preference/rule in their message - a lasting choice, "
-    "not a one-off ('from now on...', 'I prefer...', 'avoid X, give me Y instead', 'I always "
-    "wear...', 'don't program X') - append a marker [[PREF: <concise rule>]] (e.g. [[PREF: avoid "
-    "standard/normal RDL and conventional deadlift - substitute single-leg RDL or bench-supported "
-    "RDL (back-sensitive)]]) so it persists, stripped before sending. Only for LASTING rules, not "
-    "a one-time change for today; don't re-emit one already listed. "
-    "LOW-BACK / SPINE FLAG SPECIFICS: when an ACTIVE flag involves the low/mid back (or it's a "
-    "FRESH flare, i.e. reported in the last ~2 days), 'seated/supported' is NOT automatically "
-    "back-safe - AVOID axial/overhead loading that drives lumbar extension or compression: skip "
-    "overhead pressing AND overhead (behind-head) triceps extension even seated, and any loaded "
-    "hinge/carry. Prefer zero-spinal-load options: cable triceps PUSHDOWNS (not overhead ext), "
-    "chest-supported or lying presses, chest-supported rows, incline-bench-braced curls, and "
-    "neutral cable/band work. Overhead shoulder pressing waits until the back is clear. "
-    "SURFACE THE LOAD CONTEXT: when they ask about doing (or adding) a session, briefly state the "
-    "load picture in ONE clause (training_status + ACWR + acute-vs-chronic - e.g. 'plenty of "
-    "headroom: ACWR 0.8, acute below chronic') so the reasoning is visible; but weight it "
-    "correctly - training load is HR/EPOC-based so a low-HR strength/arm session barely moves it, "
-    "meaning ACWR mainly governs CARDIO scheduling, while body-battery/readiness/weekly-volume/"
-    "injury govern a strength day. "
-    "Never invent numbers - if a field is missing say so rather than guessing."
-)
+def _enrich_activity_context(data, question="", summary=False):
+    activities = data.get("recent_activities_7d") or data.get("activities") or []
+    requested_day = None
+    if summary or re.search(r"\byesterday\b", question, re.IGNORECASE):
+        requested_day = (date.today() - timedelta(days=1)).isoformat()
+    elif re.search(r"\btoday\b", question, re.IGNORECASE):
+        requested_day = date.today().isoformat()
+    explicit_day = re.search(r"\b\d{4}-\d{2}-\d{2}\b", question)
+    if explicit_day:
+        try:
+            requested_day = date.fromisoformat(explicit_day.group()).isoformat()
+        except ValueError:
+            log.warning("Activity metric request contains an invalid calendar date.")
+            data["activity_metric_coverage"] = {
+                "status": "invalid_requested_date", "requested_day": explicit_day.group(),
+                "instruction": "Clarify this invalid date rather than treating it as missing history.",
+            }
+            return
+    candidates = [a for a in activities if a.get("activity_id") is not None
+                  and (not requested_day or str(a.get("start", ""))[:10] == requested_day)]
+    candidates.sort(key=lambda a: (
+        garmin_coach.classify_activity(a)["classification"] == "intentional_training",
+        str(a.get("start", ""))), reverse=True)
+    selected = candidates[:3]
+    for activity in selected:
+        activity["detail_metrics"] = garmin_coach.activity_detail_metrics(activity["activity_id"])
+    if selected:
+        training_store().record_activities(selected)
+    data["activity_metric_coverage"] = {
+        "scope": "supplied activity history, with intentional training prioritized",
+        "requested_day": requested_day, "returned": len(selected),
+        "candidates": len(candidates), "omitted": len(candidates) - len(selected),
+        "limit": 3, "availability": "per-activity status; missing fields are not zero",
+    }
+
+
+def _compact_training_context(context, data, data_key):
+    """Reference repeated workout payloads without removing their sole occurrence."""
+    supplied, sequences, sequence_values = {}, {}, {}
+    for field in ("recent_activities_7d", "activities"):
+        for index, activity in enumerate(data.get(field, []) or []):
+            aid = str(activity.get("activity_id"))
+            supplied[aid] = (activity, f"{data_key}.{field}[{index}]")
+            sets = activity.get("logged_sets") or []
+            if sets and "set_sequence" in sets[0]:
+                sequences[aid] = supplied[aid][1] + ".logged_sets[0].set_sequence"
+                sequence_values[aid] = sets[0]["set_sequence"]
+    for index, row in enumerate(context["recent_outcomes"]):
+        aid = str(row["activity_id"])
+        sets = row["payload"].get("logged_sets") or []
+        if (sets and "set_sequence" in sets[0]
+                and (aid not in sequences or sets[0]["set_sequence"] != sequence_values.get(aid))):
+            sequences[aid] = (
+                f"TRAINING_STATE.recent_outcomes[{index}].payload.logged_sets[0].set_sequence")
+        if aid in supplied:
+            activity, reference = supplied[aid]
+            row["payload"] = {key: value for key, value in row["payload"].items()
+                              if key not in activity or value != activity[key]}
+            row["activity_reference"] = reference
+    for movement in context["latest_observed_per_movement"].values():
+        aid = str(movement["activity_id"])
+        if aid in sequences and "set_sequence" in movement["recorded_sets"]:
+            movement["recorded_sets"] = dict(movement["recorded_sets"])
+            movement["recorded_sets"].pop("set_sequence")
+            movement["chronology_reference"] = sequences[aid]
+    context["reference_note"] = (
+        "References point to complete data elsewhere in this same prompt. "
+        "Unrepeated fields remain in payload; a reference is not missing evidence.")
+    return context
+
+
+def _nutrition_focused(prompt_file, question):
+    if prompt_file == NUTRITION_PROMPT_FILE:
+        return True
+    question = question or ""
+    return bool(
+        re.search(r"\b(?:food|meal|breakfast|lunch|dinner|protein|calories|oats|scoop|hydration)\b",
+                  question, re.IGNORECASE)
+        and not re.search(r"\b(?:exercise|workout|training|sets?|reps?|press|curl|row|squat|"
+                          r"deadlift|rdl|run|running|bike|cycling|pain|injury|knee|back|shoulder)\b",
+                          question, re.IGNORECASE))
+
+
+def _nutrition_context(data, training):
+    data = dict(data)
+    for field in ("recent_activities_7d", "activities"):
+        if field in data:
+            data[field] = [{key: value for key, value in activity.items()
+                            if key not in ("logged_sets", "detail_metrics")}
+                           for activity in data[field]]
+    for outcome in training["recent_outcomes"]:
+        outcome["payload"] = {key: value for key, value in outcome["payload"].items()
+                              if key not in ("logged_sets", "detail_metrics")}
+    training["latest_observed_per_movement"] = {}
+    training["detail_selection"] = (
+        "Nutrition-focused view: exact set timelines/capabilities are omitted, not absent. "
+        "Activity totals, plans, reported day status, active symptoms and preferences remain.")
+    return data, training
 
 
 def _assemble(prompt_file, question=None, include_history=True,
               data=None, data_key="GARMIN_JSON", include_brief=True):
     if data is None:
-        data = garmin_coach.build_snapshot()
-    js = json.dumps(data, indent=2, default=str)
+        data = get_snapshot()
+    nutrition_focused = _nutrition_focused(prompt_file, question)
+    if (prompt_file in (SUMMARY_PROMPT_FILE, PERF_PROMPT_FILE)
+            or re.search(r"\b(?:workout|exercise|training|stamina|running dynamics|"
+                         r"fat burner|fat burned|fuel use|carbohydrate burned)\b",
+                         question or "", re.IGNORECASE)):
+        _enrich_activity_context(data, question or "", summary=prompt_file == SUMMARY_PROMPT_FILE)
+    training = training_store().context()
+    if nutrition_focused:
+        data, training = _nutrition_context(data, training)
+    js = json.dumps(data, separators=(",", ":"), default=str)
     parts = [
         read_file(prompt_file),
         "\n\n---\nTODAY: " + today_human() + " (" + date.today().isoformat() + ")\n",
@@ -1727,35 +1303,33 @@ def _assemble(prompt_file, question=None, include_history=True,
         parts.append("\nACTIVE HEALTH FLAGS (injuries/illness the user reported and has NOT "
                      "marked recovered - respect these: adapt or rest, don't train through "
                      "them, and check how they're doing):\n" + flags + "\n")
-    anchors = active_anchors_text()
+    anchors = ("" if nutrition_focused else
+               active_anchors_text(question or "training plan strength cycling running"))
     if anchors:
-        parts.append("\nCURRENT CAPABILITY ANCHORS (what the user ACTUALLY performed or "
-                     "adjusted to recently - calibrate weights, watts, cadence and durations "
-                     "to THESE. A later line supersedes an earlier one for the same movement, "
-                     "and these OVERRIDE stale profile/Garmin numbers):\n" + anchors + "\n")
+        parts.append("\nCAPABILITY RECORDS (check provenance and dates; unverified legacy "
+                     "claims are NOT proof of effort, causes or safe execution):\n" + anchors + "\n")
     prefs = active_prefs_text()
     if prefs:
         parts.append("\nSTANDING PREFERENCES / RULES (durable do's & don'ts the user has stated "
                      "- exercise substitutions, movements to AVOID, equipment habits, scheduling "
                      "choices. HONOUR every one: never prescribe something they asked to avoid - "
-                     "use their stated substitute instead - and apply their equipment/scheduling "
-                     "rules. A later line supersedes an earlier one):\n" + prefs + "\n")
+                     "and do not assume an alternative is safe. Apply their equipment/scheduling "
+                     "rules. Use dates and provenance, not list position; clarify genuine "
+                     "conflicts between active records):\n" + prefs + "\n")
     if include_brief:
         brief = todays_brief_text()
         if brief:
-            parts.append("\nTODAY'S BRIEF YOU ALREADY SENT (the recovery read + workout and "
-                         "recommendations you gave the user in this morning's brief - THIS is what "
-                         "they mean by 'the plan' / 'the recommendations' / 'what you told me to "
-                         "do'. Use it to judge whether they followed it and to stay consistent):\n"
+            parts.append("\nTODAY'S PREVIOUS BRIEF (historical advice, not proof of execution; "
+                         "a later dated TRAINING_STATE revision takes precedence):\n"
                          + brief + "\n")
     notes = recent_journal_text()
     if notes:
         parts.append("\nNOTES YOU'VE SHARED (durable context the user logged):\n"
                      + notes + "\n")
     hist = recent_history_text() if include_history else ""
-    fit = load_fitness_profile()
+    fit = None if nutrition_focused else load_fitness_profile()
     if isinstance(fit, dict):
-        fit_view = {k: v for k, v in fit.items() if k != "generated_at"}
+        fit_view = fit
         if fit_view:
             parts.append("\nFITNESS_PROFILE (slow-changing performance metrics "
                          "Garmin computes; times are h:mm:ss):\n"
@@ -1768,21 +1342,80 @@ def _assemble(prompt_file, question=None, include_history=True,
         # instruction the model reads.
         parts.append("\n\nRECENT CONVERSATION (context, oldest to newest):\n"
                      + hist + "\n")
-    parts.append("\n\n" + DATA_USE_DIRECTIVE)
+    training = _compact_training_context(training, data, data_key)
+    parts.append("\n\nTRAINING_STATE:\n" + json.dumps(training,
+                 separators=(",", ":"), default=str))
+    parts.append("\n\n" + read_file(os.path.join(PROMPTS, "coaching_policy.md")))
     if question is not None:
         parts.append("\n\nQUESTION:\n" + question)
     return "".join(parts), data
+
+
+def _generate_checked(prompt, source_text="", images=None, require_plan=False):
+    """Persist source-backed facts and validate proposals before returning an answer."""
+    text = run_llm(prompt, images=images)
+    receipts = []
+    for attempt in range(2):
+        if not text:
+            return None
+        # User-sourced facts stand independently of whether the proposed workout is valid.
+        # Apply them first so a newly stated exclusion guards this very response.
+        candidate, changes, memory_errors = memory_store().process_markers(
+            text, source_text=source_text, source_type="user")
+        receipts.extend(changes)
+        clean, plans, errors = parse_plans(candidate, memory_store().records("preference"))
+        errors.extend(unsupported_claims(clean))
+        if require_plan and not plans:
+            errors.append("a dated structured SESSION_PLAN is required")
+        if require_plan in (True, "today") and not any(
+                p["date"] == date.today().isoformat() for p in plans):
+            errors.append("today's structured SESSION_PLAN is required")
+        if not errors:
+            break
+        if attempt:
+            raise ValueError("Coaching response rejected: " + "; ".join(errors))
+        log.warning("stage=output_guard repair_required=true issues=%s", errors)
+        text = run_llm(prompt + "\n\nDRAFT TO CORRECT:\n" + text +
+                       "\n\nOUTPUT ERRORS:\n" + "\n".join(errors) +
+                       "\nReturn a corrected complete answer. Do not relax user constraints.",
+                       images=images)
+    if plans:
+        training_store().save(plans, source="user_requested_revision" if source_text
+                              else "scheduled_coaching_proposal")
+        for plan in plans:
+            if plan["date"] == date.today().isoformat():
+                _set_coach_rest(plan["kind"] == "rest")
+    clean, logged, log_date = _extract_log_marker(clean)
+    if logged and source_text:
+        log_date = log_date or _sent_backdate()
+        if log_date and date.fromisoformat(log_date) > date.today():
+            memory_errors.append("Future food consumption was not logged.")
+        else:
+            append_journal(logged, on_date=log_date)
+            clean += _logged_confirmation(log_date)
+    if source_text:
+        clean = _harvest_exercise_plan(clean)
+    clean = _strip_control_markers(clean)
+    if plans:
+        clean += "\n\n" + render_plans(plans)
+    saved = [r for r in receipts if r.get("saved")]
+    if saved:
+        clean += "\n\nMemory updated:\n" + "\n".join(
+            "- " + r.get("action", "saved") + ": " + r["text"] for r in saved)
+    if memory_errors:
+        log.warning("stage=memory rejected_updates=%s", memory_errors)
+        clean += "\n\nSome memory updates were not saved: " + "; ".join(memory_errors)
+    if plans and source_text and any(p["date"] == date.today().isoformat() for p in plans):
+        save_todays_brief(clean)
+    return clean
 
 
 def generate_summary():
     prompt, snap = _assemble(SUMMARY_PROMPT_FILE, include_history=True, include_brief=False)
     if isinstance(snap, dict) and "__error__" in snap:
         return None, snap
-    text = run_llm(prompt)
+    text = _generate_checked(prompt, require_plan=True)
     if text:
-        text, is_rest = _extract_rest_marker(text)
-        _set_coach_rest(is_rest)  # tell the day's check-ins whether the brief prescribed rest
-        text = _harvest_plan(text)  # persist any multi-day training plan the brief commits to
         append_history("user", "GMS (requested the morning brief)")
         append_history("agbot", text)
         save_todays_brief(text)
@@ -1793,52 +1426,19 @@ def generate_qa(question):
     prompt, snap = _assemble(QA_PROMPT_FILE, question=question, include_history=True)
     if isinstance(snap, dict) and "__error__" in snap:
         return None, snap
-    text = run_llm(prompt)
+    require_plan = bool(re.search(
+        r"\b(?:give|recommend|prescribe|plan)\b.{0,60}\b(?:workout|session|routine)\b",
+        question, re.IGNORECASE | re.DOTALL))
+    text = _generate_checked(prompt, source_text=question,
+                             require_plan="any" if require_plan else False)
     if text:
-        text, logged, log_date = _extract_log_marker(text)
-        if logged:
-            log_date = log_date or _sent_backdate()  # late-delivered message -> its own day
-            append_journal(logged, on_date=log_date)  # auto-log any meal the user reported, not just 'log:'-prefixed
-            text = text + _logged_confirmation(log_date)
-        text = _harvest_plan(text)  # persist any multi-day training plan this answer commits to
-        text = _harvest_exercise_plan(text)  # they told me today's plan -> stop the check-ins
-        text = _harvest_health_clear(text)  # they said an injury is better -> clear that flag
-        text = _harvest_health_flag(text)  # they reported a NEW injury -> persist it durably
-        text = _harvest_anchor(text)  # they reported what they actually did -> save the anchor
-        text = _harvest_pref(text)  # they stated a durable do/don't -> persist it as a rule
         append_history("user", question)
         append_history("agbot", text)
-    if _is_workout_review(question):
+    if text and _is_workout_review(question):
         _clear_pending()  # asked how they did -> don't also auto-debrief this session later
     return text, snap
 
 
-def _journal_shared_media(caption, analysis, n, media_label, on_date=None):
-    """Record an EXPLICITLY LOGGED meal/note in the DATED journal. Only fires when
-    the caption starts with 'log:' / 'log ' - i.e. the user is telling me they ATE (or did)
-    something, not just asking about it. Photos they only ask about ('should I eat
-    this?', 'what do you suggest?') are NOT journaled, so we never over-count food they
-    only browsed. Non-logged shares still live in the recent-chat window for context."""
-    cap = (caption or "").strip()
-    low = cap.lower()
-    if not (low.startswith("log:") or low.startswith("log ")):
-        return  # not an explicit log - don't record as consumed
-    note = cap[3:].lstrip(" :").strip()  # caption minus the 'log' prefix
-    body = (analysis or "").strip()
-    kept = [ln for ln in body.split("\n") if ln.strip()]
-    if kept and kept[0].lstrip().startswith("\U0001F916"):  # drop the AgBot signature line
-        kept = kept[1:]
-    summary = " ".join(kept).strip()
-    if len(summary) > 300:
-        summary = summary[:300].rstrip() + "..."
-    media = "video" if "video" in media_label else ("photos" if n > 1 else "photo")
-    parts = ["logged"]
-    if note:
-        parts.append(note)
-    parts.append("(via " + media + "):")
-    if summary:
-        parts.append(summary)
-    append_journal(" ".join(parts).strip(), on_date=on_date)
 
 
 def generate_images(image_paths, caption, extra=None, media_label="photo"):
@@ -1857,27 +1457,8 @@ def generate_images(image_paths, caption, extra=None, media_label="photo"):
                    "THE CONTENT OF EVERY image - never analyse just one and never drop a part.")
     if extra:
         prompt += "\n\n" + extra
-    text = run_llm(prompt, images=image_paths)
+    text = _generate_checked(prompt, source_text=caption or "", images=image_paths)
     if text:
-        text, marker_note, log_date = _extract_log_marker(text)
-        log_date = log_date or _sent_backdate()  # late-delivered message -> its own day
-        cap_low = (caption or "").strip().lower()
-        explicit_log = cap_low.startswith("log:") or cap_low.startswith("log ")
-        logged = False
-        if explicit_log:
-            _journal_shared_media(caption, text, n, media_label, on_date=log_date)  # keep the richer log: summary
-            logged = True
-        elif marker_note:
-            append_journal(marker_note, on_date=log_date)  # model spotted a meal the user reported without a 'log:' prefix
-            logged = True
-        if logged:
-            text = text + _logged_confirmation(log_date)
-        text = _harvest_plan(text)  # persist any multi-day training plan this answer commits to
-        text = _harvest_exercise_plan(text)  # they told me today's plan -> stop the check-ins
-        text = _harvest_health_clear(text)  # they said an injury is better -> clear that flag
-        text = _harvest_health_flag(text)  # they reported a NEW injury -> persist it durably
-        text = _harvest_anchor(text)  # they reported what they actually did -> save the anchor
-        text = _harvest_pref(text)  # they stated a durable do/don't -> persist it as a rule
         plural = "s" if n != 1 else ""
         label = caption or ("[shared " + str(n) + " " + media_label + plural + "]")
         append_history("user", label + " [" + media_label + plural + "]")
@@ -1894,7 +1475,7 @@ def generate_weekly():
     if isinstance(data, dict) and "__error__" in data:
         return None, data
     prompt, _ = _assemble(WEEKLY_PROMPT_FILE, data=data, data_key="WEEKLY_JSON")
-    text = run_llm(prompt)
+    text = _generate_checked(prompt)
     if text:
         append_history("user", "weekly review (requested)")
         append_history("agbot", text)
@@ -1905,7 +1486,7 @@ def generate_nutrition():
     prompt, snap = _assemble(NUTRITION_PROMPT_FILE)
     if isinstance(snap, dict) and "__error__" in snap:
         return None, snap
-    text = run_llm(prompt)
+    text = _generate_checked(prompt)
     if text:
         append_history("user", "nutrition targets (requested)")
         append_history("agbot", text)
@@ -1923,55 +1504,20 @@ def generate_debrief(activities):
     activities = [a for a in (activities or []) if isinstance(a, dict)]
     if not activities:
         return None
-    snap = garmin_coach.build_snapshot()
-    parts = [
-        read_file(DEBRIEF_PROMPT_FILE),
-        "\n\n---\nTODAY: " + today_human() + "\n",
-    ]
-    flags = active_health_text()
-    if flags:
-        parts.append("\nACTIVE HEALTH FLAGS (injuries/illness to respect - adapt or rest, "
-                     "don't train through them):\n" + flags + "\n")
-    anchors = active_anchors_text()
-    if anchors:
-        parts.append("\nCURRENT CAPABILITY ANCHORS (what the user ACTUALLY performed recently "
-                     "- judge this session against THESE loads/watts/durations, and if they "
-                     "did more or less than last time, capture the new level):\n" + anchors + "\n")
-    prefs = active_prefs_text()
-    if prefs:
-        parts.append("\nSTANDING PREFERENCES / RULES (durable do's & don'ts the user has stated "
-                     "- honour them and, if they state a new one now, persist it):\n" + prefs + "\n")
-    brief = todays_brief_text()
-    if brief:
-        parts.append("\nTODAY'S BRIEF YOU ALREADY SENT (the workout and recommendations you "
-                     "gave the user this morning - THIS is 'the plan' they were asked to follow; "
-                     "judge the WHOLE session below against it, collectively):\n" + brief + "\n")
-    notes = recent_journal_text()
-    if notes:
-        parts.append("\nNOTES YOU'VE SHARED (durable, date-stamped - includes the meals "
-                     "the user logged TODAY = their food intake so far):\n" + notes + "\n")
-    hist = recent_history_text()
-    if hist:
-        parts.append("\nRECENT CONVERSATION (date-stamped today / yesterday / N days ago - "
-                     "watch for a meal they said TODAY they still plan to eat later today, and "
-                     "how they fuelled/felt around the session; a meal they mentioned on an "
-                     "earlier day was already eaten, don't treat it as upcoming; oldest to "
-                     "newest):\n" + hist + "\n")
-    parts.append("\nPROFILE:\n" + read_file(PROFILE_FILE))
+    snap = get_snapshot(force=True)
+    base_prompt, _ = _assemble(DEBRIEF_PROMPT_FILE, data=snap)
+    parts = [base_prompt]
     for a in activities:
         if "strength" in str(a.get("type") or ""):
             sets = garmin_coach.exercise_sets(a.get("activity_id"))
-            if sets:
-                parts.append("\n\nLOGGED_SETS for " + json.dumps(a.get("name") or a.get("type"))
-                             + " (per exercise, IN THE ORDER ACTUALLY PERFORMED - the 'order' "
-                             + "field is the real sequence; #sets, rep range, top weight kg):\n"
-                             + json.dumps(sets, indent=2, default=str))
+            if isinstance(sets, list) and sets:
+                a["logged_sets"] = sets
     if len(activities) > 1:
         header = ("SESSION_JUST_FINISHED - these " + str(len(activities)) + " activities were "
                   "logged back-to-back and TOGETHER form ONE workout session (the user records "
                   "each part under a different Garmin type - e.g. a cardio warm-up, the Strength "
                   "block, a run, a Pilates/stretch cool-down). Judge this morning's plan as "
-                  "COLLECTIVELY covered by ALL of them together: estimate rough %-completion, "
+                  "potentially covered collectively; do not invent a completion percentage; "
                   "flag a genuinely-missing piece only once, and if they did something OFF the "
                   "plan note the pivot supportively - never ask 'is that all?' after one part")
     else:
@@ -1985,13 +1531,9 @@ def generate_debrief(activities):
     if extras_all:
         parts.append("\n\nACTIVITY_EXTRAS (per activity; time-in-HR-zone minutes; weather if "
                      "outdoor):\n" + json.dumps(extras_all, indent=2, default=str))
-    parts.append("\n\nGARMIN_JSON:\n" + json.dumps(snap, indent=2, default=str))
-    parts.append("\n\n" + DATA_USE_DIRECTIVE)
-    text = run_llm("".join(parts))
+    training_store().record_activities(activities)
+    text = _generate_checked("".join(parts))
     if text:
-        text = _harvest_anchor(text)  # capture what they actually lifted/rode as the new anchor
-        text = _harvest_health_flag(text)  # they reported a NEW injury mid-debrief -> persist it
-        text = _harvest_pref(text)  # they stated a durable do/don't -> persist it as a rule
         append_history("agbot", "[post-workout debrief] " + text)
     return text
 
@@ -2002,22 +1544,18 @@ def do_summary(chat_id, auto=False):
         send_message(chat_id, "\U0001F916 AgBot: pulling your overnight Garmin data for today's brief...")
     text, snap = generate_summary()
     if isinstance(snap, dict) and "__error__" in snap:
-        send_message(chat_id, "\U0001F916 AgBot: I couldn't read your Garmin data right now ("
-                     + str(snap["__error__"])[:180] + "). I'll try again later.")
-        return
+        raise RuntimeError("Garmin data unavailable: " + str(snap["__error__"])[:180])
     if not text:
         _llm_fail_notice(chat_id, "generate your brief")
         return
-    send_message(chat_id, text)
-    write_file(LAST_SUMMARY_FILE, date.today().isoformat())
+    send_message(chat_id, text, summary_date=date.today().isoformat())
 
 
 def do_qa(chat_id, question):
     log.info("Q&A: %s", question[:120])
     text, snap = generate_qa(question)
     if isinstance(snap, dict) and "__error__" in snap:
-        send_message(chat_id, "\U0001F916 AgBot: I couldn't read your Garmin data right now. Try again shortly.")
-        return
+        raise RuntimeError("Garmin data unavailable")
     if not text:
         _llm_fail_notice(chat_id, "generate an answer")
         return
@@ -2028,8 +1566,7 @@ def do_weekly(chat_id):
     log.info("Generating weekly review for %s", chat_id)
     text, data = generate_weekly()
     if isinstance(data, dict) and "__error__" in data:
-        send_message(chat_id, "\U0001F916 AgBot: couldn't pull your weekly data right now. Try again shortly.")
-        return
+        raise RuntimeError("Weekly Garmin data unavailable")
     if not text:
         _llm_fail_notice(chat_id, "build your weekly review")
         return
@@ -2040,8 +1577,7 @@ def do_nutrition(chat_id):
     log.info("Generating nutrition targets for %s", chat_id)
     text, snap = generate_nutrition()
     if isinstance(snap, dict) and "__error__" in snap:
-        send_message(chat_id, "\U0001F916 AgBot: couldn't read your Garmin data for nutrition targets. Try again shortly.")
-        return
+        raise RuntimeError("Garmin nutrition data unavailable")
     if not text:
         _llm_fail_notice(chat_id, "work out your targets")
         return
@@ -2052,7 +1588,7 @@ def generate_performance():
     prompt, snap = _assemble(PERF_PROMPT_FILE)
     if isinstance(snap, dict) and "__error__" in snap:
         return None, snap
-    text = run_llm(prompt)
+    text = _generate_checked(prompt)
     if text:
         append_history("user", "performance / fitness stats (requested)")
         append_history("agbot", text)
@@ -2063,8 +1599,7 @@ def do_performance(chat_id):
     log.info("Generating performance card for %s", chat_id)
     text, snap = generate_performance()
     if isinstance(snap, dict) and "__error__" in snap:
-        send_message(chat_id, "\U0001F916 AgBot: couldn't read your Garmin data right now. Try again shortly.")
-        return
+        raise RuntimeError("Garmin performance data unavailable")
     if not text:
         _llm_fail_notice(chat_id, "build your performance card")
         return
@@ -2234,15 +1769,16 @@ HELP_TEXT = (
     "you reply **recovered**.\n"
     "- \U0001F37D\uFE0F I nudge you to log meals at 8:30am, 12:15pm & 9pm, and \U0001F4A7 "
     "remind you to drink water every 2h from 8am-10pm (log the water on your watch).\n"
-    "- \U0001F3CB\uFE0F I check in through the day (10am / 12 / 4pm / 9pm) on whether you did "
+    "- \U0001F3CB\uFE0F I check in through the day (12 / 4pm / 9pm) on whether you did "
     "the recommended exercise - reply **DWRE** when done, or 'rest day' / 'skip today' to stop "
     "the check-ins for the day.\n"
     "- **Ask me anything**, e.g. 'how did I sleep?', 'what's my predicted 10K time?', "
     "'give me a 30-min rowing session'.\n"
     "- I auto-send your brief by ~9:30am, and ~90 min after your last logged activity I send "
     "ONE combined debrief of the whole session vs the plan (or reply DWRE to get it now).\n"
-    "- **/reset** clears our recent-chat memory.\n\n"
-    "Everything is based on your live Garmin data and your gym equipment."
+    "- **memory** shows saved facts; **plan** shows dated session proposals.\n"
+    "- **/reset** clears recent chat, not durable preferences or health records.\n\n"
+    "Advice uses available Garmin data and your private profile; missing data stays unknown."
 )
 
 def do_dwre(chat_id):
@@ -2250,6 +1786,8 @@ def do_dwre(chat_id):
     so the check-ins stop, cancel any pending auto-debrief, and send the collective wrap-up."""
     log.info("DWRE - marking today's exercise done, sending collective summary")
     _set_exercise_status("done")
+    training_store().set_status(date.today(), "user_completed")
+    _snapshot_cache.invalidate()
     _clear_pending()
     send_message(chat_id, "\U0001F916 AgBot: nice work \u2713 pulling your whole session "
                  "together...")
@@ -2272,6 +1810,7 @@ def do_skip_exercise(chat_id):
     """User is not exercising today - stop the check-ins for the rest of the day."""
     log.info("Exercise skipped for today (user opt-out)")
     _set_exercise_status("skip")
+    training_store().set_status(date.today(), "user_skipped")
     _clear_pending()
     send_message(chat_id, "\U0001F916 AgBot: all good \u2713 no exercise pencilled in for today "
                  "- I'll stop the check-ins and pick it up again tomorrow. Rest up and keep the "
@@ -2313,11 +1852,14 @@ def classify(text):
         return "start", ""
     if low in ("/help", "help", "?"):
         return "help", ""
+    if low in ("memory", "/memory", "what do you remember"):
+        return "memory", ""
+    if low in ("plan", "/plan", "current plan"):
+        return "plan", ""
     if low in ("/reset", "/clear", "reset", "forget", "new chat", "start over"):
         return "reset", ""
-    if low in ("recovered", "resolved", "all better", "i'm fine now", "im fine now",
-               "healed", "back to normal", "all good now", "feeling better now",
-               "i'm better now", "im better now", "fully recovered"):
+    if low in ("recovered", "/recovered", "recovered all", "fully recovered",
+               "all injuries resolved"):
         return "recovered", ""
     if low.startswith("log ") or low.startswith("log:"):
         return "log", t[3:].lstrip(" :").strip()
@@ -2355,25 +1897,35 @@ def _owner_ok(chat_id):
 def _route_text(chat_id, text):
     kind, payload = classify(text)
     log.info("Message kind=%s text=%r", kind, text[:120])
-    _maybe_capture_health(kind, text, payload)
     if kind in ("start", "help"):
         send_message(chat_id, HELP_TEXT)
+    elif kind == "memory":
+        sections = []
+        for record_kind in ("preference", "health", "anchor"):
+            value = memory_store().render(record_kind)
+            sections.append(record_kind.title() + ":\n" + (value or "(none recorded)"))
+        send_message(chat_id, "AgBot - Saved memory\n\n" + "\n\n".join(sections))
+    elif kind == "plan":
+        plans = training_store().context()["plans"]
+        lines = [f"{p['date']} - {p['payload']['kind']}: {p['payload']['objective']} "
+                 f"(revision {p['revision']}, {p['status']})" for p in plans]
+        send_message(chat_id, "AgBot - Dated plans\n" +
+                     ("\n".join(lines) if lines else "No structured plan recorded yet."))
     elif kind == "reset":
         clear_history()
         send_message(chat_id, "\U0001F916 AgBot: conversation memory cleared - fresh start.")
     elif kind == "recovered":
-        cleared = resolve_health()
+        cleared = resolve_health(text)
         if cleared:
             send_message(chat_id, "\U0001F916 AgBot: great news \u2713 cleared your active "
                          "health flag(s): " + "; ".join(c[:60] for c in cleared)
-                         + ". Back to normal programming - shout if anything still bothers you.")
+                         + ". Separate movement preferences remain unchanged.")
         else:
             send_message(chat_id, "\U0001F916 AgBot: noted - you had no active injury/illness "
                          "flags on record. Glad you're feeling good!")
     elif kind == "log":
         if payload:
-            append_journal(payload)
-            send_message(chat_id, "\U0001F916 AgBot: logged \u2713 - I'll factor that into your coaching.")
+            do_qa(chat_id, "log: " + payload)
         else:
             send_message(chat_id, "\U0001F916 AgBot: tell me what to log, e.g. 'log: ate 3 eggs and oats'.")
     elif kind == "weekly":
@@ -2477,7 +2029,10 @@ def maybe_auto_summary():
     own = owner()
     if not own:
         return
-    if read_file(LAST_SUMMARY_FILE).strip() == date.today().isoformat():
+    if (read_file(LAST_SUMMARY_FILE).strip() == date.today().isoformat()
+            or runtime_store().summary_delivered(date.today().isoformat())):
+        return
+    if runtime_store().summary_pending(date.today().isoformat()):
         return
     now = datetime.now()
     cur = (now.hour, now.minute)
@@ -2838,10 +2393,7 @@ def _load_exercise_state():
 
 def _save_exercise_state(d):
     d["date"] = date.today().isoformat()
-    try:
-        _atomic_write(EXERCISE_STATE_FILE, json.dumps(d))
-    except Exception as exc:  # noqa: BLE001
-        log.error("exercise state save failed: %s", exc)
+    _atomic_write(EXERCISE_STATE_FILE, json.dumps(d))
 
 
 def _exercise_status():
@@ -2884,13 +2436,7 @@ def exercise_checkin_slots_due(now, asked, catchup_min=EXERCISE_CHECKIN_CATCHUP_
 
 
 def _exercise_checkin_message():
-    logged = False
-    try:
-        act = garmin_coach.latest_activity()
-        if isinstance(act, dict) and "__error__" not in act:
-            logged = str(act.get("start") or "")[:10] == date.today().isoformat()
-    except Exception:  # noqa: BLE001
-        logged = False
+    logged = garmin_coach.trained_today()
     if logged:
         return ("\U0001F3CB\uFE0F AgBot check-in \u00B7 nice, I can see you've trained today. "
                 "Reply DWRE when you're fully done and I'll pull your wrap-up - or tell me if "
@@ -2980,6 +2526,7 @@ def maybe_post_workout():
     # single part. A session is several back-to-back activities across different Garmin
     # types; we send ONE collective debrief once things have been quiet for a while.
     if aid and aid != seen:
+        _snapshot_cache.invalidate()
         write_file(LAST_ACTIVITY_FILE, aid)
         if not seen:
             return  # first run - baseline only, don't debrief a historical activity
@@ -3005,13 +2552,13 @@ def maybe_post_workout():
         if isinstance(block, dict) and "__error__" in block:
             log.error("session_block error, will retry next poll: %s", block.get("__error__"))
             return  # keep pending; retry
-        _clear_pending()
         if block:
             log.info("Quiet for %dm - collective debrief of %d activities",
                      DEBRIEF_QUIET_SECS // 60, len(block))
             text = generate_debrief(block)
             if text:
                 send_message(own, text)
+                _clear_pending()
 
 
 def evaluate_red_flags(snap):
@@ -3039,19 +2586,21 @@ def maybe_red_flags():
     today = date.today().isoformat()
     if read_file(RED_FLAGS_FILE).strip() == today:
         return
-    if read_file(LAST_SUMMARY_FILE).strip() == today:
+    if (read_file(LAST_SUMMARY_FILE).strip() == today
+            or runtime_store().summary_delivered(today)
+            or runtime_store().summary_pending(today)):
         write_file(RED_FLAGS_FILE, today)  # the brief already covers this ground
         return
     now = datetime.now()
     cur = (now.hour, now.minute)
     if cur < (5, 30) or cur >= AUTO_START:
         return
-    snap = garmin_coach.build_snapshot()
+    snap = get_snapshot()
     if isinstance(snap, dict) and "__error__" in snap:
         return
     flags = evaluate_red_flags(snap)
-    write_file(RED_FLAGS_FILE, today)
     if not flags:
+        write_file(RED_FLAGS_FILE, today)
         return
     log.info("Red flags this morning: %s", flags)
     prompt, _ = _assemble(SUMMARY_PROMPT_FILE, data=snap)
@@ -3060,10 +2609,11 @@ def maybe_red_flags():
                "words) early heads-up: name the concern(s) plainly and give ONE "
                "adjustment for today (dial back intensity / prioritise recovery). "
                "First line: \U0001F916 AgBot \u26A0\uFE0F Heads-up \u00B7 " + today_human() + ".")
-    text = run_llm(prompt)
+    text = _generate_checked(prompt)
     if text:
         append_history("agbot", "[early red-flag alert] " + text)
         send_message(own, text)
+        write_file(RED_FLAGS_FILE, today)
 
 
 def acquire_singleton_lock():
@@ -3077,40 +2627,134 @@ def acquire_singleton_lock():
     return s  # keep referenced for process lifetime
 
 
-def main():
-    _lock = acquire_singleton_lock()  # noqa: F841
-    me = tg("getMe")
-    log.info("AgBot online as @%s", me.get("result", {}).get("username"))
-    log.info("LLM model=%s reasoning-effort=%s",
-             COPILOT_MODEL or "(CLI default)", COPILOT_REASONING_EFFORT)
-    offset = get_offset()
-    while True:
+def _poll_messages():
+    delay = 5
+    while not _stop.is_set():
         try:
-            pt = 1 if _album_buffer else POLL_TIMEOUT
-            params = {"timeout": pt}
+            params = {"timeout": POLL_TIMEOUT}
+            offset = runtime_store().offset(get_offset())
             if offset is not None:
                 params["offset"] = offset
-            resp = tg("getUpdates", params, timeout=pt + 15)
-            for upd in resp.get("result", []):
-                offset = upd["update_id"] + 1
-                set_offset(offset)
-                msg = upd.get("message") or upd.get("edited_message")
-                if msg:
-                    try:
-                        dispatch(msg)
-                    except Exception as exc:  # noqa: BLE001
-                        log.exception("dispatch error: %s", exc)
-            flush_ready_albums()
-            maybe_auto_summary()
-            maybe_red_flags()
-            maybe_post_workout()
-            maybe_meal_reminders()
-            maybe_hydration_reminders()
-            maybe_movement_reminders()
-            maybe_exercise_checkins()
-        except Exception as exc:  # noqa: BLE001
-            log.error("poll loop error: %s", exc)
-            time.sleep(5)
+            response = tg("getUpdates", params, timeout=POLL_TIMEOUT + 15)
+            if not response.get("ok"):
+                raise RuntimeError(response.get("description", "Telegram poll rejected"))
+            runtime_store().ingest(response.get("result", []))
+            delay = 5
+        except Exception:
+            log.exception("stage=poll failed; durable cursor retained")
+            _stop.wait(delay)
+            delay = min(60, delay * 2)
+
+
+def _publish_messages():
+    while not _stop.is_set():
+        try:
+            flush_outbox()
+        except Exception:
+            log.exception("stage=outbox failed; pending messages retained")
+        _stop.wait(2)
+
+
+def _serve_health(listener):
+    listener.settimeout(1)
+    while not _stop.is_set():
+        try:
+            connection, _ = listener.accept()
+        except socket.timeout:
+            continue
+        with connection:
+            connection.settimeout(2)
+            try:
+                request = connection.recv(4096)
+                if not request.startswith(b"GET /health "):
+                    connection.sendall(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+                    continue
+                body = json.dumps({
+                    "status": "busy" if _current_request else "ready",
+                    "model": COPILOT_MODEL, "reasoning": COPILOT_REASONING_EFFORT,
+                    "release": os.environ.get("AGBOT_RELEASE", "development"),
+                    "worker_busy_seconds": (round(time.time() - _worker_started)
+                                            if _worker_started else 0),
+                    "last_progress_age_seconds": round(time.time() - _last_progress),
+                    "queues": runtime_store().counts(),
+                }).encode("utf-8")
+                connection.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                                   + f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
+            except (OSError, ValueError):
+                log.exception("stage=health request failed")
+
+
+def _process_request(item):
+    messages = item["payload"]["messages"]
+    if item["payload"].get("album"):
+        chat_id = messages[0]["chat"]["id"]
+        if not _owner_ok(chat_id):
+            return
+        _set_msg_sent_at(messages[0].get("date"))
+        caption = next((m["caption"] for m in messages if m.get("caption")), "")
+        do_images(chat_id, [_photo_file_id(m) for m in messages], caption)
+    else:
+        dispatch(messages[0])
+
+
+def main():
+    global _current_request, _send_sequence, _generation_sequence, _worker_started, _last_progress
+    listener = acquire_singleton_lock()
+    if not os.path.isfile(PROFILE_FILE):
+        raise FileNotFoundError("Create your private profile first: " + PROFILE_FILE)
+    runtime_store().recover()
+    memory_store()
+    training_store()
+    me = tg("getMe")
+    log.info("AgBot online as @%s", me.get("result", {}).get("username"))
+    log.info("LLM model=%s reasoning-effort=%s release=%s",
+             COPILOT_MODEL or "(CLI default)", COPILOT_REASONING_EFFORT,
+             os.environ.get("AGBOT_RELEASE", "development"))
+    for target, args in ((_poll_messages, ()), (_publish_messages, ()),
+                         (_serve_health, (listener,))):
+        threading.Thread(target=target, args=args, daemon=True).start()
+    next_schedule = 0
+    jobs = (maybe_auto_summary, maybe_red_flags, maybe_post_workout, maybe_meal_reminders,
+            maybe_hydration_reminders, maybe_movement_reminders, maybe_exercise_checkins)
+    while not _stop.is_set():
+        item = runtime_store().claim()
+        if item:
+            _current_request = item["id"]
+            _send_sequence = _generation_sequence = 0
+            _worker_started = time.time()
+            try:
+                _process_request(item)
+                runtime_store().finish(item["id"])
+            except Exception as exc:
+                log.exception("stage=request failed id=%s", item["id"])
+                state = runtime_store().fail(item["id"], str(exc),
+                                             max_attempts=1 if isinstance(exc, ValueError) else 4)
+                chat_id = item["payload"]["messages"][0]["chat"]["id"]
+                notice = ("AgBot: I couldn't complete this request. "
+                          "It is retained as failed; please resend when ready."
+                          if state == "failed" else
+                          "AgBot: I couldn't complete this yet. Your request is saved; "
+                          "I'll retry automatically.")
+                # Failure notices have their own stable identity, not the answer's slot.
+                runtime_store().enqueue(f"{item['id']}:notice:{state}", chat_id,
+                                        {"text": notice})
+            finally:
+                log.info("stage=request id=%s seconds=%.2f", item["id"],
+                         time.time() - _worker_started)
+                _current_request = None
+                _worker_started = None
+                _last_progress = time.time()
+            continue
+        if time.time() >= next_schedule:
+            _set_msg_sent_at(None)
+            for job in jobs:
+                try:
+                    job()
+                except Exception:
+                    log.exception("stage=scheduler job=%s failed; next tick will retry", job.__name__)
+            next_schedule = time.time() + 60
+            _last_progress = time.time()
+        _stop.wait(1)
 
 
 if __name__ == "__main__":
