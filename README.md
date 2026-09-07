@@ -139,6 +139,12 @@ feedback. Proposed, completed and too-difficult loads are different facts.
 - Active preferences and health constraints are not silently trimmed or expired.
   Capability retrieval is entity-aware; recent chat remains a bounded selection,
   not a guarantee that every sentence from seven days is in every prompt.
+- Food replies show per-item estimates, meal totals and daily calorie/protein
+  progress. Corrections can supersede an existing journal entry rather than add
+  another meal; originals remain in the append-only audit. Estimates are not
+  measured intake, and unconfigured targets remain unknown.
+- Replies use phone-friendly headings and lists. Markdown tables are converted to
+  labeled cards, and long replies preserve their formatting across Telegram messages.
 - Structured `SESSION_PLAN` proposals are checked against supported explicit
   exclusions and rest-plan consistency before saving. These checks are not a
   comprehensive medical or biomechanical safety assessment.

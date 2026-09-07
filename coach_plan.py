@@ -82,13 +82,18 @@ def parse_plans(text, preferences=(), today=None):
 
 def render_plans(plans):
     """Render the validated prescription; hidden JSON must not hide working sets."""
-    sections = []
+    sections, upcoming = [], []
     for plan in plans:
-        kind = plan["kind"] + (", provisional outline" if plan.get("detail_level") == "outline" else "")
-        lines = [f"Session plan - {plan['date']} ({kind})",
-                 "Goal: " + plan["objective"], "Reason: " + plan["reason"]]
+        day = date.fromisoformat(plan["date"])
+        label = "Today" if day == date.today() else day.strftime("%a %d %b")
+        if plan.get("detail_level") == "outline" or (day > date.today() and not plan.get("exercises")):
+            upcoming.append(f"- **{label}**: {plan['objective']} (provisional outline)")
+            continue
+        icon = "\U0001F33F" if plan["kind"] == "rest" else "\U0001F4CB"
+        lines = [f"**{icon} {label} \u00b7 {plan['kind'].title()} plan**",
+                 plan["objective"], "**Why:** " + plan["reason"]]
         for number, exercise in enumerate(plan.get("exercises", []), 1):
-            lines.append(f"{number}. {exercise['name']}")
+            lines.extend(["", f"**{number}. {exercise['name']}**"])
             basis = exercise.get("weight_basis", "unspecified")
             for index, prescription in enumerate(exercise.get("sets", []), 1):
                 fields = []
@@ -112,6 +117,8 @@ def render_plans(plans):
             if exercise.get("effort"):
                 lines.append("   Effort: " + str(exercise["effort"]))
         sections.append("\n".join(lines))
+    if upcoming:
+        sections.append("**\U0001F5D3\uFE0F Coming up**\n" + "\n".join(upcoming))
     return "\n\n".join(sections)
 
 

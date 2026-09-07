@@ -25,7 +25,7 @@ import os
 import re
 import sys
 import json
-import html
+import hashlib
 import time
 import socket
 import logging
@@ -195,6 +195,7 @@ import garmin_coach  # noqa: E402
 from coach_memory import MemoryStore
 from coach_plan import TrainingStore, parse_plans, render_plans, unsupported_claims
 from coach_runtime import RuntimeStore, SnapshotCache, message_key
+from telegram_formatting import md_to_html, html_chunks, html_to_plain as _html_to_plain
 
 _memory_store = None
 _training_store = None
@@ -434,24 +435,59 @@ def recent_history_text():
     return prefix + "\n".join(reversed(lines))
 
 
-def append_journal(text, on_date=None):
+def journal_entry_id(entry):
+    identity = [entry.get("request_id") or entry.get("ts"), entry.get("date"), entry.get("text")]
+    return entry.get("entry_id") or "note:" + hashlib.sha256(
+        json.dumps(identity, ensure_ascii=False).encode("utf-8")).hexdigest()[:16]
+
+
+def journal_entries():
+    return [json.loads(line) for line in read_file(JOURNAL_FILE).splitlines() if line.strip()]
+
+
+def active_journal_entries(entries=None):
+    entries = journal_entries() if entries is None else entries
+    replaced = {e["replaces_entry_id"] for e in entries if e.get("replaces_entry_id")}
+    return [e for e in entries if journal_entry_id(e) not in replaced
+            and e.get("entry_type") != "supersession"]
+
+
+def append_journal(text, on_date=None, replaces_entry_id=None):
     """Journal a durable note. `on_date` ('YYYY-MM-DD') back-dates the entry - used when the
     user reports a meal from an earlier day ('last night's dinner', shared the morning after).
     Defaults to today. The stored `ts` always stays the real capture time."""
-    entry = {"date": on_date or date.today().isoformat(), "text": text.strip(),
+    existing = journal_entries()
+    target = next((e for e in existing if journal_entry_id(e) == replaces_entry_id), None)
+    if replaces_entry_id and target is None:
+        raise ValueError("The meal selected for correction was not found.")
+    entry = {"date": on_date or (target["date"] if target else date.today().isoformat()),
+             "text": text.strip(),
              "ts": datetime.now().isoformat(timespec="seconds"), "request_id": _current_request}
+    if date.fromisoformat(entry["date"]) > date.today():
+        raise ValueError("Future food consumption cannot be logged.")
+    if replaces_entry_id:
+        entry["replaces_entry_id"] = replaces_entry_id
     if _current_request:
-        for line in read_file(JOURNAL_FILE).splitlines():
-            old = json.loads(line)
+        for old in existing:
             if (old.get("request_id") == _current_request and old.get("date") == entry["date"]
-                    and old.get("text") == entry["text"]):
-                return
+                    and old.get("text") == entry["text"]
+                    and old.get("replaces_entry_id") == replaces_entry_id):
+                return old
+    if replaces_entry_id and replaces_entry_id not in {
+            journal_entry_id(e) for e in active_journal_entries(existing)}:
+        raise ValueError("This meal already has a correction; use its latest entry.")
+    entry["entry_id"] = journal_entry_id(entry)
     with open(JOURNAL_FILE, "a", encoding="utf-8") as fh:
         fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    return entry
 
 
 _LOG_MARKER_RE = re.compile(r"\[\[LOG(?:\s+(\d{4}-\d{2}-\d{2}))?:\s*(.*?)\]\]",
                             re.IGNORECASE | re.DOTALL)
+_LOG_REPLACES_RE = re.compile(r"\[\[LOG_REPLACES:\s*([A-Za-z0-9:_-]+)\s*\]\]", re.IGNORECASE)
+_MODEL_LOG_RECEIPT_RE = re.compile(
+    r"(?mi)^[ \t]*(?:\U0001F37D\uFE0F?[ \t]*)?(?:logged|updated log)"
+    r"[ \t]*\u2713(?:[ \t]*\u00b7[^\n]*)?[ \t]*$")
 
 
 def _extract_log_marker(text):
@@ -472,15 +508,13 @@ def _extract_log_marker(text):
     clean = _LOG_MARKER_RE.sub("", text).rstrip()
     note = " ".join(" ".join(n for _d, n in found).split()).strip()
     on_date = next((d for d, _n in found if d), None)
-    if on_date and on_date > date.today().isoformat():
-        on_date = None  # never accept a future date
     return clean, (note or None), on_date
 
 
-def _logged_confirmation(on_date=None):
+def _logged_confirmation(on_date=None, updated=False):
     """The 'logged' line appended after a meal is saved. Names the day whenever the entry
     was back-dated, so it's obvious it did NOT land on today's tally."""
-    base = "\n\n\U0001F37D\uFE0F logged \u2713"
+    base = "\n\n\U0001F37D\uFE0F " + ("updated log" if updated else "logged") + " \u2713"
     today = date.today().isoformat()
     if not on_date or on_date == today:
         return base
@@ -580,22 +614,15 @@ def _harvest_exercise_plan(text):
 
 
 def recent_journal_text():
-    try:
-        with open(JOURNAL_FILE, "r", encoding="utf-8") as fh:
-            lines = [ln for ln in fh.read().strip().split("\n") if ln]
-    except FileNotFoundError:
-        return ""
     entries = []
-    for ln in lines[-JOURNAL_KEEP:]:
-        try:
-            e = json.loads(ln)
-        except json.JSONDecodeError:
-            continue
+    active = active_journal_entries()
+    for e in active[-JOURNAL_KEEP:]:
         d = e.get("date", "")
         tag = _day_tag(d)
         label = d + ((" (" + tag + ")") if tag else "")
         if not (e.get("text") or "").startswith("[coach plan]"):
-            entries.append((d, (label + ": " + (e.get("text") or "")).strip()))
+            entries.append((d, ("[entry_id=" + journal_entry_id(e) + "] " +
+                               label + ": " + (e.get("text") or "")).strip()))
     selected, size, omitted = [], 0, 0
     for day, line in reversed(entries):
         if day != date.today().isoformat() and size + len(line) > JOURNAL_PROMPT_CHARS:
@@ -603,8 +630,10 @@ def recent_journal_text():
             continue
         selected.append(line)
         size += len(line) + 1
-    prefix = f"[{omitted} older journal records omitted; plans are in TRAINING_STATE.]\n"
-    return (prefix if omitted else "") + "\n".join(reversed(selected))
+    prefix = "ACTIVE JOURNAL: superseded corrections are excluded; count each meal once.\n"
+    if omitted:
+        prefix += f"[{omitted} older journal records omitted; plans are in TRAINING_STATE.]\n"
+    return prefix + "\n".join(reversed(selected)) if selected else ""
 
 def active_health_text():
     """Injuries/illness the user reported and hasn't marked recovered - injected into EVERY
@@ -710,103 +739,6 @@ def _post(method, params, timeout=30):
         return {"ok": False, "description": str(exc)}
 
 
-def _chunks(text, n):
-    if not text:
-        return [""]
-    out, cur = [], ""
-    for line in text.split("\n"):
-        if len(cur) + len(line) + 1 > n:
-            if cur:
-                out.append(cur)
-            while len(line) > n:
-                out.append(line[:n])
-                line = line[n:]
-            cur = line
-        else:
-            cur = (cur + "\n" + line) if cur else line
-    if cur:
-        out.append(cur)
-    return out
-
-
-# ---- lightweight Markdown -> Telegram-HTML renderer -----------------------
-# The model writes natural Markdown; Telegram renders a small HTML subset
-# (<b> <i> <u> <s> <code> <pre> <a>). We convert the constructs the coach
-# actually uses and, if Telegram ever rejects the markup, fall back to plain
-# text so a message is never lost. Underscore italics are deliberately NOT
-# supported so identifiers like strain_yesterday survive intact.
-_SENT_O, _SENT_C = "\ue000", "\ue001"
-_RE_FENCE = re.compile(r"```[ \t]*[A-Za-z0-9_+-]*\n(.*?)```", re.DOTALL)
-_RE_ICODE = re.compile(r"`([^`\n]+)`")
-_RE_LINK = re.compile(r"\[([^\]\n]+)\]\((https?://[^)\s]+)\)")
-_RE_BOLD = re.compile(r"\*\*(.+?)\*\*", re.DOTALL)
-_RE_STRIKE = re.compile(r"~~(.+?)~~", re.DOTALL)
-_RE_ITALIC = re.compile(r"(?<![\w*])\*(?!\s)([^*\n]+?)\*(?![\w*])")
-_RE_HEAD = re.compile(r"^\s{0,3}#{1,6}\s+(.*?)\s*#*\s*$")
-_RE_BULLET = re.compile(r"^(\s*)[-*+]\s+(.*)$")
-_RE_HR = re.compile(r"^\s*([-*_])\1{2,}\s*$")
-_RE_RESTORE = re.compile(_SENT_O + r"(\d+)" + _SENT_C)
-
-
-def md_to_html(text):
-    """Convert the model's Markdown-ish text to Telegram-safe HTML."""
-    if not text:
-        return ""
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-
-    # Unwrap a single code fence that wraps the WHOLE message (model slip-up).
-    s = text.strip()
-    if s.startswith("```") and s.endswith("```") and s.count("```") == 2:
-        s = re.sub(r"^```[ \t]*[A-Za-z0-9_+-]*\n?", "", s)
-        text = s[:-3].strip("\n")
-
-    store = []
-
-    def _stash(frag):
-        store.append(frag)
-        return _SENT_O + str(len(store) - 1) + _SENT_C
-
-    # Protect code first (its contents must not be re-formatted).
-    text = _RE_FENCE.sub(
-        lambda m: _stash("<pre>" + html.escape(m.group(1).rstrip("\n"), quote=False) + "</pre>"),
-        text)
-    text = _RE_ICODE.sub(
-        lambda m: _stash("<code>" + html.escape(m.group(1), quote=False) + "</code>"),
-        text)
-
-    # Escape everything else, then inject the known-good tags.
-    text = html.escape(text, quote=False)
-    text = _RE_LINK.sub(
-        lambda m: _stash('<a href="' + html.escape(m.group(2), quote=True) + '">'
-                         + m.group(1) + "</a>"),
-        text)
-    text = _RE_BOLD.sub(lambda m: "<b>" + m.group(1) + "</b>", text)
-    text = _RE_STRIKE.sub(lambda m: "<s>" + m.group(1) + "</s>", text)
-    text = _RE_ITALIC.sub(lambda m: "<i>" + m.group(1) + "</i>", text)
-
-    out = []
-    for line in text.split("\n"):
-        if _RE_HR.match(line):
-            continue
-        h = _RE_HEAD.match(line)
-        if h:
-            out.append("<b>" + h.group(1) + "</b>")
-            continue
-        b = _RE_BULLET.match(line)
-        if b:
-            out.append(("  " if b.group(1) else "") + "\u2022 " + b.group(2))
-            continue
-        out.append(line)
-    text = "\n".join(out)
-
-    return _RE_RESTORE.sub(lambda m: store[int(m.group(1))], text)
-
-
-def _html_to_plain(html_text):
-    """Strip tags / unescape entities for the plain-text fallback path."""
-    return html.unescape(re.sub(r"<[^>]+>", "", html_text))
-
-
 def _strip_control_markers(text):
     """Final egress safety net: remove EVERY machine control marker ([[LOG]], [[REST_DAY]],
     [[PLAN]], [[EXERCISE_PLAN]], [[HEALTH_CLEAR]], [[ANCHOR]], and any future [[UPPER: ...]]
@@ -828,7 +760,7 @@ def send_message(chat_id, text, summary_date=None):
     text = _strip_control_markers(text)
     rendered = md_to_html(text)
     keys = []
-    chunks = [chunk for chunk in _chunks(rendered, 4000) if chunk.strip()]
+    chunks = [chunk for chunk in html_chunks(rendered, 4000) if _html_to_plain(chunk).strip()]
     for index, chunk in enumerate(chunks):
         if not chunk.strip():
             continue
@@ -1351,10 +1283,65 @@ def _assemble(prompt_file, question=None, include_history=True,
     return "".join(parts), data
 
 
+def _food_reporting_errors(text, source_text):
+    if not source_text:
+        return []
+    logs = _LOG_MARKER_RE.findall(text)
+    replacements = _LOG_REPLACES_RE.findall(text)
+    errors = []
+    if replacements and (not logs or len(set(replacements)) != 1):
+        errors.append("A meal correction needs one existing entry_id and a complete LOG note.")
+    if replacements and replacements[0] not in {journal_entry_id(e) for e in journal_entries()}:
+        errors.append("LOG_REPLACES must reference an entry_id from the supplied active journal.")
+    for day, _ in logs:
+        if day:
+            try:
+                if date.fromisoformat(day) > date.today():
+                    errors.append("Do not log future food consumption.")
+            except ValueError:
+                errors.append("LOG must use a valid calendar date.")
+    if not logs:
+        return errors
+    visible = _LOG_MARKER_RE.sub("", _LOG_REPLACES_RE.sub("", text))
+    progress_pattern = r"\b(?:daily|today['\u2019]s)\s+(?:progress|totals?|intake|tally)\b"
+    sections = {
+        "Meal estimate": r"\b(?:meal estimate|meal breakdown|food breakdown|rough estimates?)\b",
+        "Meal total": (r"\b(?:meal|snack)\s+(?:total|summary)\b|"
+                       r"^\s*(?:[-*]\s+)?(?:\*\*)?Total\s*:"),
+        "Daily progress": progress_pattern,
+    }
+    for section, pattern in sections.items():
+        if not re.search(pattern, visible, re.IGNORECASE | re.MULTILINE):
+            errors.append("Food reply needs a visible " + section + " section.")
+    progress = re.search(progress_pattern, visible, re.IGNORECASE)
+    if progress:
+        tail = visible[progress.end():]
+        if not re.search(r"\b(?:calories|kcal)\b", tail, re.IGNORECASE):
+            errors.append("Daily progress must include calories eaten, target and remaining.")
+        if not re.search(r"\bprotein\b", tail, re.IGNORECASE):
+            errors.append("Daily progress must include protein eaten, target and remaining.")
+    return errors
+
+
+def _present_reply(text):
+    parts = re.split(r"(```.*?```)", text.strip(), flags=re.DOTALL)
+    text = "".join(part if i % 2 else re.sub(r"\n[ \t]*\n(?:[ \t]*\n)+", "\n\n", part)
+                   for i, part in enumerate(parts))
+    lines = text.split("\n")
+    first = lines[0].strip().strip("*")
+    if re.match(r"^(?:\U0001F916\s*)?AgBot\b", first, re.IGNORECASE):
+        first = re.sub(r"^\U0001F916\s*", "", first).replace(" - ", " \u00b7 ")
+        lines[0] = "**\U0001F916 " + first + "**"
+    else:
+        lines.insert(0, "**\U0001F916 AgBot \u00b7 " + today_human() + "**\n")
+    return "\n".join(lines)
+
+
 def _generate_checked(prompt, source_text="", images=None, require_plan=False):
     """Persist source-backed facts and validate proposals before returning an answer."""
     text = run_llm(prompt, images=images)
     receipts = []
+    pending_memory_errors = []
     for attempt in range(2):
         if not text:
             return None
@@ -1363,21 +1350,31 @@ def _generate_checked(prompt, source_text="", images=None, require_plan=False):
         candidate, changes, memory_errors = memory_store().process_markers(
             text, source_text=source_text, source_type="user")
         receipts.extend(changes)
+        if memory_errors:
+            pending_memory_errors = memory_errors
+        elif changes:
+            pending_memory_errors = []
         clean, plans, errors = parse_plans(candidate, memory_store().records("preference"))
         errors.extend(unsupported_claims(clean))
+        errors.extend(_food_reporting_errors(clean, source_text))
         if require_plan and not plans:
             errors.append("a dated structured SESSION_PLAN is required")
         if require_plan in (True, "today") and not any(
                 p["date"] == date.today().isoformat() for p in plans):
             errors.append("today's structured SESSION_PLAN is required")
-        if not errors:
+        repair_reasons = errors + (pending_memory_errors if source_text else [])
+        if not repair_reasons:
             break
         if attempt:
-            raise ValueError("Coaching response rejected: " + "; ".join(errors))
-        log.warning("stage=output_guard repair_required=true issues=%s", errors)
+            if errors:
+                raise ValueError("Coaching response rejected: " + "; ".join(errors))
+            break
+        log.warning("stage=output_guard repair_required=true issues=%s", repair_reasons)
         text = run_llm(prompt + "\n\nDRAFT TO CORRECT:\n" + text +
-                       "\n\nOUTPUT ERRORS:\n" + "\n".join(errors) +
-                       "\nReturn a corrected complete answer. Do not relax user constraints.",
+                       "\n\nOUTPUT ERRORS:\n" + "\n".join(repair_reasons) +
+                       "\nReturn a corrected complete answer. Keep all visible food totals. "
+                       "Copy MEMORY source_quote verbatim from the CURRENT USER MESSAGE, "
+                       "never a paraphrase. Do not relax user constraints.",
                        images=images)
     if plans:
         training_store().save(plans, source="user_requested_revision" if source_text
@@ -1385,14 +1382,16 @@ def _generate_checked(prompt, source_text="", images=None, require_plan=False):
         for plan in plans:
             if plan["date"] == date.today().isoformat():
                 _set_coach_rest(plan["kind"] == "rest")
+    clean = _MODEL_LOG_RECEIPT_RE.sub("", clean)
+    replacements = _LOG_REPLACES_RE.findall(clean)
+    clean = _LOG_REPLACES_RE.sub("", clean)
     clean, logged, log_date = _extract_log_marker(clean)
     if logged and source_text:
-        log_date = log_date or _sent_backdate()
-        if log_date and date.fromisoformat(log_date) > date.today():
-            memory_errors.append("Future food consumption was not logged.")
-        else:
-            append_journal(logged, on_date=log_date)
-            clean += _logged_confirmation(log_date)
+        log_date = log_date or (None if replacements else _sent_backdate())
+        entry = append_journal(logged, on_date=log_date,
+                               replaces_entry_id=replacements[0] if replacements else None)
+        clean = re.sub(r"(?m)^Logged\.\s*", "", clean)
+        clean += _logged_confirmation(entry["date"], updated=bool(replacements))
     if source_text:
         clean = _harvest_exercise_plan(clean)
     clean = _strip_control_markers(clean)
@@ -1402,9 +1401,10 @@ def _generate_checked(prompt, source_text="", images=None, require_plan=False):
     if saved:
         clean += "\n\nMemory updated:\n" + "\n".join(
             "- " + r.get("action", "saved") + ": " + r["text"] for r in saved)
-    if memory_errors:
-        log.warning("stage=memory rejected_updates=%s", memory_errors)
-        clean += "\n\nSome memory updates were not saved: " + "; ".join(memory_errors)
+    if pending_memory_errors:
+        log.warning("stage=memory rejected_updates=%s", pending_memory_errors)
+        clean += "\n\nA memory update was not saved; that change has not been made permanent."
+    clean = _present_reply(clean)
     if plans and source_text and any(p["date"] == date.today().isoformat() for p in plans):
         save_todays_brief(clean)
     return clean

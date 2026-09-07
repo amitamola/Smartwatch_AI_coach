@@ -49,6 +49,118 @@ class BridgeTests(unittest.TestCase):
                 "exercises": []}
         return "A recovery day is planned.\n[[SESSION_PLAN: " + json.dumps(plan) + "]]"
 
+    def food_reply(self):
+        return (
+            "AgBot - A synthetic day\n\n**Meal estimate**\n"
+            "- Fruit: ~60 kcal; P 1g, C 15g, F 0g\n"
+            "- Yogurt: ~140 kcal; P 10g, C 9g, F 6g\n\n"
+            "**Meal total**: ~200 kcal; protein 11g, carbs 24g, fat 6g.\n\n"
+            "**Daily progress**\n"
+            "- Calories: ~300 eaten / 2,100 kcal target; ~1,800 remaining.\n"
+            "- Protein: ~21g eaten / 100g target; ~79g remaining.\n"
+            "[[LOG: Fruit and yogurt (~200 kcal, ~11g protein)]]")
+
+    def test_food_reply_repairs_missing_calories_and_daily_progress(self):
+        b = self.bridge
+        incomplete = "Protein looks good.\n[[LOG: Fruit and yogurt (~200 kcal, ~11g protein)]]"
+        with patch.object(b, "run_llm", side_effect=[incomplete, self.food_reply()]) as model:
+            result = b._generate_checked("food", source_text="I ate fruit and yogurt.")
+        self.assertEqual(model.call_count, 2)
+        self.assertIn("Meal total", result)
+        self.assertIn("1,800 remaining", result)
+        self.assertEqual(len(b.journal_entries()), 1)
+
+    def test_food_receipt_is_app_owned_and_shown_once(self):
+        b = self.bridge
+        reply = self.food_reply() + "\n\n\U0001F37D\uFE0F logged \u2713\n\n\n\n\U0001F37D\uFE0F logged \u2713"
+        with patch.object(b, "run_llm", return_value=reply):
+            result = b._generate_checked("food", source_text="I ate fruit and yogurt.")
+        self.assertEqual(result.count("logged \u2713"), 1)
+        self.assertNotIn("\n\n\n", result)
+        self.assertTrue(result.startswith("**\U0001F916 AgBot \u00b7"))
+
+    def test_equivalent_readable_food_headings_do_not_trigger_an_extra_model_call(self):
+        b = self.bridge
+        reply = self.food_reply().replace("Daily progress", "Today's progress")
+        with patch.object(b, "run_llm", return_value=reply) as model:
+            b._generate_checked("food", source_text="I ate fruit and yogurt.")
+        model.assert_called_once()
+
+    def test_telegram_delivery_converts_tables_and_keeps_long_bold_chunks_balanced(self):
+        b = self.bridge
+        table = "| Food | Calories |\n|---|---|\n| Fruit | 60 kcal |\n"
+        b.send_message(123, table + "\n**" + ("sample " * 700) + "**")
+        messages = b.runtime_store().due_messages()
+        self.assertGreater(len(messages), 1)
+        visible = "".join(b._html_to_plain(m["payload"]["text"]) for m in messages)
+        self.assertIn("60 kcal", visible)
+        self.assertNotIn("|---", visible)
+        for message in messages:
+            chunk = message["payload"]["text"]
+            self.assertEqual(chunk.count("<b>"), chunk.count("</b>"))
+            self.assertLessEqual(len(b._html_to_plain(chunk).encode("utf-16-le")) // 2, 4000)
+        for message in messages[:-1]:
+            self.assertTrue(b._html_to_plain(message["payload"]["text"])[-1].isspace())
+
+    def test_meal_correction_replaces_active_entry_and_is_retry_safe(self):
+        b = self.bridge
+        b._current_request = "update:1"
+        original = b.append_journal("Fruit and yogurt (~180 kcal)")
+        b._current_request = "update:2"
+        reply = self.food_reply() + "\n[[LOG_REPLACES: " + original["entry_id"] + "]]"
+        with patch.object(b, "run_llm", return_value=reply):
+            for _ in range(2):
+                result = b._generate_checked("correction", source_text="There were two portions.")
+        self.assertEqual(len(b.journal_entries()), 2)
+        self.assertEqual(len(b.active_journal_entries()), 1)
+        self.assertNotIn("180 kcal", b.recent_journal_text())
+        self.assertIn("200 kcal", b.recent_journal_text())
+        self.assertEqual(result.count("updated log \u2713"), 1)
+
+    def test_meal_correction_preserves_original_day_without_explicit_new_date(self):
+        b = self.bridge
+        yesterday = (date.today() - timedelta(days=1)).isoformat()
+        original = b.append_journal("Fruit", on_date=yesterday)
+        updated = b.append_journal("Two fruit", replaces_entry_id=original["entry_id"])
+        self.assertEqual(updated["date"], yesterday)
+        self.assertEqual(b.active_journal_entries(), [updated])
+
+    def test_legacy_correction_link_is_not_an_extra_food_entry(self):
+        b = self.bridge
+        original = b.append_journal("First meal estimate")
+        clarified = b.append_journal("Clarified meal estimate")
+        link = {"entry_type": "supersession", "replaces_entry_id": original["entry_id"],
+                "superseded_by": clarified["entry_id"], "text": "Audit link"}
+        self.assertEqual(b.active_journal_entries([original, clarified, link]), [clarified])
+
+    def test_unknown_meal_correction_is_not_silently_an_extra_meal(self):
+        b = self.bridge
+        reply = self.food_reply() + "\n[[LOG_REPLACES: note:missing]]"
+        with patch.object(b, "run_llm", return_value=reply), self.assertRaises(ValueError):
+            b._generate_checked("correction", source_text="It was two portions.")
+        self.assertEqual(b.journal_entries(), [])
+
+    def test_future_food_date_is_not_relabelled_today(self):
+        tomorrow = (date.today() + timedelta(days=1)).isoformat()
+        reply = self.food_reply().replace("[[LOG:", "[[LOG " + tomorrow + ":")
+        self.assertIn("Do not log future food consumption.",
+                      self.bridge._food_reporting_errors(reply, "A food report"))
+
+    def test_invalid_memory_quote_gets_one_repair_before_claiming_persistence(self):
+        b = self.bridge
+        source = "I prefer calories with every food report."
+        marker = {"kind": "preference", "key": "nutrition_reporting",
+                  "text": source, "source_quote": "Always show calories", "action": "upsert"}
+        first = "I'll use that format.\n[[MEMORY: " + json.dumps(marker) + "]]"
+        marker["source_quote"] = source
+        second = "I'll use that format.\n[[MEMORY: " + json.dumps(marker) + "]]"
+        with patch.object(b, "run_llm", side_effect=[first, second]) as model:
+            result = b._generate_checked("preference", source_text=source)
+        self.assertEqual(model.call_count, 2)
+        self.assertEqual(len(b.memory_store().records("preference")), 1)
+        self.assertNotIn("not saved", result)
+        self.assertIn("Memory updated", result)
+
     def test_current_plan_and_reminders_share_rest_state(self):
         b = self.bridge
         with patch.object(b, "run_llm", return_value=self.rest_reply()):

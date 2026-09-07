@@ -20,5 +20,8 @@ few training/recovery slots consistent with availability. Detailed sets/blocks
 belong to today's session; future slots can be outlines. Clearly distinguish a
 proposed plan from an activity the user actually completed.
 
+Use compact bold headings and a few bullets rather than long clinical paragraphs
+or tables. Don't repeat today's decision and rationale several times or list future
+schedule slots in prose: the app renders the plans below your explanation.
 Keep the narrative concise, but do not omit requested set-by-set details to satisfy
 a word limit. Include a brief, relevant safety note for prescribed exercise.

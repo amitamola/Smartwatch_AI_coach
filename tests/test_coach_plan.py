@@ -46,6 +46,14 @@ class PlanTests(unittest.TestCase):
         self.assertFalse(errors)
         self.assertIn("provisional outline", render_plans([outline]))
 
+    def test_future_schedule_is_a_compact_card_not_repeated_reason_blocks(self):
+        text = render_plans([self.plan(kind="strength", detail_level="outline"),
+                             self.plan(date="2026-01-02", detail_level="outline")])
+        self.assertEqual(text.count("Coming up"), 1)
+        self.assertNotIn("Reason:", text)
+        self.assertNotIn("Session plan -", text)
+        self.assertEqual(text.count("provisional outline"), 2)
+
     def test_avoidance_survives_symptom_clear(self):
         preference = {"key": "avoid_exercise:normal RDL", "status": "active"}
         _, _, errors = self.parse(
