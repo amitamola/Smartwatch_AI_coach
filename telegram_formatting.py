@@ -479,6 +479,8 @@ def html_chunks(rendered, max_length=4000):
         raise ValueError("max_length must be a positive integer")
     parser = _ChunkParser()
     parser.feed(rendered)
+    if parser.rawdata:
+        raise ValueError("Incomplete Telegram HTML token")
     parser.close()
     if parser.stack:
         raise ValueError("Unclosed Telegram HTML tag: " + parser.stack[-1])
