@@ -1,0 +1,3 @@
+-r requirements.lock
+# Synthetic image fixtures used by the model-evaluation regression suite.
+Pillow==12.3.0

@@ -481,10 +481,7 @@ def validate_case_b_output(text: str) -> dict[str, Any]:
 
 
 def load_font(size: int):
-    try:
-        from PIL import ImageFont  # type: ignore
-    except ImportError:  # pragma: no cover - environment already has Pillow
-        return None
+    from PIL import ImageFont
     windir = Path(os.environ.get("WINDIR", r"C:\Windows"))
     for candidate in (
         windir / "Fonts" / "segoeui.ttf",
@@ -493,9 +490,9 @@ def load_font(size: int):
         if candidate.exists():
             try:
                 return ImageFont.truetype(str(candidate), size=size)
-            except Exception:  # noqa: BLE001 - fallback to default font
+            except OSError:
                 pass
-    return ImageFont.load_default()
+    return ImageFont.load_default(size=size)
 
 
 def write_png_text_image(path: Path, title: str, lines: list[str]) -> None:

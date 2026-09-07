@@ -166,12 +166,14 @@ coaching cases and checks declared decision invariants without touching live sta
 Compare availability, correctness, output format and latency across repeated runs;
 small samples do not prove clinical safety or universal model superiority.
 Keep evaluation outputs private. Run the script with `--help` for its interface.
+Install `requirements-dev.txt` for synthetic image generation and the full suite.
 
 ## Development and deployment
 
 Run the offline standard-library regression suite:
 
 ```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
@@ -195,8 +197,9 @@ An optional private `-BeforeStartScript` can perform an idempotent migration aft
 the stopped-state backup. It receives `DataDir`, `ReleaseDir` and `PythonExe`; keep
 legacy data intact. Profile and `.env` changes from that hook are restored on failure.
 
-Dependencies from `requirements.lock` must be installed in the selected interpreter
-before deployment. Optional media dependencies are installed separately.
+Deployment runs the full suite, so install `requirements-dev.txt` (which includes
+`requirements.lock`) in the selected interpreter first. Optional voice/video
+dependencies beyond Pillow are installed separately.
 For first-time scheduling, configure Task Scheduler to run the launcher at logon
 with restart-on-failure and no execution time limit. A logon task cannot run while
 the host is unavailable or the required user session is absent.
