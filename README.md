@@ -100,6 +100,11 @@ AGBOT_SNAPSHOT_TTL=120
 The shipped backend is Copilot CLI. The adapter has extension points for other
 providers; those providers are not automatically enabled by changing a name.
 Routine model calls have an empty tool allowlist and explicitly use default context.
+Optionally set `AGBOT_FALLBACK_MODELS` to comma-separated, account-supported,
+vision-capable model IDs. An explicit "model is not available" error tries these
+in order with the same prompt, attachments and permissions. Unavailable IDs are
+rechecked after five minutes; other errors do not switch models. Fallback attempts
+share the original model-call timeout. No fallback is enabled by default.
 
 Launch on Windows:
 
@@ -163,7 +168,11 @@ feedback. Proposed, completed and too-difficult loads are different facts.
   a crash after Telegram accepts a message but before local acknowledgement may
   produce a duplicate.
 - A local `/health` endpoint on `127.0.0.1:49517` reports release/model, queue counts
-  and worker progress. It is not exposed to the network and has no health records.
+  and worker progress. It also reports the last successful `active_model`,
+  configured fallbacks and a sanitized `last_model_error`; known model failures
+  make status `degraded` until a successful call. A null active model means no
+  successful model call has been observed since startup, not verified availability.
+  It is not exposed to the network and has no health records.
 
 ## Models and evaluation
 

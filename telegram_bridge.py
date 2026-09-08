@@ -95,6 +95,9 @@ USER_NAME = os.environ.get("AGBOT_USER_NAME", "").strip()
 # `/model` in an interactive `copilot` session (e.g. "gpt-5.6-luna", "claude-sonnet-4.5",
 # or "auto"). AGBOT_REASONING_EFFORT is one of none|minimal|low|medium|high|xhigh|max.
 COPILOT_MODEL = os.environ.get("AGBOT_MODEL", "").strip()
+COPILOT_FALLBACK_MODELS = tuple(dict.fromkeys(
+    model.strip() for model in os.environ.get("AGBOT_FALLBACK_MODELS", "").split(",")
+    if model.strip()))
 COPILOT_REASONING_EFFORT = (os.environ.get("AGBOT_REASONING_EFFORT", "").strip() or "medium")
 
 # Auto-summary window (local time). If no summary has been sent yet today and the
@@ -955,14 +958,19 @@ def _scrub(text):
     return "\n".join(lines).strip()
 
 
-# The model runner can be briefly unreachable - e.g. GitHub Copilot auth/OAuth 503s during a
-# GitHub outage. Flag when the LAST run failed that way so the user gets a clear "model outage,
-# please resend" notice instead of a vague "try again", and knows missed messages aren't queued.
+# Keep provider failures separate from an explicitly unavailable model identifier.
 _LLM_OUTAGE_RE = re.compile(
     r"could not be validated|OAuth|No server is currently available|\b503\b|"
     r"service unavailable|temporarily unavailable|Authentication token|Failed to fetch",
     re.IGNORECASE)
 _llm_last_outage = False
+_MODEL_UNAVAILABLE_RE = re.compile(
+    r"""^\s*(?:Error:\s*)?Model ["']([^"'\r\n]+)["'] """
+    r"(?:from --model flag )?is not available\.?\s*$", re.IGNORECASE | re.MULTILINE)
+_MODEL_RECHECK_SECONDS = 300
+_unavailable_models = {}
+_llm_active_model = None
+_llm_last_error = None
 
 
 def _is_llm_outage(stderr):
@@ -1008,14 +1016,16 @@ def run_llm(prompt, image=None, images=None):
             runtime_store().save_generation(cache_key, result)
         return result
     finally:
-        log.info("stage=llm model=%s seconds=%.2f prompt_chars=%d images=%d",
-                 COPILOT_MODEL, time.monotonic() - started, len(prompt), len(imgs))
+        log.info("stage=llm configured=%s active=%s seconds=%.2f prompt_chars=%d images=%d",
+                 COPILOT_MODEL, _llm_active_model,
+                 time.monotonic() - started, len(prompt), len(imgs))
 
 
 def _llm_copilot(prompt, images):
     """Default backend: the GitHub Copilot CLI (`copilot`). The prompt is piped via
     stdin (so the OS command-line length limit never applies); images are passed as
     --attachment (Copilot is vision-capable)."""
+    global _llm_last_outage, _llm_active_model, _llm_last_error
     env = dict(os.environ)
     for k in ("AGENCY_ENGINE", "AGENCY_SESSION_ID", "AGENCY_OPERATION_ID",
               "AGENCY_LOG_SESSION_DIR", "COPILOT_AGENT_SESSION_ID",
@@ -1032,28 +1042,61 @@ def _llm_copilot(prompt, images):
         "--no-color", "--no-remote", "--no-remote-export",
         "--reasoning-effort", COPILOT_REASONING_EFFORT, "--context", "default",
     ]
-    if COPILOT_MODEL:
-        cmd += ["--model", COPILOT_MODEL]
     for att in images:
         if att:
             cmd += ["--attachment", att]
-    try:
-        res = subprocess.run(
-            cmd, input=prompt, capture_output=True, text=True,
-            encoding="utf-8", errors="replace",
-            timeout=COPILOT_TIMEOUT, env=env, cwd=BASE,
-        )
-    except subprocess.TimeoutExpired:
-        log.error("copilot timed out after %ss", COPILOT_TIMEOUT)
-        return None
-    if res.returncode != 0:
-        stderr = res.stderr or ""
-        log.error("copilot exit %s: %s", res.returncode, stderr[:600])
-        global _llm_last_outage
-        if _is_llm_outage(stderr):
-            _llm_last_outage = True
-        return None
-    return _scrub(res.stdout or "") or None
+    deadline = time.monotonic() + COPILOT_TIMEOUT
+    for model in dict.fromkeys((COPILOT_MODEL, *COPILOT_FALLBACK_MODELS)):
+        if _unavailable_models.get(model, 0) > time.monotonic():
+            continue
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            _llm_last_error = "model_timeout"
+            log.error("Copilot model attempts exhausted the %ss timeout", COPILOT_TIMEOUT)
+            return None
+        command = cmd + (["--model", model] if model else [])
+        try:
+            res = subprocess.run(
+                command, input=prompt, capture_output=True, text=True,
+                encoding="utf-8", errors="replace",
+                timeout=remaining, env=env, cwd=BASE,
+            )
+        except subprocess.TimeoutExpired:
+            _llm_last_error = "model_timeout"
+            log.error("copilot model=%s timed out", model or "(CLI default)")
+            return None
+        except OSError:
+            _llm_last_error = "cli_launch_error"
+            log.exception("Could not launch the Copilot CLI")
+            raise
+        if res.returncode != 0:
+            stderr = res.stderr or ""
+            unavailable = _MODEL_UNAVAILABLE_RE.search(stderr)
+            if unavailable and (not model or unavailable[1] == model):
+                _unavailable_models[model] = time.monotonic() + _MODEL_RECHECK_SECONDS
+                log.warning("Copilot model=%s unavailable; trying configured fallbacks",
+                            model or "(CLI default)")
+                continue
+            _llm_last_outage = _is_llm_outage(stderr)
+            _llm_last_error = "service_unavailable" if _llm_last_outage else "cli_error"
+            log.error("copilot model=%s exit %s: %s", model, res.returncode, stderr[:600])
+            return None
+        answer = _scrub(res.stdout or "")
+        if not answer:
+            _llm_last_error = "empty_response"
+            log.error("copilot model=%s returned an empty answer", model)
+            return None
+        _unavailable_models.pop(model, None)
+        _llm_active_model = model or "(CLI default)"
+        _llm_last_error = None
+        _llm_last_outage = False
+        if model != COPILOT_MODEL:
+            log.warning("stage=llm fallback configured=%s active=%s", COPILOT_MODEL, model)
+        return answer
+    _llm_last_error = "model_unavailable"
+    _llm_last_outage = True
+    log.error("No configured Copilot model is currently available")
+    return None
 
 
 # --- Optional alternative backends -------------------------------------------
@@ -2655,6 +2698,22 @@ def _publish_messages():
         _stop.wait(2)
 
 
+def _health_report():
+    return {
+        "status": ("degraded" if _llm_last_error else
+                   "busy" if _current_request else "ready"),
+        "model": COPILOT_MODEL, "reasoning": COPILOT_REASONING_EFFORT,
+        "active_model": _llm_active_model,
+        "fallback_models": list(COPILOT_FALLBACK_MODELS),
+        "last_model_error": _llm_last_error,
+        "release": os.environ.get("AGBOT_RELEASE", "development"),
+        "worker_busy_seconds": (round(time.time() - _worker_started)
+                                if _worker_started else 0),
+        "last_progress_age_seconds": round(time.time() - _last_progress),
+        "queues": runtime_store().counts(),
+    }
+
+
 def _serve_health(listener):
     listener.settimeout(1)
     while not _stop.is_set():
@@ -2669,15 +2728,7 @@ def _serve_health(listener):
                 if not request.startswith(b"GET /health "):
                     connection.sendall(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
                     continue
-                body = json.dumps({
-                    "status": "busy" if _current_request else "ready",
-                    "model": COPILOT_MODEL, "reasoning": COPILOT_REASONING_EFFORT,
-                    "release": os.environ.get("AGBOT_RELEASE", "development"),
-                    "worker_busy_seconds": (round(time.time() - _worker_started)
-                                            if _worker_started else 0),
-                    "last_progress_age_seconds": round(time.time() - _last_progress),
-                    "queues": runtime_store().counts(),
-                }).encode("utf-8")
+                body = json.dumps(_health_report()).encode("utf-8")
                 connection.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
                                    + f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
             except (OSError, ValueError):

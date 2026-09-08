@@ -4,7 +4,7 @@ import logging
 import os
 import tempfile
 import unittest
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -34,6 +34,13 @@ class BridgeTests(unittest.TestCase):
         b._memory_store = b._training_store = b._runtime_store = None
         b._current_request = None
         b._send_sequence = b._generation_sequence = 0
+        b._unavailable_models = {}
+        b._llm_active_model = b._llm_last_error = None
+        b._llm_last_outage = False
+        for name, value in (("COPILOT_MODEL", "primary-test"), ("COPILOT_FALLBACK_MODELS", ())):
+            model_setting = patch.object(b, name, value)
+            model_setting.start()
+            self.addCleanup(model_setting.stop)
         b._set_msg_sent_at(None)
         b.INCOMING = str(self.state)
         for variable, name in (
@@ -303,6 +310,88 @@ class BridgeTests(unittest.TestCase):
         with patch.object(self.bridge.subprocess, "run", return_value=SimpleNamespace(
                 returncode=1, stdout="partial response", stderr="upstream unavailable")):
             self.assertIsNone(self.bridge._llm_copilot("synthetic", []))
+
+    def test_unavailable_model_falls_back_with_images_and_rechecks_primary(self):
+        b = self.bridge
+        failure = SimpleNamespace(returncode=1, stdout="not an answer",
+                                  stderr='Error: Model "primary-test" from --model flag is not available.')
+        success = SimpleNamespace(returncode=0, stdout="Image answer", stderr="")
+        with patch.object(b, "COPILOT_FALLBACK_MODELS", ("backup-test", "primary-test")), \
+                patch.object(b.time, "monotonic", return_value=100) as clock, \
+                patch.object(b.subprocess, "run", side_effect=[
+                    failure, success, success, success]) as run:
+            self.assertEqual(b._llm_copilot("synthetic", ["sample.png"]), "Image answer")
+            health = b._health_report()
+            self.assertEqual(health["model"], "primary-test")
+            self.assertEqual(health["active_model"], "backup-test")
+            self.assertIsNone(health["last_model_error"])
+            b._llm_copilot("synthetic", ["sample.png"])
+            clock.return_value = 100 + b._MODEL_RECHECK_SECONDS
+            b._llm_copilot("synthetic", ["sample.png"])
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertEqual([cmd[cmd.index("--model") + 1] for cmd in commands],
+                         ["primary-test", "backup-test", "backup-test", "primary-test"])
+        for call in run.call_args_list:
+            self.assertIn("--available-tools=", call.args[0])
+            self.assertIn("sample.png", call.args[0])
+            self.assertEqual(call.kwargs["input"], "synthetic")
+        self.assertEqual(b._llm_active_model, "primary-test")
+
+    def test_all_models_unavailable_degrades_health_and_does_not_cache_failure(self):
+        b = self.bridge
+        b._current_request = "update:synthetic"
+        errors = [SimpleNamespace(returncode=1, stdout="partial", stderr=
+                                  f'Error: Model "{model}" from --model flag is not available.')
+                  for model in ("primary-test", "backup-test")]
+        with patch.object(b, "COPILOT_FALLBACK_MODELS", ("backup-test",)), \
+                patch.object(b.subprocess, "run", side_effect=errors):
+            self.assertIsNone(b.run_llm("synthetic"))
+        self.assertEqual(b._health_report()["status"], "degraded")
+        self.assertEqual(b._health_report()["last_model_error"], "model_unavailable")
+        self.assertIsNone(b.runtime_store().saved_generation("update:synthetic:generation:1"))
+
+    def test_other_cli_errors_never_switch_models(self):
+        b = self.bridge
+        for error in ("OAuth 503", "rate limit 429", "invalid argument --context",
+                      'Error: Model "another-model" from --model flag is not available.'):
+            with self.subTest(error=error), \
+                    patch.object(b, "COPILOT_FALLBACK_MODELS", ("backup-test",)), \
+                    patch.object(b.subprocess, "run", return_value=SimpleNamespace(
+                        returncode=1, stdout="partial", stderr=error)) as run:
+                self.assertIsNone(b._llm_copilot("synthetic", []))
+                run.assert_called_once()
+                self.assertEqual(b._health_report()["status"], "degraded")
+
+    def test_timeout_never_switches_models_or_returns_partial_output(self):
+        b = self.bridge
+        with patch.object(b, "COPILOT_FALLBACK_MODELS", ("backup-test",)), \
+                patch.object(b.subprocess, "run", side_effect=b.subprocess.TimeoutExpired(
+                    "copilot", 1, output="partial")) as run:
+            self.assertIsNone(b._llm_copilot("synthetic", []))
+        run.assert_called_once()
+        self.assertEqual(b._llm_last_error, "model_timeout")
+
+    def test_success_clears_model_failure_health(self):
+        b = self.bridge
+        b._llm_last_error = "model_unavailable"
+        with patch.object(b.subprocess, "run", return_value=SimpleNamespace(
+                returncode=0, stdout="reply", stderr="")):
+            b._llm_copilot("synthetic", [])
+        self.assertEqual(b._health_report()["status"], "ready")
+        self.assertEqual(b._health_report()["active_model"], "primary-test")
+
+    def test_recovered_photo_food_is_logged_once_on_original_message_day(self):
+        b = self.bridge
+        yesterday = date.today() - timedelta(days=1)
+        b._set_msg_sent_at(datetime.combine(yesterday, datetime.min.time()).replace(
+            hour=23, minute=58).timestamp())
+        b._current_request = "update:synthetic-photo"
+        with patch.object(b, "run_llm", return_value=self.food_reply()):
+            for _ in range(2):
+                result = b._generate_checked("photo", source_text="Having fruit and yogurt.")
+        self.assertEqual(len(b.journal_entries()), 1)
+        self.assertEqual(b.journal_entries()[0]["date"], yesterday.isoformat())
+        self.assertIn("yesterday", result)
 
     def test_album_downloads_have_distinct_paths_without_token_global(self):
         b = self.bridge
