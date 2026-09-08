@@ -5,6 +5,13 @@ Apply the shared coaching policy and private profile. Use the latest dated
 TRAINING_STATE, active constraints and relevant capabilities rather than repeating
 an older brief or blindly progressing yesterday's work.
 
+When PROGRAMME_STATE has an active review, select the appropriate programme
+template and apply its progression conditions to the latest actual evidence.
+Explain one meaningful keep/progress/change decision, especially a reviewed new
+exercise or a recovery adjustment. Include programme metadata in today's marker.
+Do not repeat the entire multi-week programme or automatically increase a load
+because it appeared in a previous prescription.
+
 Cover recovery/sleep, the 2-3 signals that matter today, a meaningful trend,
 today's session or planned rest, and a relevant nutrition/recovery suggestion.
 Mention missing/stale evidence when it affects the decision. Do not dump every

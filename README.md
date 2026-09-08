@@ -124,6 +124,8 @@ manager is needed for unattended operation. An interactive terminal is not one.
 | Ordinary text | Coaching question, preference, correction or feedback |
 | `memory` | Inspect active preferences, health and capability records |
 | `plan` | Inspect saved dated session proposals and user-reported status |
+| `programme` / `program` | View the saved multi-week framework and next review |
+| `review programme` / `review program` | Request a programme review now |
 | `week` | Weekly review and proposed upcoming schedule |
 | `performance` / `stats` | Available performance metrics and their dates |
 | `nutrition` | Targets and reported intake context |
@@ -136,6 +138,56 @@ manager is needed for unattended operation. An interactive terminal is not one.
 For selective recovery or correction, use ordinary language naming the relevant
 body area or fact. Prefer an exact movement variant and clear units for training
 feedback. Proposed, completed and too-difficult loads are different facts.
+
+## Autonomous training programmes
+
+Opt in with `AGBOT_PROGRAM_ENABLED=true` in the private `.env`. State goals,
+equipment, constraints and explicit availability (for example, "I can train three
+days per week") in the private profile. Missing availability is not a default
+training commitment.
+
+The app maintains four-week blocks with weekly reviews by default
+(`AGBOT_PROGRAM_BLOCK_DAYS=28`, `AGBOT_PROGRAM_REVIEW_DAYS=7`). It checks during
+the daytime scheduling window and before morning/weekly reports. New durable
+training feedback or profile changes can bring a review forward to the following
+day; current symptoms and exclusions override the programme immediately.
+The machine must be awake, connected and running the bridge. An overdue review
+is performed when it resumes, not replayed once for every missed week.
+
+Reviews use the observed 28-day workout history, explicit source-backed feedback,
+dated recovery/fitness metrics and existing commitments.
+The review refreshes a bounded Garmin lookback so a newly deployed bot can use
+older workouts too, with at most eight additional strength-set fetches and
+per-activity coverage/freshness disclosure.
+Routine prompts retain older movement-specific sets without repeating every older
+session timeline; explicit workout/order reviews retain the fuller sequence context.
+Reviews retain anchor movements, assess accessory/skill alternatives, set progression conditions,
+identify useful success signals and preserve recovery. Each exercise decision
+cites supplied evidence. A progression decision requires two distinct observed
+session dates for that exercise plus verified user capability feedback; these
+checks establish evidence presence, **not** proof of good form or safe exertion.
+Recorded mobility/recovery work can support its own capability progression;
+it still does not count as an intentional-training day, and commutes are not
+progression proof.
+New or unknown loads remain a tolerance/effort assessment, not an inferred
+capability. Commuting and proposals are not proof of training.
+Programme rules include stop/tolerance conditions and do not freeze numeric
+working kg/lb/watt targets. Those stay in dated daily prescriptions so newer
+feedback cannot be overridden by an old multi-week target.
+
+Daily prescriptions use the saved templates and revision, or explicitly explain a
+scope/safety/equipment adjustment. The known intentional-training day budget is
+checked across rolling seven-day windows. Templates are options, not extra weekly
+sessions. Routine reviews require no user nudge, but honest effort and symptom
+feedback still matter: the bot cannot observe what a trainer beside you could.
+
+Successful reviews and their evidence are private, revisioned and audited; their
+Telegram announcements are durably queued once per revision. A failed review
+does not overwrite a programme or disable ordinary replies: it is surfaced and
+retried after backoff. Copilot review generation, including one optional repair,
+shares a bounded `AGBOT_PROGRAM_REVIEW_TIMEOUT` budget (180 seconds by default);
+ordinary requests retain their existing timeout. This is structured coaching support, not a clinician or a
+guarantee of fitness outcomes. No model weights are trained on the user's data.
 
 ## Persistence and limits
 

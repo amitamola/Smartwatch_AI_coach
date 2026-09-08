@@ -11,7 +11,7 @@ contains your initial settings, not a transcript or a model-generated diagnosis.
 - How progress should be measured: <capabilities and outcomes that matter to you>
 
 ## Availability
-- Intentional training days per week: <your preference>
+- I can train <number> days per week (intentional training, not commuting).
 - Available days, session duration, upcoming events and preferred recovery days:
 
 ## Equipment and activities
@@ -42,3 +42,6 @@ contains your initial settings, not a transcript or a model-generated diagnosis.
 - Distinguish observed performance from inferred effort or form.
 - Explain why a session is held, reduced or progressed, and update the dated plan.
 - Ask when essential information is missing rather than inventing it.
+- If autonomous programme reviews are enabled, maintain useful anchor exercises,
+  assess coverage and alternatives, and explain what stays, progresses or changes.
+  Novelty alone is not a reason to replace a productive movement.

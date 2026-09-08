@@ -31,13 +31,14 @@ class BridgeTests(unittest.TestCase):
         b = self.bridge
         self.state = Path(self.temp.name)
         b.STATE = str(self.state)
-        b._memory_store = b._training_store = b._runtime_store = None
+        b._memory_store = b._training_store = b._runtime_store = b._program_store = None
         b._current_request = None
         b._send_sequence = b._generation_sequence = 0
         b._unavailable_models = {}
         b._llm_active_model = b._llm_last_error = None
         b._llm_last_outage = False
-        for name, value in (("COPILOT_MODEL", "primary-test"), ("COPILOT_FALLBACK_MODELS", ())):
+        for name, value in (("COPILOT_MODEL", "primary-test"), ("COPILOT_FALLBACK_MODELS", ()),
+                            ("PROGRAM_ENABLED", False)):
             model_setting = patch.object(b, name, value)
             model_setting.start()
             self.addCleanup(model_setting.stop)
@@ -205,6 +206,25 @@ class BridgeTests(unittest.TestCase):
         self.assertIn("TRAINING_STATE.", compact["latest_observed_per_movement"]
                       ["synthetic press"]["chronology_reference"])
 
+    def test_old_capabilities_keep_matching_sets_without_repeating_unrequested_full_sessions(self):
+        b = self.bridge
+        sequence = [{"sequence_index": 0, "exercise": "Synthetic press", "reps": 8},
+                    {"sequence_index": 1, "exercise": "Synthetic row", "reps": 12}]
+        old = {"activity_id": "old", "start": (date.today() - timedelta(days=20)).isoformat(),
+               "logged_sets": [{"exercise": "Synthetic press", "sets": 1,
+                               "set_indices": [0], "set_sequence": sequence}]}
+        b.training_store().record_activities([old] + [
+            {"activity_id": n, "start": date.today().isoformat(), "type": "running"}
+            for n in range(13)])
+        compact = b._compact_training_context(b.training_store().context(), {}, "GARMIN_JSON")
+        move = compact["latest_observed_per_movement"]["synthetic press"]
+        self.assertEqual(move["recorded_sets"]["set_sequence"], sequence[:1])
+        self.assertIn("omitted", move["chronology_scope"])
+        full = b._compact_training_context(b.training_store().context(), {}, "GARMIN_JSON",
+                                          keep_older_sequences=True)
+        self.assertEqual(full["latest_observed_per_movement"]["synthetic press"]
+                         ["recorded_sets"]["set_sequence"], sequence)
+
     def test_requested_workout_metrics_reach_context_and_durable_outcomes(self):
         b = self.bridge
         yesterday = (date.today() - timedelta(days=1)).isoformat()
@@ -370,6 +390,14 @@ class BridgeTests(unittest.TestCase):
             self.assertIsNone(b._llm_copilot("synthetic", []))
         run.assert_called_once()
         self.assertEqual(b._llm_last_error, "model_timeout")
+
+    def test_optional_review_can_use_a_smaller_copilot_budget(self):
+        b = self.bridge
+        with patch.object(b.subprocess, "run", return_value=SimpleNamespace(
+                returncode=0, stdout="reply", stderr="")) as run:
+            self.assertEqual(b._llm_copilot("synthetic", [], timeout=5), "reply")
+        self.assertLessEqual(run.call_args.kwargs["timeout"], 5)
+        self.assertGreater(run.call_args.kwargs["timeout"], 0)
 
     def test_success_clears_model_failure_health(self):
         b = self.bridge

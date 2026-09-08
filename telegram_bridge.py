@@ -67,6 +67,7 @@ WEEKLY_PROMPT_FILE = os.path.join(PROMPTS, "weekly_prompt.md")
 NUTRITION_PROMPT_FILE = os.path.join(PROMPTS, "nutrition_prompt.md")
 DEBRIEF_PROMPT_FILE = os.path.join(PROMPTS, "debrief_prompt.md")
 PERF_PROMPT_FILE = os.path.join(PROMPTS, "performance_prompt.md")
+PROGRAM_PROMPT_FILE = os.path.join(PROMPTS, "program_review_prompt.md")
 JOURNAL_FILE = os.path.join(STATE, "journal.jsonl")
 HEALTH_FILE = os.path.join(STATE, "health.jsonl")
 ANCHOR_FILE = os.path.join(STATE, "anchors.jsonl")
@@ -99,6 +100,10 @@ COPILOT_FALLBACK_MODELS = tuple(dict.fromkeys(
     model.strip() for model in os.environ.get("AGBOT_FALLBACK_MODELS", "").split(",")
     if model.strip()))
 COPILOT_REASONING_EFFORT = (os.environ.get("AGBOT_REASONING_EFFORT", "").strip() or "medium")
+PROGRAM_ENABLED = os.environ.get("AGBOT_PROGRAM_ENABLED", "false").strip().lower() == "true"
+PROGRAM_REVIEW_DAYS = int(os.environ.get("AGBOT_PROGRAM_REVIEW_DAYS", "7"))
+PROGRAM_BLOCK_DAYS = int(os.environ.get("AGBOT_PROGRAM_BLOCK_DAYS", "28"))
+PROGRAM_REVIEW_TIMEOUT = int(os.environ.get("AGBOT_PROGRAM_REVIEW_TIMEOUT", "180"))
 
 # Auto-summary window (local time). If no summary has been sent yet today and the
 # current time falls in this window, one is pushed automatically.
@@ -196,12 +201,14 @@ log = logging.getLogger("agbot")
 sys.path.insert(0, BASE)
 import garmin_coach  # noqa: E402
 from coach_memory import MemoryStore
-from coach_plan import TrainingStore, parse_plans, render_plans, unsupported_claims
+from coach_plan import TrainingStore, canonical_exercise, parse_plans, render_plans, unsupported_claims
+from coach_program import ProgramStore, build_review_evidence, parse_program_review, render_program
 from coach_runtime import RuntimeStore, SnapshotCache, message_key
 from telegram_formatting import md_to_html, html_chunks, html_to_plain as _html_to_plain
 
 _memory_store = None
 _training_store = None
+_program_store = None
 _runtime_store = None
 _snapshot_cache = SnapshotCache(garmin_coach.build_snapshot,
                                 int(os.environ.get("AGBOT_SNAPSHOT_TTL", "120")))
@@ -234,6 +241,14 @@ def runtime_store():
     if _runtime_store is None:
         _runtime_store = RuntimeStore(os.path.join(STATE, "transport.sqlite3"))
     return _runtime_store
+
+
+def program_store():
+    global _program_store
+    if _program_store is None:
+        _program_store = ProgramStore(os.path.join(STATE, "coach.sqlite3"),
+                                     review_days=PROGRAM_REVIEW_DAYS, block_days=PROGRAM_BLOCK_DAYS)
+    return _program_store
 
 
 def get_snapshot(force=False):
@@ -982,7 +997,7 @@ def _llm_fail_notice(chat_id, what="answer"):
     raise RuntimeError("Model unavailable while trying to " + what)
 
 
-def run_llm(prompt, image=None, images=None):
+def run_llm(prompt, image=None, images=None, cache_scope=None, timeout=None):
     """Generate a reply from the configured model/agent backend.
 
     *** THIS IS THE ONE PLACE TO CHANGE TO USE A DIFFERENT MODEL. ***
@@ -993,9 +1008,13 @@ def run_llm(prompt, image=None, images=None):
     """
     global _llm_last_outage, _generation_sequence
     _llm_last_outage = False
-    _generation_sequence += 1
-    cache_key = (f"{_current_request}:generation:{_generation_sequence}"
-                 if _current_request else None)
+    if cache_scope is None:
+        _generation_sequence += 1
+        generation_key = f"generation:{_generation_sequence}"
+    else:
+        # Optional review calls must not shift the answer's retry-cache slots.
+        generation_key = "scope:" + cache_scope
+    cache_key = f"{_current_request}:{generation_key}" if _current_request else None
     cached = runtime_store().saved_generation(cache_key)
     if cached is not None:
         return cached
@@ -1011,7 +1030,8 @@ def run_llm(prompt, image=None, images=None):
         return None
     started = time.monotonic()
     try:
-        result = backend(prompt, imgs)
+        result = (backend(prompt, imgs, timeout=timeout)
+                  if timeout is not None and LLM_BACKEND == "copilot" else backend(prompt, imgs))
         if result:
             runtime_store().save_generation(cache_key, result)
         return result
@@ -1021,7 +1041,7 @@ def run_llm(prompt, image=None, images=None):
                  time.monotonic() - started, len(prompt), len(imgs))
 
 
-def _llm_copilot(prompt, images):
+def _llm_copilot(prompt, images, timeout=None):
     """Default backend: the GitHub Copilot CLI (`copilot`). The prompt is piped via
     stdin (so the OS command-line length limit never applies); images are passed as
     --attachment (Copilot is vision-capable)."""
@@ -1045,14 +1065,15 @@ def _llm_copilot(prompt, images):
     for att in images:
         if att:
             cmd += ["--attachment", att]
-    deadline = time.monotonic() + COPILOT_TIMEOUT
+    budget = COPILOT_TIMEOUT if timeout is None else min(COPILOT_TIMEOUT, timeout)
+    deadline = time.monotonic() + budget
     for model in dict.fromkeys((COPILOT_MODEL, *COPILOT_FALLBACK_MODELS)):
         if _unavailable_models.get(model, 0) > time.monotonic():
             continue
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             _llm_last_error = "model_timeout"
-            log.error("Copilot model attempts exhausted the %ss timeout", COPILOT_TIMEOUT)
+            log.error("Copilot model attempts exhausted the %ss timeout", budget)
             return None
         command = cmd + (["--model", model] if model else [])
         try:
@@ -1149,6 +1170,302 @@ def today_human():
     return datetime.now().strftime("%a %d %b")
 
 
+def _program_inputs():
+    profile = read_file(PROFILE_FILE)
+    records = []
+    for kind in ("preference", "anchor", "health"):
+        for record in memory_store().records(kind):
+            if kind == "preference" and re.search(
+                    r"nutrition|food|meal|protein|calorie|hydration", record["key"], re.IGNORECASE):
+                continue
+            records.append(record)
+    facts = [{key: record.get(key) for key in (
+        "id", "kind", "key", "text", "status", "source_type", "source_text",
+        "verified", "revision", "observed_on")} for record in records]
+    fingerprint = hashlib.sha256(json.dumps(
+        {"profile": profile, "memory": facts}, sort_keys=True, ensure_ascii=False
+    ).encode("utf-8")).hexdigest()
+    return profile, records, fingerprint
+
+
+def _resolved_health_reports():
+    return [{key: record.get(key) for key in (
+        "key", "status", "resolved_at", "resolution_source_text")}
+        for record in memory_store().records("health", status="resolved")]
+
+
+def _program_training_context():
+    context = training_store().context(outcome_limit=None)
+    for row in context["recent_outcomes"]:
+        row["classification"] = garmin_coach.classify_activity(row["payload"])["classification"]
+    return context
+
+
+def _program_context(nutrition_focused=False):
+    if not PROGRAM_ENABLED:
+        return {"enabled": False}
+    _, _, fingerprint = _program_inputs()
+    context = program_store().context(fingerprint=fingerprint)
+    active = context.get("active")
+    # Evidence snapshots stay in the audit store; do not duplicate them in every reply.
+    result = {key: context.get(key) for key in (
+        "review_due", "due_reason", "next_review_date", "last_error", "retry_after")}
+    result["enabled"] = True
+    result["active"] = None
+    if active:
+        result["active"] = {key: active.get(key) for key in (
+            "revision", "block_start", "block_end", "reviewed_on", "next_review_date", "review")}
+        if nutrition_focused:
+            result["active"]["review"] = {key: active["review"].get(key) for key in (
+                "goal", "weekly_training_days", "recovery_rule")}
+    return result
+
+
+def _program_evidence_prompt(evidence, repair=False):
+    """Show each fact once; retain full provenance in the stored review audit."""
+    view = {key: value for key, value in evidence.items() if key not in ("memory", "profile")}
+    view["refs"] = {key: dict(value) for key, value in evidence["refs"].items()}
+    if "profile" in view["refs"]:
+        view["refs"]["profile"] = {"type": "profile", "text_reference": "PROFILE"}
+    for record in evidence.get("memory", []):
+        if record["ref"] in view["refs"]:
+            view["refs"][record["ref"]].update(
+                revision=record.get("revision"), updated_at=record.get("updated_at"))
+    if repair:
+        view.pop("observations", None)
+        baseline = view["refs"].get("block_baseline")
+        if baseline:
+            baseline.pop("observations", None)
+    return json.dumps(view, ensure_ascii=False, default=str, separators=(",", ":"))
+
+
+def _queue_program_update(record):
+    own = owner()
+    if not own or not record:
+        return
+    rendered = md_to_html(_strip_control_markers(render_program(record)))
+    for index, chunk in enumerate(html_chunks(rendered, 4000)):
+        key = f"program-review:{record['revision']}:{record['reviewed_on']}:{index}"
+        runtime_store().enqueue(key, own, {
+            "text": chunk, "parse_mode": "HTML", "disable_web_page_preview": "true",
+            "_program_revision": record["revision"],
+        })
+
+
+def _program_review_failed(reason):
+    log.error("stage=program_review failed reason=%s; prior programme unchanged", reason)
+    program_store().record_failure(reason)
+    own = owner()
+    if own:
+        runtime_store().enqueue(
+            f"program-review:notice:{date.today().isoformat()}", own,
+            {"text": "AgBot: I couldn't complete the programme review, so no programme "
+                     "change was saved. I'll retry automatically. Your current symptoms "
+                     "and movement exclusions still take priority over any older plan."})
+
+
+def ensure_program_review(force=False):
+    """Review only when due; a failed optional review must not disable ordinary replies."""
+    if not PROGRAM_ENABLED:
+        return None
+    store = program_store()
+    request_key = "program:" + _current_request if _current_request else None
+    if request_key:
+        prior = store.review_for_request(request_key)
+        if prior:
+            _queue_program_update(prior)
+            return prior
+    profile, records, fingerprint = _program_inputs()
+    context = store.context(fingerprint=fingerprint)
+    if not force and not context["review_due"]:
+        return None
+    snapshot = get_snapshot()
+    if not isinstance(snapshot, dict) or "__error__" in snapshot:
+        _program_review_failed("garmin_unavailable")
+        return None
+    history = garmin_coach.program_history()
+    training_store().record_activities(history["activities"])
+    training = _program_training_context()
+    evidence = build_review_evidence(training, records, profile)
+    evidence["refs"]["history_coverage"] = {"kind": "history_coverage", "data": history["coverage"]}
+    evidence["refs"]["snapshot"] = {
+        "kind": "device_snapshot",
+        "data": {key: snapshot.get(key) for key in (
+            "generated_at", "snapshot_cache", "last_sync_gmt", "last_sync_age_min",
+            "last_night_sleep", "training_readiness", "morning_readiness", "hrv",
+            "training_status", "training_rhythm", "wellness_today", "strain_yesterday",
+            "latest_weigh_in_30d", "weight_trend_30d", "weekly_trends", "weekly_intensity",
+            "recent_activities_7d_coverage")},
+    }
+    evidence["refs"]["fitness_metrics"] = {"kind": "device_metrics", "data": load_fitness_profile()}
+    evidence["refs"]["resolved_health"] = {
+        "kind": "user_reported_resolutions", "data": _resolved_health_reports(),
+        "meaning": "Historical symptoms reported resolved, not active injuries or proof any exercise is safe.",
+    }
+    baseline = context.get("block_baseline")
+    if baseline:
+        baseline_evidence = baseline["evidence"]
+        evidence["refs"]["block_baseline"] = {
+            "kind": "historical_observations",
+            "captured_on": baseline["reviewed_on"],
+            "observations": baseline_evidence.get("observations", []),
+            "metrics": {key: baseline_evidence.get("refs", {}).get(key)
+                        for key in ("snapshot", "fitness_metrics")},
+            "meaning": "Immutable block-start observations, not old programme proposals or recent progression proof.",
+        }
+    # These are proposals to honour, not evidence that their sets were completed.
+    commitments = [row for row in training["plans"] if row["date"] >= date.today().isoformat()]
+    prompt = (
+        read_file(PROGRAM_PROMPT_FILE)
+        + "\n\nTODAY: " + date.today().isoformat()
+        + "\n\nPROFILE:\n" + profile
+        + "\n\nREVIEW_EVIDENCE:\n" + _program_evidence_prompt(evidence)
+        + "\n\nEXISTING_DATED_PROPOSALS:\n" + json.dumps(commitments, ensure_ascii=False)
+        + "\n\nCURRENT_PROGRAMME:\n" + json.dumps(
+            _program_context(), ensure_ascii=False, default=str)
+        + "\n\n" + read_file(os.path.join(PROMPTS, "coaching_policy.md"))
+        + "\n\nTASK BOUNDARY: this is only a programme review, not a daily prescription. "
+          "Return exactly one TRAINING_PROGRAM marker; no SESSION_PLAN, MEMORY or LOG markers."
+    )
+    preferences = [record for record in records if record["kind"] == "preference"]
+    previous = context.get("active")
+    attempt_prompt = prompt
+    deadline = time.monotonic() + PROGRAM_REVIEW_TIMEOUT
+    for attempt in range(2):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            _program_review_failed("review_timeout")
+            return None
+        try:
+            answer = run_llm(attempt_prompt, cache_scope=f"program-review:{attempt}", timeout=remaining)
+        except OSError:
+            log.exception("stage=program_review model launch failed")
+            _program_review_failed("model_launch_error")
+            return None
+        if not answer:
+            _program_review_failed("review_timeout" if _llm_last_error == "model_timeout"
+                                   else "model_unavailable")
+            return None
+        _, review, errors = parse_program_review(
+            answer, evidence, preferences=preferences,
+            previous=previous["review"] if previous else None)
+        if not errors and review is not None:
+            record = store.save_review(review, evidence, fingerprint, request_key=request_key)
+            _queue_program_update(record)
+            log.info("stage=program_review saved revision=%s next_review=%s",
+                     record["revision"], record["next_review_date"])
+            return record
+        log.warning("stage=program_review validation attempt=%s errors=%s", attempt + 1, errors)
+        attempt_prompt = (read_file(PROGRAM_PROMPT_FILE)
+                          + "\n\nPROFILE:\n" + profile
+                          + "\n\nREVIEW_EVIDENCE (reference index; keep supported draft measurements):\n"
+                          + _program_evidence_prompt(evidence, repair=True)
+                          + "\n\nDRAFT TO CORRECT:\n" + answer
+                          + "\n\nREVIEW ERRORS:\n" + "\n".join(errors)
+                          + "\nReturn one complete corrected TRAINING_PROGRAM marker. "
+                          "Check EVERY exercise's conditions, not only the first reported error. "
+                          "Preserve supported decisions and measurements unless a reported error "
+                          "requires changing them. Do not invent new loads or capabilities. "
+                          "Use keep/reduce/clarify when progression evidence is insufficient; "
+                          "never invent references, tolerability or performance.")
+    _program_review_failed("invalid_programme_review")
+    return None
+
+
+def maybe_program_review(now=None):
+    if not PROGRAM_ENABLED or not owner():
+        return
+    now = now or datetime.now()
+    _, _, fingerprint = _program_inputs()
+    context = program_store().context(today=now.date(), fingerprint=fingerprint)
+    if not AUTO_START <= (now.hour, now.minute) < AUTO_END:
+        return
+    # Recover a crash between saving a review and queuing its announcement.
+    _queue_program_update(context.get("active"))
+    ensure_program_review()
+
+
+def _program_plan_errors(plans):
+    if not plans or not PROGRAM_ENABLED:
+        return []
+    active = program_store().context().get("active")
+    if not active:
+        return []
+    review = active["review"]
+    templates = {item["id"]: item for item in review["session_templates"]}
+    errors = []
+    intentional = {"strength", "cardio", "mixed"}
+    for plan in plans:
+        if (plan["kind"] == "rest" or (plan.get("detail_level") == "outline"
+                                      and plan["date"] > date.today().isoformat())):
+            continue
+        template_id = plan.get("program_template_id")
+        if template_id is not None and not isinstance(template_id, str):
+            errors.append("program_template_id must be a string.")
+            template_id = None
+        template = templates.get(template_id)
+        adjustment = isinstance(plan.get("program_adjustment"), str) and plan["program_adjustment"].strip()
+        if (not isinstance(plan.get("program_revision"), int)
+                or isinstance(plan.get("program_revision"), bool)
+                or plan.get("program_revision") != active["revision"]):
+            errors.append("SESSION_PLAN must name the current program_revision.")
+        if template is None:
+            if not adjustment:
+                errors.append("SESSION_PLAN needs a known program_template_id or an explicit "
+                              "program_adjustment explaining the requested/safety exception.")
+            continue
+        if template["kind"] != plan["kind"] and not adjustment:
+            errors.append("Changing the programme session kind needs a program_adjustment.")
+        expected = {canonical_exercise(item["name"]) for item in template["exercises"]}
+        actual = {canonical_exercise(item["name"]) for item in plan.get("exercises", [])
+                  if (canonical_exercise(item["name"]) in expected
+                      or item.get("role") not in ("warmup", "cooldown"))}
+        if actual != expected and not adjustment:
+            errors.append("Changing programme exercises needs a program_adjustment: "
+                          "explain the scope, recovery, equipment or tolerability reason.")
+    training = _program_training_context()
+    profile, records, _ = _program_inputs()
+    availability = build_review_evidence(training, records, profile)["weekly_training_days"]
+    prior_availability = (active.get("evidence") or {}).get("weekly_training_days")
+    limit = review.get("weekly_training_days")
+    if availability is not None:
+        if limit is None or availability < limit:
+            limit = availability
+        elif (prior_availability is not None and limit == prior_availability
+              and availability > prior_availability
+              and any(isinstance(p.get("program_adjustment"), str)
+                      and p["program_adjustment"].strip() for p in plans)):
+            # New explicit availability can raise an unchanged budget, not cancel a deload.
+            limit = availability
+    if limit is not None:
+        observed = {row["date"] for row in training["recent_outcomes"]
+                    if row["classification"] == "intentional_training"}
+        reported = {row["date"] for row in training["user_reported_day_status"]
+                    if row["status"] == "user_completed"
+                    and row.get("plan_kind_at_report") in intentional
+                    and row["date"] <= date.today().isoformat()}
+        proposals = {row["date"]: row["payload"] for row in training["plans"]
+                     if row["date"] >= date.today().isoformat()}
+        proposals.update({plan["date"]: plan for plan in plans})
+        planned = {day for day, proposal in proposals.items() if proposal["kind"] in intentional}
+        known_training_days = observed | reported | planned
+        proposed_training = {plan["date"] for plan in plans if plan["kind"] in intentional}
+        for day in sorted(planned):
+            end = date.fromisoformat(day)
+            start = (end - timedelta(days=6)).isoformat()
+            if not any(start <= candidate <= day for candidate in proposed_training):
+                continue
+            if sum(start <= day <= end.isoformat() for day in known_training_days) > limit:
+                counted = sorted(day for day in known_training_days if start <= day <= end.isoformat())
+                errors.append(
+                    f"The {start} through {end.isoformat()} window has {len(counted)} known "
+                    f"observed/reported/proposed training dates {counted}, above budget {limit}. "
+                    "Revise provisional future recovery slots rather than silently cancelling "
+                    "today's agreed session or adding more training; transport does not count.")
+                break
+    return errors
+
+
 def _enrich_activity_context(data, question="", summary=False):
     activities = data.get("recent_activities_7d") or data.get("activities") or []
     requested_day = None
@@ -1185,7 +1502,7 @@ def _enrich_activity_context(data, question="", summary=False):
     }
 
 
-def _compact_training_context(context, data, data_key):
+def _compact_training_context(context, data, data_key, keep_older_sequences=False):
     """Reference repeated workout payloads without removing their sole occurrence."""
     supplied, sequences, sequence_values = {}, {}, {}
     for field in ("recent_activities_7d", "activities"):
@@ -1214,6 +1531,17 @@ def _compact_training_context(context, data, data_key):
             movement["recorded_sets"] = dict(movement["recorded_sets"])
             movement["recorded_sets"].pop("set_sequence")
             movement["chronology_reference"] = sequences[aid]
+        elif not keep_older_sequences and "set_sequence" in movement["recorded_sets"]:
+            recorded = movement["recorded_sets"]
+            indices = recorded.get("set_indices")
+            if isinstance(indices, list) and indices:
+                selected = [item for index, item in enumerate(recorded["set_sequence"])
+                            if item.get("sequence_index", index) in indices]
+                if selected:
+                    movement["recorded_sets"] = dict(recorded, set_sequence=selected)
+                    movement["chronology_scope"] = (
+                        "This movement's sets only; the rest of this older session is omitted "
+                        "from routine context. Do not infer preceding exercises from this subset.")
     context["reference_note"] = (
         "References point to complete data elsewhere in this same prompt. "
         "Unrepeated fields remain in payload; a reference is not missing evidence.")
@@ -1278,6 +1606,13 @@ def _assemble(prompt_file, question=None, include_history=True,
         parts.append("\nACTIVE HEALTH FLAGS (injuries/illness the user reported and has NOT "
                      "marked recovered - respect these: adapt or rest, don't train through "
                      "them, and check how they're doing):\n" + flags + "\n")
+    if PROGRAM_ENABLED:
+        resolved = _resolved_health_reports()
+        if resolved:
+            parts.append("\nRESOLVED SYMPTOM REPORTS (historical, not active flags; "
+                         "do not repeatedly ask whether these remain active without new evidence. "
+                         "Separate movement exclusions still apply):\n"
+                         + json.dumps(resolved, ensure_ascii=False) + "\n")
     anchors = ("" if nutrition_focused else
                active_anchors_text(question or "training plan strength cycling running"))
     if anchors:
@@ -1317,9 +1652,14 @@ def _assemble(prompt_file, question=None, include_history=True,
         # instruction the model reads.
         parts.append("\n\nRECENT CONVERSATION (context, oldest to newest):\n"
                      + hist + "\n")
-    training = _compact_training_context(training, data, data_key)
+    keep_older_sequences = (prompt_file == DEBRIEF_PROMPT_FILE or _is_workout_review(question)
+                            or bool(re.search(r"\b(?:order|sequence|superset)\b",
+                                              question or "", re.IGNORECASE)))
+    training = _compact_training_context(training, data, data_key, keep_older_sequences)
     parts.append("\n\nTRAINING_STATE:\n" + json.dumps(training,
                  separators=(",", ":"), default=str))
+    parts.append("\n\nPROGRAMME_STATE:\n" + json.dumps(
+        _program_context(nutrition_focused), separators=(",", ":"), default=str))
     parts.append("\n\n" + read_file(os.path.join(PROMPTS, "coaching_policy.md")))
     if question is not None:
         parts.append("\n\nQUESTION:\n" + question)
@@ -1398,6 +1738,7 @@ def _generate_checked(prompt, source_text="", images=None, require_plan=False):
         elif changes:
             pending_memory_errors = []
         clean, plans, errors = parse_plans(candidate, memory_store().records("preference"))
+        errors.extend(_program_plan_errors(plans))
         errors.extend(unsupported_claims(clean))
         errors.extend(_food_reporting_errors(clean, source_text))
         if require_plan and not plans:
@@ -1405,6 +1746,11 @@ def _generate_checked(prompt, source_text="", images=None, require_plan=False):
         if require_plan in (True, "today") and not any(
                 p["date"] == date.today().isoformat() for p in plans):
             errors.append("today's structured SESSION_PLAN is required")
+        if require_plan in (True, "today") and any(
+                p["date"] == date.today().isoformat() and p["kind"] != "rest"
+                and (p.get("detail_level") == "outline" or not p.get("exercises"))
+                for p in plans):
+            errors.append("Today's non-rest plan needs an actual exercise prescription, not an empty outline.")
         repair_reasons = errors + (pending_memory_errors if source_text else [])
         if not repair_reasons:
             break
@@ -1442,6 +1788,8 @@ def _generate_checked(prompt, source_text="", images=None, require_plan=False):
         clean += "\n\n" + render_plans(plans)
     saved = [r for r in receipts if r.get("saved")]
     if saved:
+        if PROGRAM_ENABLED:
+            _program_context()
         clean += "\n\nMemory updated:\n" + "\n".join(
             "- " + r.get("action", "saved") + ": " + r["text"] for r in saved)
     if pending_memory_errors:
@@ -1454,6 +1802,7 @@ def _generate_checked(prompt, source_text="", images=None, require_plan=False):
 
 
 def generate_summary():
+    ensure_program_review()
     prompt, snap = _assemble(SUMMARY_PROMPT_FILE, include_history=True, include_brief=False)
     if isinstance(snap, dict) and "__error__" in snap:
         return None, snap
@@ -1514,6 +1863,7 @@ def generate_image(image_path, caption):
 
 
 def generate_weekly():
+    ensure_program_review()
     data = garmin_coach.build_weekly()
     if isinstance(data, dict) and "__error__" in data:
         return None, data
@@ -1820,6 +2170,8 @@ HELP_TEXT = (
     "- I auto-send your brief by ~9:30am, and ~90 min after your last logged activity I send "
     "ONE combined debrief of the whole session vs the plan (or reply DWRE to get it now).\n"
     "- **memory** shows saved facts; **plan** shows dated session proposals.\n"
+    "- **programme** shows your multi-week framework; **review programme** requests a "
+    "review now. When enabled, reviews also happen automatically without a command.\n"
     "- **/reset** clears recent chat, not durable preferences or health records.\n\n"
     "Advice uses available Garmin data and your private profile; missing data stays unknown."
 )
@@ -1899,6 +2251,11 @@ def classify(text):
         return "memory", ""
     if low in ("plan", "/plan", "current plan"):
         return "plan", ""
+    if low in ("programme", "program", "/programme", "/program", "training programme",
+               "training program"):
+        return "program", ""
+    if low in ("review programme", "review program", "/review_programme", "/review_program"):
+        return "program_review", ""
     if low in ("/reset", "/clear", "reset", "forget", "new chat", "start over"):
         return "reset", ""
     if low in ("recovered", "/recovered", "recovered all", "fully recovered",
@@ -1954,11 +2311,35 @@ def _route_text(chat_id, text):
                  f"(revision {p['revision']}, {p['status']})" for p in plans]
         send_message(chat_id, "AgBot - Dated plans\n" +
                      ("\n".join(lines) if lines else "No structured plan recorded yet."))
+    elif kind in ("program", "program_review"):
+        if not PROGRAM_ENABLED:
+            send_message(chat_id, "AgBot: programme coaching is not enabled in this installation.")
+        elif kind == "program_review":
+            record = ensure_program_review(force=True)
+            if record is None:
+                send_message(chat_id, "AgBot: the programme review did not complete; no programme "
+                             "change was saved. The automatic retry remains pending.")
+        else:
+            _, _, fingerprint = _program_inputs()
+            context = program_store().context(fingerprint=fingerprint)
+            active = context.get("active")
+            if active:
+                text = render_program(active)
+                if context.get("next_review_date") != active.get("next_review_date"):
+                    text += "\n\nFeedback review scheduled: " + str(context["next_review_date"])
+                if context.get("last_error"):
+                    text += "\n\nThe latest review attempt failed; a retry is pending."
+                send_message(chat_id, text)
+            else:
+                send_message(chat_id, "AgBot: the initial programme review is pending. "
+                             "It runs automatically during the daytime review window.")
     elif kind == "reset":
         clear_history()
         send_message(chat_id, "\U0001F916 AgBot: conversation memory cleared - fresh start.")
     elif kind == "recovered":
         cleared = resolve_health(text)
+        if cleared and PROGRAM_ENABLED:
+            _program_context()
         if cleared:
             send_message(chat_id, "\U0001F916 AgBot: great news \u2713 cleared your active "
                          "health flag(s): " + "; ".join(c[:60] for c in cleared)
@@ -2699,7 +3080,7 @@ def _publish_messages():
 
 
 def _health_report():
-    return {
+    report = {
         "status": ("degraded" if _llm_last_error else
                    "busy" if _current_request else "ready"),
         "model": COPILOT_MODEL, "reasoning": COPILOT_REASONING_EFFORT,
@@ -2712,6 +3093,15 @@ def _health_report():
         "last_progress_age_seconds": round(time.time() - _last_progress),
         "queues": runtime_store().counts(),
     }
+    if PROGRAM_ENABLED:
+        context = _program_context()
+        active = context.get("active") or {}
+        report["programme"] = {
+            "enabled": True, "revision": active.get("revision"),
+            "next_review_date": context.get("next_review_date"),
+            "review_due": context.get("review_due"), "last_error": context.get("last_error"),
+        }
+    return report
 
 
 def _serve_health(listener):
@@ -2756,6 +3146,8 @@ def main():
     runtime_store().recover()
     memory_store()
     training_store()
+    if PROGRAM_ENABLED:
+        program_store()
     me = tg("getMe")
     log.info("AgBot online as @%s", me.get("result", {}).get("username"))
     log.info("LLM model=%s reasoning-effort=%s release=%s",
@@ -2765,7 +3157,7 @@ def main():
                          (_serve_health, (listener,))):
         threading.Thread(target=target, args=args, daemon=True).start()
     next_schedule = 0
-    jobs = (maybe_auto_summary, maybe_red_flags, maybe_post_workout, maybe_meal_reminders,
+    jobs = (maybe_program_review, maybe_auto_summary, maybe_red_flags, maybe_post_workout, maybe_meal_reminders,
             maybe_hydration_reminders, maybe_movement_reminders, maybe_exercise_checkins)
     while not _stop.is_set():
         item = runtime_store().claim()

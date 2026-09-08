@@ -299,6 +299,48 @@ def _training_rhythm(g, d_today, activities=None, coverage=None):
     return metrics.training_rhythm(activities, d_today, coverage or {}, _activity_labels())
 
 
+def program_history(d_today=None, days=28, max_set_fetches=8, g=None):
+    """Bounded programme lookback, including workouts predating the local bot store."""
+    d_today = d_today or date.today()
+    if isinstance(days, bool) or not isinstance(days, int) or not 1 <= days <= 90:
+        raise ValueError("Programme history days must be between 1 and 90.")
+    if (isinstance(max_set_fetches, bool) or not isinstance(max_set_fetches, int)
+            or not 0 <= max_set_fetches <= 20):
+        raise ValueError("Programme set-fetch budget must be between 0 and 20.")
+    g = safe(client) if g is None else g
+    if isinstance(g, dict) and "__error__" in g:
+        return {"activities": [], "coverage": {
+            "complete": False, "unknown": True, "total": None,
+            "stop_reason": "history_client_unavailable",
+        }}
+    raw, coverage = _activity_history(g, d_today - timedelta(days=days), d_today)
+    activities = [_trim_activity(activity) for activity in raw]
+    cache = _load_sets_cache()
+    fetched = available = strength = 0
+    for activity in activities:
+        if "strength" not in str(activity.get("type") or "") or activity.get("activity_id") is None:
+            continue
+        strength += 1
+        metadata = {}
+        sets = _sets_for(g, activity["activity_id"], cache,
+                        refresh=_within_days(activity.get("start"), EDITABLE_DAYS),
+                        metadata=metadata, allow_fetch=fetched < max_set_fetches)
+        fetched += int(metadata.get("fetched", False))
+        activity["logged_sets_coverage"] = metadata
+        if sets:
+            activity["logged_sets"] = sets
+            available += 1
+    if fetched:
+        _save_sets_cache(cache)
+    coverage["strength_sets"] = {
+        "activities": strength, "with_available_or_cached_detail": available,
+        "without_detail": strength - available, "fetches": fetched,
+        "max_fetches": max_set_fetches,
+        "interpretation": "Per-activity freshness applies; missing or deferred detail is unknown.",
+    }
+    return {"activities": activities, "coverage": coverage}
+
+
 def _load_metric_cache():
     # New optional caches are isolated only when an explicit data root is supplied.
     if not os.environ.get("AGBOT_DATA_DIR"):

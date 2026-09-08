@@ -345,6 +345,37 @@ class MetricTests(unittest.TestCase):
 
 
 class CoverageTests(unittest.TestCase):
+    def test_programme_history_fetches_older_sessions_with_a_bounded_set_budget(self):
+        g = Mock()
+        g.get_activities.return_value = [
+            activity("2026-09-06", "strength_training", aid=1),
+            activity("2026-08-25", "strength_training", aid=2),
+            activity("2026-08-20", "strength_training", aid=3),
+        ]
+        g.get_activity_exercise_sets.return_value = {"exerciseSets": [
+            raw_set("TEST_PRESS", "2026-08-25T12:00:00", "kg", weight=4)]}
+        with patch.object(coach, "_load_sets_cache", return_value={}), \
+                patch.object(coach, "_save_sets_cache"):
+            result = coach.program_history(TODAY, max_set_fetches=2, g=g)
+        self.assertEqual(len(result["activities"]), 3)
+        self.assertTrue(result["coverage"]["complete"])
+        self.assertEqual(g.get_activity_exercise_sets.call_count, 2)
+        self.assertEqual(result["coverage"]["strength_sets"]["without_detail"], 1)
+        self.assertEqual(result["activities"][-1]["logged_sets_coverage"]["status"], "deferred")
+        self.assertEqual(result["activities"][1]["start"][:10], "2026-08-25")
+
+    def test_programme_history_failure_is_unknown_not_zero_training(self):
+        g = Mock()
+        g.get_activities.side_effect = RuntimeError("offline")
+        with patch.object(coach, "_load_sets_cache", return_value={}):
+            result = coach.program_history(TODAY, g=g)
+        self.assertTrue(result["coverage"]["unknown"])
+        self.assertIsNone(result["coverage"]["total"])
+
+    def test_programme_history_rejects_unbounded_requests(self):
+        with self.assertRaises(ValueError):
+            coach.program_history(TODAY, max_set_fetches=100, g=Mock())
+
     def test_classifier_commute_strength_unknown_and_overrides(self):
         fixtures = [
             (activity("2026-09-07", "e_bike_fitness", activityTrainingLoad=100), "transport"),

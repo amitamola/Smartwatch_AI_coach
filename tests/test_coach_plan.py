@@ -1,7 +1,7 @@
 import json
 import tempfile
 import unittest
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 from coach_plan import TrainingStore, parse_plans, render_plans, unsupported_claims
@@ -101,6 +101,27 @@ class PlanTests(unittest.TestCase):
             self.assertEqual(store.context(date(2026, 1, 1))["plans"][0]["status"],
                              "user_skipped")
 
+    def test_completion_context_does_not_change_with_a_later_plan_revision(self):
+        with tempfile.TemporaryDirectory() as folder:
+            store = TrainingStore(Path(folder) / "plans.db")
+            store.save([self.plan(kind="strength")])
+            store.set_status("2026-01-01", "user_completed")
+            store.save([self.plan(kind="recovery")])
+            report = store.context(date(2026, 1, 1))["user_reported_day_status"][0]
+            self.assertEqual(report["plan_kind_at_report"], "strength")
+            self.assertEqual(report["plan_revision_at_report"], 1)
+            store.set_status("2026-01-01", "user_skipped")
+            self.assertIsNone(store.context(date(2026, 1, 1))["user_reported_day_status"][0]
+                              ["plan_kind_at_report"])
+
+    def test_completion_without_a_plan_does_not_infer_a_later_proposal_was_done(self):
+        with tempfile.TemporaryDirectory() as folder:
+            store = TrainingStore(Path(folder) / "plans.db")
+            store.set_status("2026-01-01", "user_completed")
+            store.save([self.plan(kind="strength")])
+            self.assertIsNone(store.context(date(2026, 1, 1))["user_reported_day_status"][0]
+                              ["plan_kind_at_report"])
+
     def test_latest_movement_uses_workout_time_not_upload_identifier(self):
         with tempfile.TemporaryDirectory() as folder:
             store = TrainingStore(Path(folder) / "plans.db")
@@ -112,6 +133,22 @@ class PlanTests(unittest.TestCase):
             ])
             movement = store.context(date(2026, 1, 1))["latest_observed_per_movement"]
             self.assertEqual(movement["test press"]["activity_id"], "10")
+
+    def test_programme_reviews_can_get_all_observed_sessions_not_just_last_twelve(self):
+        today = date(2026, 1, 28)
+        with tempfile.TemporaryDirectory() as folder:
+            store = TrainingStore(Path(folder) / "plans.db")
+            store.record_activities([
+                {"activity_id": str(n), "start": (today - timedelta(days=n)).isoformat()}
+                for n in range(20)
+            ] + [{"activity_id": "future", "start": "2026-01-29"}])
+            self.assertEqual(len(store.context(today)["recent_outcomes"]), 12)
+            all_context = store.context(today, outcome_limit=None)
+            self.assertEqual(len(all_context["recent_outcomes"]), 20)
+            self.assertEqual(all_context["recent_outcomes_omitted"], 0)
+            self.assertNotIn("future", [r["activity_id"] for r in all_context["recent_outcomes"]])
+            with self.assertRaises(ValueError):
+                store.context(today, outcome_limit=0)
 
 
 if __name__ == "__main__":

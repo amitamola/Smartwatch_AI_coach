@@ -124,7 +124,9 @@ def render_plans(plans):
 
 def unsupported_claims(text):
     pattern = (r"\b(?:zero[- ]spinal[- ]load|zero (?:spinal|back) stress|"
-               r"guaranteed back[- ]safe|proves? (?:no|zero) muscle loss)\b")
+               r"guaranteed back[- ]safe|proves? (?:no|zero) muscle loss|"
+               r"(?:without|no) (?:axial |added |any )?(?:spinal|spine|lumbar) "
+               r"(?:loading|load|compression|stress|overload))\b")
     problems = []
     for match in re.finditer(pattern, text or "", re.IGNORECASE):
         prefix = text[max(0, match.start() - 70):match.start()].lower()
@@ -150,10 +152,28 @@ class TrainingStore:
                     observed_at TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS training_day_status (
                     date TEXT PRIMARY KEY, status TEXT NOT NULL, updated_at TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS training_completion_context (
+                    date TEXT PRIMARY KEY, plan_kind_at_report TEXT,
+                    plan_revision_at_report INTEGER, reported_at TEXT NOT NULL);
                 INSERT OR IGNORE INTO training_day_status
                     SELECT date,status,updated_at FROM training_plans
                     WHERE status IN ('user_completed','user_skipped','user_planned');
             """)
+            legacy_reports = db.execute(
+                "SELECT date,updated_at FROM training_day_status WHERE status='user_completed' "
+                "AND date NOT IN (SELECT date FROM training_completion_context)").fetchall()
+            for day, reported_at in legacy_reports:
+                # Same-second or later proposals cannot establish the plan the report referred to.
+                earlier = db.execute(
+                    "SELECT payload,revision FROM training_plan_events "
+                    "WHERE date=? AND recorded_at<? ORDER BY recorded_at DESC,revision DESC LIMIT 1",
+                    (day, reported_at)).fetchone()
+                if db.execute("SELECT 1 FROM training_plan_events WHERE date=? AND recorded_at=?",
+                              (day, reported_at)).fetchone():
+                    earlier = None
+                db.execute("INSERT INTO training_completion_context VALUES (?,?,?,?)",
+                           (day, json.loads(earlier[0]).get("kind") if earlier else None,
+                            earlier[1] if earlier else None, reported_at))
 
     @contextmanager
     def connection(self):
@@ -193,6 +213,13 @@ class TrainingStore:
         day = date.fromisoformat(str(day)).isoformat()
         now = datetime.now().isoformat(timespec="seconds")
         with self.connection() as db:
+            if status == "user_completed":
+                proposed = db.execute("SELECT payload,revision FROM training_plans WHERE date=?",
+                                      (day,)).fetchone()
+                kind = json.loads(proposed[0]).get("kind") if proposed else None
+                db.execute(
+                    "INSERT OR REPLACE INTO training_completion_context VALUES (?,?,?,?)",
+                    (day, kind, proposed[1] if proposed else None, now))
             db.execute("INSERT INTO training_day_status VALUES (?,?,?) "
                        "ON CONFLICT(date) DO UPDATE SET status=excluded.status,"
                        "updated_at=excluded.updated_at", (day, status, now))
@@ -222,8 +249,12 @@ class TrainingStore:
                     "observed_at=excluded.observed_at",
                     (str(aid), start, json.dumps(payload, ensure_ascii=False, default=str), now))
 
-    def context(self, today=None):
+    def context(self, today=None, outcome_limit=12):
         today = today or date.today()
+        if outcome_limit is not None and (
+                isinstance(outcome_limit, bool) or not isinstance(outcome_limit, int)
+                or outcome_limit < 1):
+            raise ValueError("outcome_limit must be a positive integer or None.")
         start = (today - timedelta(days=28)).isoformat()
         with self.connection() as db:
             db.row_factory = sqlite3.Row
@@ -231,11 +262,13 @@ class TrainingStore:
                 "SELECT date,payload,revision,status FROM training_plans WHERE date>=? "
                 "ORDER BY date", ((today - timedelta(days=7)).isoformat(),))]
             outcomes = [dict(r) for r in db.execute(
-                "SELECT activity_id,date,payload FROM training_outcomes WHERE date>=? "
-                "ORDER BY date,activity_id", (start,))]
+                "SELECT activity_id,date,payload FROM training_outcomes WHERE date>=? AND date<=? "
+                "ORDER BY date,activity_id", (start, today.isoformat()))]
             day_status = [dict(r) for r in db.execute(
-                "SELECT date,status,updated_at FROM training_day_status WHERE date>=? "
-                "ORDER BY date", (start,))]
+                "SELECT s.date,s.status,s.updated_at,c.plan_kind_at_report,c.plan_revision_at_report "
+                "FROM training_day_status s LEFT JOIN training_completion_context c "
+                "ON c.date=s.date AND c.reported_at=s.updated_at AND s.status='user_completed' "
+                "WHERE s.date>=? ORDER BY s.date", (start,))]
         for row in plans + outcomes:
             row["payload"] = json.loads(row["payload"])
         outcomes.sort(key=lambda row: (
@@ -264,8 +297,9 @@ class TrainingStore:
         return {
             "plans": plans,
             "user_reported_day_status": day_status,
-            "recent_outcomes": outcomes[-12:],
-            "recent_outcomes_omitted": max(0, len(outcomes) - 12),
+            "recent_outcomes": outcomes if outcome_limit is None else outcomes[-outcome_limit:],
+            "recent_outcomes_omitted": (0 if outcome_limit is None else
+                                      max(0, len(outcomes) - outcome_limit)),
             "outcome_count_28d": len(outcomes),
             "latest_observed_per_movement": movements,
             "weekly_recorded_sets": {
@@ -276,7 +310,9 @@ class TrainingStore:
             },
             "interpretation": (
                 "Plans are proposals, not evidence of completion. Logged sets do not establish "
-                "RPE, good form, pain-free execution, or readiness to increase load. Missing "
-                "history is unknown, not rest or zero volume. Use full set chronology, not "
+                "RPE, good form, pain-free execution, or readiness to increase load. "
+                "Completion-report context records the proposal kind at report time, not proof "
+                "that its prescribed sets were completed. Older unclassified reports stay unknown. "
+                "Missing history is unknown, not rest or zero volume. Use full set chronology, not "
                 "category first-appearance order. Revise dated plans explicitly when needed."),
         }

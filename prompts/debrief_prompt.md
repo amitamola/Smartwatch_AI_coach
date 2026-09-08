@@ -16,3 +16,12 @@ effort. Ask a short effort/tolerability question when that would change progress
 No new verified memory may be inferred from this automated debrief: actual Garmin
 outcomes are stored by the app, and user feedback is captured on their next reply.
 If revising a future session, emit a SESSION_PLAN with the reason.
+
+Relate the observed session to PROGRAMME_STATE's progression conditions and success
+signals. Distinguish progress in performance from unknown effort/tolerability.
+Ask the single most useful missing effort or symptom question for the next
+decision, rather than the same generic question after every workout. Introduced
+exercises particularly need tolerance feedback; their first appearance in Garmin
+is not proof they should be progressed. Include programme metadata for revised
+dated prescriptions, and explain deviations rather than silently reverting to an
+old exercise list.
