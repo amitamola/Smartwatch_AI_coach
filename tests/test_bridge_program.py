@@ -80,6 +80,14 @@ class ProgrammeBridgeTests(unittest.TestCase):
         with patch.object(self.bridge, "run_llm", return_value=self.marker()):
             return self.bridge.ensure_program_review()
 
+    def test_classification_repair_is_not_reported_as_clinical_recovery(self):
+        store = self.bridge.memory_store()
+        quote = "My back felt good during and after glute bridges."
+        record = store.upsert("health", "low_back", quote, source_text=quote, verified=True)
+        store.reclassify_tolerance(record["id"], "exercise_tolerance:glute_bridges")
+        self.assertEqual(self.bridge._resolved_health_reports(), [])
+        self.assertTrue(store.records("anchor"))
+
     def plan(self, **changes):
         result = {
             "date": date.today().isoformat(), "kind": "strength", "objective": "Practise",
@@ -181,7 +189,8 @@ class ProgrammeBridgeTests(unittest.TestCase):
         original = b._program_inputs()[2]
         b.memory_store().upsert("preference", "nutrition_reporting", "Show calories.")
         self.assertEqual(original, b._program_inputs()[2])
-        b.memory_store().upsert("anchor", "test_press", "That load was too difficult.")
+        b.memory_store().upsert("anchor", "test_press", "That load was too difficult.",
+                                source_text="That load was too difficult.", verified=True)
         self.assertNotEqual(original, b._program_inputs()[2])
 
     def test_paraphrased_memory_keeps_its_verified_source_for_progression(self):
@@ -333,6 +342,7 @@ class ProgrammeBridgeTests(unittest.TestCase):
 
     def test_training_budget_counts_days_not_commutes_or_multiple_parts(self):
         b = self.bridge
+        Path(b.PROFILE_FILE).write_text("I can train at most four days per week.", encoding="utf-8")
         self.initialise()
         today = date.today()
         activities = [
@@ -350,6 +360,7 @@ class ProgrammeBridgeTests(unittest.TestCase):
 
     def test_today_cannot_overfill_an_already_planned_future_week(self):
         b = self.bridge
+        Path(b.PROFILE_FILE).write_text("I can train at most four days per week.", encoding="utf-8")
         self.initialise()
         future = [self.plan(date=(date.today() + timedelta(days=n)).isoformat(),
                             detail_level="outline", exercises=[]) for n in range(1, 5)]
@@ -358,6 +369,7 @@ class ProgrammeBridgeTests(unittest.TestCase):
 
     def test_completed_reported_training_days_count_even_before_watch_sync(self):
         b = self.bridge
+        Path(b.PROFILE_FILE).write_text("I can train at most four days per week.", encoding="utf-8")
         self.initialise()
         for days_ago in range(1, 5):
             day = (date.today() - timedelta(days=days_ago)).isoformat()
@@ -368,7 +380,7 @@ class ProgrammeBridgeTests(unittest.TestCase):
     def test_new_lower_availability_limits_the_same_reply_before_next_review(self):
         b = self.bridge
         self.initialise()
-        Path(b.PROFILE_FILE).write_text("I can train two days per week.", encoding="utf-8")
+        Path(b.PROFILE_FILE).write_text("I can train at most two days per week.", encoding="utf-8")
         b.training_store().record_activities([
             {"activity_id": str(n), "start": (date.today() - timedelta(days=n)).isoformat(),
              "type": "strength_training"} for n in (1, 2)])
@@ -381,7 +393,8 @@ class ProgrammeBridgeTests(unittest.TestCase):
         b.training_store().record_activities([
             {"activity_id": str(n), "start": (date.today() - timedelta(days=n)).isoformat(),
              "type": "strength_training"} for n in range(1, 5)])
-        self.assertTrue(b._program_plan_errors([self.plan()]))
+        self.assertEqual(b._program_plan_errors([self.plan()]), [])
+        self.assertEqual(b._scheduling_context()["usual_target_days"], 5)
         adjusted = self.plan(program_adjustment="The user explicitly increased availability.")
         self.assertEqual(b._program_plan_errors([adjusted]), [])
 
@@ -396,7 +409,8 @@ class ProgrammeBridgeTests(unittest.TestCase):
             {"activity_id": str(n), "start": (date.today() - timedelta(days=n)).isoformat(),
              "type": "strength_training"} for n in (1, 2)])
         adjusted = self.plan(program_adjustment="The user has more available time.")
-        self.assertTrue(b._program_plan_errors([adjusted]))
+        self.assertEqual(b._program_plan_errors([adjusted]), [])
+        self.assertEqual(b._scheduling_context()["usual_target_days"], 2)
 
     def test_programme_commands_are_views_or_explicit_reviews_not_generic_qa(self):
         b = self.bridge
@@ -409,6 +423,92 @@ class ProgrammeBridgeTests(unittest.TestCase):
         health = b._health_report()["programme"]
         self.assertEqual(health["revision"], 1)
         self.assertNotIn("goal", health)
+
+    def test_one_off_class_is_not_rejected_for_exceeding_a_starting_target(self):
+        b = self.bridge
+        self.initialise()
+        b.training_store().record_activities([
+            {"activity_id": str(n), "start": (date.today() - timedelta(days=n)).isoformat(),
+             "type": "strength_training"} for n in range(4)])
+        tomorrow = (date.today() + timedelta(days=1)).isoformat()
+        future = self.plan(date=tomorrow, kind="mixed", exercises=[],
+                           objective="Provisional group class",
+                           reason="Requested one-off class; format and intensity need clarification")
+        future.pop("program_revision")
+        future.pop("program_template_id")
+        reply = "What is the class format?\n[[SESSION_PLAN: " + json.dumps(future) + "]]"
+        with patch.object(b, "run_llm", return_value=reply) as model:
+            result = b._generate_checked("synthetic", source_text="Can I join the class tomorrow?",
+                                         require_plan="any", show_schedule=True)
+        model.assert_called_once()
+        self.assertIn("5 training days", result)
+        self.assertEqual(b.training_store().context()["plans"][0]["payload"]["kind"], "mixed")
+        self.assertEqual(b.program_store().context()["active"]["review"]["weekly_training_days"], 4)
+
+    def test_unsupported_reply_claim_is_repaired_without_reversing_class_choice(self):
+        b = self.bridge
+        self.initialise()
+        plan = self.plan(date=(date.today() + timedelta(days=1)).isoformat(),
+                         kind="mixed", exercises=[], objective="Class option")
+        marker = "[[SESSION_PLAN: " + json.dumps(plan) + "]]"
+        with patch.object(b, "run_llm", side_effect=[
+                "Your muscular reserves are untouched.\n" + marker,
+                "Class intensity remains to be clarified.\n" + marker]) as model:
+            result = b._generate_checked("synthetic", source_text="Could I join the class?",
+                                         require_plan="any")
+        self.assertEqual(model.call_count, 2)
+        self.assertNotIn("untouched", result)
+        self.assertEqual(b.training_store().context()["plans"][0]["payload"]["kind"], "mixed")
+
+    def test_mixed_message_correction_uses_app_debrief_refs_and_keeps_raw_source(self):
+        b = self.bridge
+        point = {"sequence_index": 0, "source_index": 0, "set_type": "ACTIVE",
+                 "exercise": "TEST_PRESS", "reps": 21, "weight_kg": 4}
+        group = {"exercise": "Test press", "sets": 1, "reps": "21",
+                 "set_indices": [0], "set_sequence": [point]}
+        recent = {"activity_id": "111", "start": date.today().isoformat(),
+                  "type": "strength_training", "logged_sets": [group]}
+        old = {**recent, "activity_id": "222",
+               "start": (date.today() - timedelta(days=10)).isoformat()}
+        b.training_store().record_activities([old, recent])
+        b.append_history("agbot", "A question about the observed set.", activity_ids=["111"])
+        b._current_request = "synthetic:correction"
+        question = ("My watch recorded 21 reps by mistake; I corrected it to 15. "
+                    "For another exercise I used 20kg. Can I join a class tomorrow?")
+        with patch.object(b.garmin_coach, "exercise_sets", return_value=[group]) as refresh:
+            result = b._prepare_workout_correction(question)
+            replay = b._prepare_workout_correction(question)
+        self.assertTrue(result["saved"])
+        self.assertTrue(replay["replayed"])
+        refresh.assert_called_once()
+        self.assertTrue(refresh.call_args.kwargs["force_refresh"])
+        self.assertEqual(result["correction"]["target"]["activity_id"], "111")
+        raw = next(a for a in b.training_store().raw_activities() if a["activity_id"] == "111")
+        self.assertEqual(raw["logged_sets"][0]["reps"], "21")
+        effective = b.training_store().context()["latest_observed_per_movement"]["test press"]
+        self.assertEqual(effective["recorded_sets"]["reps"], "15")
+        self.assertIn("user_corrections", effective["recorded_sets"])
+        with self.assertRaises(ValueError):
+            b.training_store().record_activities(b.training_store().corrections.apply([raw]))
+        with patch.object(b, "run_llm", return_value="The reported correction is available."):
+            reply = b._generate_checked("synthetic", source_text=question)
+        self.assertIn("21 \u2192 15 reps", reply)
+        self.assertIn("user-reported", reply)
+        self.assertIn("original Garmin data are preserved separately", reply)
+
+    def test_todays_external_class_does_not_need_an_invented_exercise_list(self):
+        b = self.bridge
+        self.initialise()
+        plan = self.plan(kind="mixed", exercises=[], delivery="instructor_led",
+                         start_time="18:30", detail_level="outline",
+                         participation_guidance=["Confirm format and intensity with the instructor.",
+                                                 "Reassess symptoms and reduce overlapping work."],
+                         program_adjustment="User requested an external class; content is unknown.")
+        with patch.object(b, "run_llm", return_value="[[SESSION_PLAN: " + json.dumps(plan) + "]]"):
+            reply = b._generate_checked("morning", require_plan=True)
+        self.assertIn("Instructor-led session", reply)
+        self.assertIn("18:30", reply)
+        self.assertIn("content/intensity must be confirmed", reply)
 
 
 if __name__ == "__main__":

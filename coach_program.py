@@ -13,7 +13,7 @@ from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
-from coach_plan import avoided_exercises, canonical_exercise, unsupported_claims
+from coach_plan import canonical_exercise, exercise_excluded, unsupported_claims
 
 
 _MARKER = re.compile(r"\[\[\s*TRAINING_PROGRAM\b", re.IGNORECASE)
@@ -112,6 +112,22 @@ def _availability(text):
                              rf"|{_NUMBER}\s*(?:-|–|to|or)\s*{_NUMBER}", clause, re.IGNORECASE)):
             return None
     return next(iter(values))
+
+
+def _hard_frequency_limit(text):
+    """Only explicit limits are constraints; a starting frequency is a target."""
+    limits = []
+    numbers = {word: i for i, word in
+               enumerate(("one", "two", "three", "four", "five", "six", "seven"), 1)}
+    for match in _DAYS.finditer(text):
+        prefix = re.split(r"[.!?;\n]", text[:match.start()])[-1]
+        if re.search(r"\b(?:don't|do not|no longer)\b", prefix, re.I):
+            continue
+        if re.search(r"\b(?:at most|maximum(?: of)?|max(?:imum)?\s*:|no more than|"
+                     r"not more than|only(?: train)?|limit(?:ed)? to|"
+                     r"(?:cannot|can't) (?:train|do) more than)\s*$", prefix, re.IGNORECASE):
+            limits.append(numbers.get(match[1].lower(), int(match[1]) if match[1].isdigit() else None))
+    return limits[0] if limits and len(set(limits)) == 1 and limits[0] in range(1, 8) else None
 
 
 def build_review_evidence(training_context, memory_records, profile, today=None):
@@ -228,11 +244,12 @@ def build_review_evidence(training_context, memory_records, profile, today=None)
                 (schedule_key or (_DAYS.search(text) and re.search(
                     r"\b(?:train\w*|workout\w*|gym|exercise|available)\b", text, re.IGNORECASE)))):
             scheduling.append((observed.isoformat(), record.get("updated_at") or "",
-                               record["ref"], _availability(text)))
+                               record["ref"], _availability(text), _hard_frequency_limit(text)))
     profile_text = profile if isinstance(profile, str) else ""
     if profile_text.strip():
         refs["profile"] = {"type": "profile", "verified": False, "text": profile_text}
     availability = _availability(profile_text)
+    hard_limit = _hard_frequency_limit(profile_text)
     availability_refs = ["profile"] if availability is not None else []
     if scheduling:
         newest = max((item[0], item[1]) for item in scheduling)
@@ -240,6 +257,8 @@ def build_review_evidence(training_context, memory_records, profile, today=None)
         values = {item[3] for item in current}
         availability = next(iter(values)) if len(values) == 1 else None
         availability_refs = [item[2] for item in current]
+        limits = {item[4] for item in current}
+        hard_limit = next(iter(limits)) if len(limits) == 1 else None
     observations.sort(key=lambda row: (row["date"], row["ref"]))
     memories.sort(key=lambda row: row["ref"])
     omitted = training_context.get("recent_outcomes_omitted", 0)
@@ -254,8 +273,11 @@ def build_review_evidence(training_context, memory_records, profile, today=None)
         },
         "weekly_training_days": availability,
         "weekly_training_days_refs": availability_refs,
+        "hard_weekly_limit": hard_limit,
         "availability_caveat": (
-            "Explicit availability is a ceiling, not a requirement to fill every day."
+            "Frequency is a planning target, not a physiological ceiling. Only "
+            "hard_weekly_limit represents an explicitly stated maximum. One-off changes "
+            "do not silently change the ongoing target or establish recovery."
             if availability is not None else
             "Weekly availability is unknown or ambiguous; ask, do not assume a number."),
         "coverage": {
@@ -356,7 +378,7 @@ def _validate_review(review, evidence, preferences, previous):
         raise ValueError("weekly_training_days cannot be invented or exceed known availability; "
                          "use null when unknown, or reduce to the evidenced budget")
     result["weekly_training_days"] = requested
-    forbidden = avoided_exercises(list(preferences) + evidence.get("memory", []))
+    constraints = list(preferences) + evidence.get("memory", [])
     templates, exercises, ids = [], {}, set()
     total = 0
     for item in _list(review["session_templates"], "session_templates", 1, 12):
@@ -377,7 +399,7 @@ def _validate_review(review, evidence, preferences, previous):
             if not canonical or canonical in local:
                 raise ValueError("exercise names within a template must be distinct")
             local.add(canonical)
-            if canonical in forbidden:
+            if exercise_excluded(name, constraints):
                 raise ValueError(f"excluded movement cannot be prescribed: {name}")
             if move["role"] not in {"anchor", "accessory", "skill"}:
                 raise ValueError("exercise role must be anchor, accessory or skill")
@@ -431,14 +453,14 @@ def _validate_review(review, evidence, preferences, previous):
                 raise ValueError(f"{name} cannot be removed/replaced and still prescribed")
         elif identity not in exercises:
             raise ValueError(f"{action} decision for {name} must name an exercise in templates")
-        if canonical in forbidden and action not in {"remove", "replace"}:
+        if exercise_excluded(name, constraints) and action not in {"remove", "replace"}:
             raise ValueError(f"excluded movement may only be removed or replaced: {name}")
         if action == "replace":
             replacement = _text(item.get("replacement"), "replacement for " + name, 160)
             key = _identity(replacement)
             if (key == identity or canonical_exercise(replacement) == canonical
                     or key not in exercises
-                    or canonical_exercise(replacement) in forbidden):
+                    or exercise_excluded(replacement, constraints)):
                 raise ValueError("replace needs a different nonexcluded canonical replacement present "
                                  "in templates; use keep for a spelling/alias-only change")
             decision["replacement"] = replacement
@@ -589,6 +611,8 @@ class ProgramStore:
             columns = {row["name"] for row in db.execute("PRAGMA table_info(training_program_state)")}
             if "feedback_detected_on" not in columns:
                 db.execute("ALTER TABLE training_program_state ADD COLUMN feedback_detected_on TEXT")
+            if "pending_review_reason" not in columns:
+                db.execute("ALTER TABLE training_program_state ADD COLUMN pending_review_reason TEXT")
 
     @contextmanager
     def connection(self):
@@ -669,6 +693,9 @@ class ProgramStore:
             reason = "weekly"
         elif feedback_date and today >= _day(feedback_date):
             reason = "feedback_changed"
+        if reason is None and state["pending_review_reason"]:
+            reason = state["pending_review_reason"]
+            next_date = min(next_date, today.isoformat())
         if reason is None and state["last_error"]:
             reason = "retry"
             if state["retry_after"]:
@@ -684,7 +711,14 @@ class ProgramStore:
             "dirty_fingerprint": dirty, "failure_count": state["failure_count"],
             "feedback_detected_on": detected,
             "last_attempt_at": state["last_attempt_at"],
+            "pending_review_reason": state["pending_review_reason"],
         }
+
+    def request_review(self, reason):
+        reason = _text(reason, "review reason", 100)
+        with self.connection() as db:
+            db.execute("UPDATE training_program_state SET pending_review_reason="
+                       "COALESCE(pending_review_reason,?) WHERE singleton=1", (reason,))
 
     def save_review(self, review, evidence, fingerprint, today=None, request_key=None):
         today = _day(today)
@@ -717,7 +751,8 @@ class ProgramStore:
                     db.execute("INSERT INTO training_program_requests VALUES (?,?)",
                                (request_key, active["revision"]))
                 db.execute("UPDATE training_program_state SET last_error=NULL,retry_after=NULL,"
-                           "failure_count=0,dirty_fingerprint=?,feedback_detected_on=NULL "
+                           "failure_count=0,dirty_fingerprint=?,feedback_detected_on=NULL,"
+                           "pending_review_reason=NULL "
                            "WHERE singleton=1", (fingerprint,))
                 return active
             block_start = (_day(active["block_start"])
@@ -742,7 +777,7 @@ class ProgramStore:
                            (request_key, record["revision"]))
             db.execute("UPDATE training_program_state SET active_revision=?,dirty_fingerprint=?,"
                        "last_success_at=?,last_error=NULL,retry_after=NULL,failure_count=0,"
-                       "last_attempt_at=?,feedback_detected_on=NULL WHERE singleton=1",
+                       "last_attempt_at=?,feedback_detected_on=NULL,pending_review_reason=NULL WHERE singleton=1",
                        (record["revision"], fingerprint, instant, instant))
             return record
 
@@ -762,14 +797,17 @@ def render_program(record):
         return "No training programme is available yet."
     review = record["review"]
     budget = review["weekly_training_days"]
-    availability = "unknown — please clarify" if budget is None else f"up to {budget} days/week"
+    availability = "unknown — please clarify" if budget is None else f"usually {budget} days/week"
     lines = [
         "**\U0001F916 AgBot · Training programme**",
         f"**Goal:** {review['goal']}",
         f"**Block:** {record['block_start']} → {record['block_end']} (review/renewal boundary)",
-        f"**Training budget:** {availability}",
+        f"**Training target:** {availability} (adjustable, not a recovery test)",
         "**Session options** (not a promise to schedule every option each week)",
     ]
+    hard = (record.get("evidence") or {}).get("hard_weekly_limit")
+    if hard is not None:
+        lines.insert(4, f"**Explicit scheduling maximum:** {hard} days per rolling seven days")
     for template in review["session_templates"]:
         names = ", ".join(move["name"] + (" [anchor]" if move["role"] == "anchor" else "")
                           for move in template["exercises"]) or "No prescribed exercises"

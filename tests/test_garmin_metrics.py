@@ -121,6 +121,83 @@ class SetTests(unittest.TestCase):
         coach._sets_for(g, 1, {"1": entry}, refresh=True)
         g.get_activity_exercise_sets.assert_not_called()
 
+    def test_force_refresh_bypasses_recent_cache_and_reports_actual_change(self):
+        g = Mock()
+        payload = {"exerciseSets": [raw_set("SQUAT", None, "g")]}
+        payload["exerciseSets"][0]["repetitionCount"] = 21
+        g.get_activity_exercise_sets.return_value = payload
+        cache = {}
+        coach._sets_for(g, 1, cache)
+        payload["exerciseSets"][0]["repetitionCount"] = 15
+        meta = {}
+        out = coach._sets_for(g, 1, cache, refresh=True, force_refresh=True, metadata=meta)
+        self.assertEqual(g.get_activity_exercise_sets.call_count, 2)
+        self.assertEqual(out[0]["set_sequence"][0]["reps"], 15)
+        self.assertTrue(meta["data_changed"])
+        self.assertEqual(meta["refresh_status"], "changed")
+        self.assertTrue(meta["fetched"])
+        coach._sets_for(g, 1, cache, force_refresh=True, metadata=meta)
+        self.assertFalse(meta["data_changed"])
+        self.assertEqual(meta["refresh_status"], "unchanged")
+
+    def test_forced_refresh_failure_retains_last_good_without_claiming_unchanged(self):
+        g = Mock()
+        g.get_activity_exercise_sets.return_value = {"exerciseSets": [raw_set("SQUAT", None, "g")]}
+        cache = {}
+        coach._sets_for(g, 1, cache)
+        original = json.dumps(cache)
+        for response in ({}, {"exerciseSets": []}, {"__error__": "synthetic timeout"}):
+            g.get_activity_exercise_sets.return_value = response
+            meta = {}
+            result = coach._sets_for(g, 1, cache, force_refresh=True, metadata=meta)
+            self.assertEqual(meta["status"], "stale")
+            self.assertIsNone(meta["data_changed"])
+            self.assertTrue(meta["fetched"])
+            self.assertEqual(result[0]["set_sequence"][0]["reps"], 8)
+            self.assertEqual(json.dumps(cache), original)
+            result[0]["set_sequence"][0]["reps"] = 999
+            self.assertEqual(json.dumps(cache), original)
+
+    def test_force_refresh_respects_explicit_no_network_budget(self):
+        g = Mock()
+        meta = {}
+        coach._sets_for(g, 1, {}, allow_fetch=False, force_refresh=True, metadata=meta)
+        g.get_activity_exercise_sets.assert_not_called()
+        self.assertEqual(meta["refresh_status"], "budget_deferred")
+        self.assertFalse(meta["fetched"])
+
+    def test_unit_policy_change_is_not_mislabelled_server_data_change(self):
+        g = Mock()
+        g.get_activity_exercise_sets.return_value = {"exerciseSets": [raw_set("SQUAT", None)]}
+        cache = {}
+        coach._sets_for(g, 1, cache)
+        with patch.dict(os.environ, {"AGBOT_STRENGTH_WEIGHT_UNIT": "g"}):
+            meta = {}
+            result = coach._sets_for(g, 1, cache, force_refresh=True, metadata=meta)
+        self.assertFalse(meta["data_changed"])
+        self.assertEqual(result[0]["top_weight_kg"], 10)
+
+    def test_public_sets_force_refresh_is_targeted_and_keeps_login_failure_fallback(self):
+        g = Mock()
+        g.get_activity_exercise_sets.return_value = {"exerciseSets": [raw_set("SQUAT", None)]}
+        cache = {}
+        coach._sets_for(g, 17, cache)
+        meta = {}
+        with patch.object(coach, "client", return_value=g), \
+             patch.object(coach, "_load_sets_cache", return_value=cache), \
+             patch.object(coach, "_save_sets_cache"):
+            coach.exercise_sets(17, force_refresh=True, metadata=meta)
+        self.assertEqual(g.get_activity_exercise_sets.call_count, 2)
+        self.assertEqual(g.get_activity_exercise_sets.call_args.args, (17,))
+        self.assertEqual(meta["refresh_status"], "unchanged")
+        with patch.object(coach, "client", side_effect=RuntimeError("synthetic login failure")), \
+             patch.object(coach, "_load_sets_cache", return_value=cache), \
+             patch.object(coach, "_save_sets_cache"):
+            result = coach.exercise_sets(17, force_refresh=True, metadata=meta)
+        self.assertEqual(result[0]["exercise"], "Squat")
+        self.assertEqual(meta["status"], "stale")
+        self.assertIsNone(meta["data_changed"])
+
     def test_explicit_private_unit_policy_restores_kg_with_provenance(self):
         with patch.dict(os.environ, {"AGBOT_STRENGTH_WEIGHT_UNIT": "g",
                                      "AGBOT_STRENGTH_WEIGHT_UNIT_PROVENANCE": "Synthetic matched-source evidence"}):

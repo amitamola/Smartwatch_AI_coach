@@ -77,9 +77,12 @@ exercise: cover selected template movements and genuinely removed previous ancho
 - Respect EXISTING_DATED_PROPOSALS, especially today's agreed session and upcoming
   recovery. Do not silently replace today's workout mid-day. Templates guide
   subsequent daily prescriptions; they are options, not extra weekly commitments.
-- Treat the weekly training-day budget as a rolling seven-day upper budget for
-  known intentional-training days. Commutes and active recovery are not
-  interchangeable with hard training. Missing history remains unknown.
+- Treat weekly training days as a usual planning target, not a physiological
+  ceiling. Only REVIEW_EVIDENCE.hard_weekly_limit is an explicit user-set maximum.
+  One-off schedule changes can be discussed without changing the ongoing target.
+  Commutes and active recovery are not interchangeable with hard training.
+  Missing history remains unknown. Do not prescribe mandatory rest solely to
+  satisfy the usual target, or justify a numerical limit with invented physiology.
 - recovery_rule must cover spacing, reduced effort/deload when warranted, and a
   planned recovery opportunity. Never chase Garmin Training Status or ACWR.
   Combine trends, effort, symptoms and spacing; do not invent a single sleep-score

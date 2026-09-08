@@ -152,19 +152,167 @@ def _regions(value):
 
 
 def _source_context(source, quote):
-    """Keep enclosing sentences so quote selection cannot strip a user's negation."""
+    """Keep contiguous testimony, including dependent sentences and corrections."""
     start = source.index(quote)
+    if source.find(quote, start + 1) >= 0:
+        raise ValueError("MEMORY source_quote is ambiguous; quote a longer, unique passage.")
     end = start + len(quote)
     boundaries = list(re.finditer(r"(?<=[.!?])\s+|\n+", source))
-    left = max([0] + [boundary.end() for boundary in boundaries if boundary.end() <= start])
-    right = next((boundary.start() for boundary in boundaries if boundary.start() >= end),
-                 len(source))
-    return source[left:right]
+    spans = list(zip([0] + [boundary.end() for boundary in boundaries],
+                     [boundary.start() for boundary in boundaries] + [len(source)]))
+    spans = [(left, right) for left, right in spans if source[left:right].strip()]
+    first = next(index for index, (_, right) in enumerate(spans) if right > start)
+    last = next((index for index, (_, right) in enumerate(spans) if right >= end),
+                len(spans) - 1)
+
+    def dependent(index):
+        sentence = source[slice(*spans[index])]
+        return bool(re.search(
+            r"^\W*(?:but|yet|however|although|though|except|instead|nevertheless|"
+            r"still|now|currently|actually|today|since then|from now on|in fact|"
+            r"these days|at the moment|and|so|because|therefore|otherwise|"
+            r"only|unless|during|at rest|afterwards?|it|this|that|both|the same)\b"
+            r"|\b(?:they|them|those|these|former|latter)\b"
+            r"|\bI\s+(?:find it|found it)\b",
+            sentence, re.IGNORECASE,
+        ))
+
+    while first > 0:
+        # "Also" alone is not an antecedent dependency. Follow an enumeration
+        # only when a later selected sentence refers back to its members.
+        enumerated = first < last and re.search(
+            r"\b(?:both|they|them|those|these|former|latter)\b",
+            source[spans[first + 1][0]:spans[last][1]], re.IGNORECASE,
+        ) and re.match(
+            r"\W*(?:also\b|I\s+also\b)", source[slice(*spans[first])], re.IGNORECASE,
+        )
+        if not dependent(first) and not enumerated:
+            break
+        first -= 1
+    while last + 1 < len(spans):
+        current_regions = _regions(source[spans[first][0]:spans[last][1]])
+        following = source[slice(*spans[last + 1])]
+        next_regions = _regions(following)
+        symptom_followup = current_regions and not next_regions and re.search(
+            r"\b" + _SYMPTOM + r"\b", following, re.IGNORECASE,
+        )
+        if (not dependent(last + 1) and not current_regions.intersection(next_regions)
+                and not symptom_followup):
+            break
+        last += 1
+    return source[spans[first][0]:max(end, spans[last][1])]
+
+
+_SYMPTOM = (
+    r"(?:pain(?:ful)?|hurts?|hurting|aches?|aching|symptoms?|discomfort|"
+    r"soreness|sore|injur\w*|issues?|problems?|tight(?:ness)?|stiff(?:ness)?|"
+    r"numb(?:ness)?|tingling|tingly|tender(?:ness)?|uncomfortable|"
+    r"twinges?|flare\w*|strains?|spasms?|irritation)"
+)
+_POSITIVE_STATE = (
+    r"(?:fine|all good|good|great|well|normal|smoothly|alright|all right|okay|ok|"
+    r"comfortable|better|pain free)"
+)
+
+
+def _negated_health_positive(evidence):
+    words = " ".join(_words(evidence))
+    return bool(re.search(
+        r"\b(?:not sure|anything but|far from)\b"
+        r"|\b(?:cannot|can t|not|don t|do not|wouldn t|couldn t)\s+"
+        r"(?:say|claim|confirm|know|assume)\b"
+        r"|\bnot\s+without\s+" + _SYMPTOM + r"\b",
+        words,
+    ) or re.search(
+        r"\b(?:not|never|isn t|wasn t|aren t|weren t|doesn t|didn t|don t|"
+        r"haven t|hasn t|can t|cannot)"
+        r"\s+(?:(?:always|completely|quite|really|feel|feeling|felt|entirely|"
+        r"yet|fully|exactly)\s+)*(?:" + _POSITIVE_STATE
+        + r"|recovered|healed|resolved)\b", words,
+    ))
+
+
+def _positive_health_report(evidence):
+    """Recognize unqualified positive reports, not diagnoses or implied recovery."""
+    words = " ".join(_words(evidence))
+    # Ambiguous or mixed testimony stays intact rather than masking a restriction.
+    if re.search(r"\b(?:except|unless|if|only)\b", words) or _negated_health_positive(words):
+        return False
+    area = "(?:" + "|".join(re.escape(alias) for aliases in _REGIONS.values()
+                          for alias in aliases) + ")"
+    without_symptoms = re.sub(
+        r"\b(?:no|without|not experiencing|not having|"
+        r"(?:don t|didn t|did not|do not)\s+(?:have|feel|experience))\s+"
+        r"(?:(?:any|more|further)\s+)?(?:" + area + r"\s+)?"
+        + _SYMPTOM + r"(?:\s+(?:or|and)\s+" + _SYMPTOM + r")*\b"
+        r"|\b(?:doesn t|didn t|does not|did not|do not|don t)\s+hurt\b"
+        r"|\bnot\s+(?:painful|sore)\b"
+        r"|\bno longer\s+(?:hurts?|painful|sore)\b"
+        r"|\bpain free\b"
+        r"|\b" + _SYMPTOM + r"\s+(?:(?:is|are|has|have|now|all|completely|fully|been)\s+)*"
+        r"(?:gone|resolved|healed|recovered)\b",
+        "", words,
+    )
+    positive = re.search(
+        r"\b" + _POSITIVE_STATE + r"\b|\b(?:resolved|healed|recovered|tolerated)\b",
+        words,
+    ) or without_symptoms != words
+    return bool(positive and not re.search(r"\b" + _SYMPTOM + r"\b", without_symptoms))
+
+
+def _family_pattern(key):
+    return r"\s+".join(
+        re.escape(word) + r"(?:es)?" if word.endswith("ss") else
+        re.escape(word[:-1] if word.endswith("s") else word) + r"s?"
+        for word in _words(key.split(":", 1)[1])
+    )
+
+
+def _family_scope_supported(key, words):
+    family = _family_pattern(key)
+    return bool(re.search(
+        r"\b(?:all|any|every|the entire|the whole)\s+(?:the\s+)?"
+        + family + r"\b"
+        r"|\b" + family + r"\s+(?:(?:exercise|movement)\s+)?family\b"
+        r"|\b" + family + r"\s+(?:and\s+)?all\s+(?:its|their|the)\s+"
+        r"(?:variants|variations)\b"
+        r"|\bno\s+" + family + r"\s+(?:variants|variations)\b",
+        words,
+    ))
+
+
+def _family_avoidance_supported(key, evidence):
+    """Require explicit whole-family intent; two named variants are not a family."""
+    words = " ".join(_words(evidence))
+    if "?" in evidence or re.search(
+        r"\b(?:if|might|maybe|could|would|should|hypothetical|suppose|"
+        r"except|unless|only|apart from|other than|"
+        r"suggest\w*|recommend(?:ed|s)|said|told)\b", words,
+    ):
+        return False
+    if re.search(
+        r"\b(?:not|never|don t|do not|didn t|did not)\s+"
+        r"(?:(?:want|wish|need|intend|plan)\s+to\s+)?(?:avoid|exclude|skip|ban)\b",
+        words,
+    ):
+        return False
+    intent_pattern = (
+        r"^(?:please\s+)?(?:avoid|exclude|skip|ban|do not recommend|don t recommend|no)\b"
+        r"|\bi\s+(?:(?:want|need|prefer|choose)\s+(?:you\s+)?to\s+|"
+        r"(?:am|m)\s+)?(?:avoid|avoiding|exclude|excluding|skip|skipping)\b"
+    )
+    return any(
+        re.search(intent_pattern, sentence) and _family_scope_supported(key, sentence)
+        for sentence in (" ".join(_words(part)) for part in re.split(
+            r"[.!?;\n]+|\b(?:because|but|although|though|whereas|while)\b",
+            evidence, flags=re.IGNORECASE,
+        ))
+    )
 
 
 def _resolution_supported(record, quote):
     """Require a named, affirmative resolution clause, not just any matching quote."""
-    clauses = re.split(r"[.!?;\n]+|,\s*|\b(?:but|yet|while|and)\b", quote.casefold())
+    clauses = re.split(r"[.!?;\n]+|,\s*|\b(?:but|yet|and)\b", quote.casefold())
     if "?" in quote:
         return False
     if re.search(
@@ -178,9 +326,33 @@ def _resolution_supported(record, quote):
     )
     if record["kind"] == "health":
         actual = _regions(record["key"]) or _regions(record["text"])
+        if re.search(r"\b(?:except|unless)\b", quote, re.IGNORECASE):
+            return False
+        for clause in clauses:
+            mentioned = _regions(clause)
+            if mentioned and actual and not actual.intersection(mentioned):
+                continue
+            if _negated_health_positive(clause):
+                return False
+            if not mentioned and re.search(
+                r"\b(?:only|during|after|while|when|at rest|usually|sometimes)\b", clause,
+            ):
+                return False
+            if re.search(r"\b" + _SYMPTOM + r"\b", clause) and not _positive_health_report(clause):
+                # A plainly historical symptom clause may precede a current clear.
+                if not re.search(r"\b(?:used to|previously|last year)\b", clause):
+                    return False
         cleared = set()
         for clause in clauses:
             if re.search(negation, " ".join(_words(clause))):
+                continue
+            if re.search(
+                r"\b(?:during|after|while|when|with|only|at rest|on|for|in|"
+                r"through|throughout|until|whenever|most|sometimes|usually|often|"
+                r"occasionally|temporarily|almost|mostly|"
+                r"was|were|had|used to|previously|before|yesterday|ago|last)\b",
+                clause,
+            ):
                 continue
             recovery = re.search(
                 r"\b(?:resolved|recovered|healed|gone|pain[- ]free)\b"
@@ -207,9 +379,18 @@ def _resolution_supported(record, quote):
                 return True
         return bool(actual and actual <= cleared)
     target = set(_words(record["key"].split(":")[-1]))
-    for clause in clauses:
+    if re.search(
+        r"\b(?:suggest\w*|recommend(?:ed|s)|said|told|consider\w*|"
+        r"hypothetical|suppose)\b", quote, re.IGNORECASE,
+    ):
+        return False
+    for clause in re.split(
+            r"\n+|\b(?:because|since|although|though|while)\b", "\n".join(clauses)):
         words = set(_words(clause))
-        if not target <= words:
+        if record["key"].startswith("avoid_family:"):
+            if not _family_scope_supported(record["key"], " ".join(_words(clause))):
+                continue
+        elif not target <= words:
             continue
         if re.search(negation + r"|\b(?:keep|continue)\b", " ".join(_words(clause))):
             continue
@@ -386,6 +567,94 @@ class MemoryStore:
             return self._upsert(db, kind, key, text, source_text, source_type,
                                 observed_on, verified, status)
 
+    def reclassify_tolerance(self, record_id, anchor_key):
+        """Atomically correct one misclassified health report; not a clinical clear.
+
+        Trusted maintenance API only; model markers cannot invoke it. Requires
+        an active, verified user report of positive tolerance naming the target
+        movement. Existing anchors and earlier unresolved symptom revisions are
+        never overwritten. Returns ``{"health": receipt, "anchor": receipt}``.
+
+        The health revision action is ``reclassified``. Its truthy
+        ``source_metadata["reclassification"]`` marks administrative retirement;
+        consumers must not present it as user-reported recovery.
+        """
+        if type(record_id) is not int or record_id < 1:
+            raise ValueError("record_id must be a positive integer.")
+        anchor_key = normalize_key(anchor_key)
+        movement_key = anchor_key.split(":")[-1]
+        generic_keys = {"exercise", "workout", "session", "tolerance"}
+        generic_keys.update(normalize_key(alias) for aliases in _REGIONS.values()
+                            for alias in aliases)
+        if movement_key in generic_keys:
+            raise ValueError("anchor_key must name a specific movement in the original report.")
+        with self._connection(write=True) as db:
+            row = db.execute("SELECT * FROM memory_records WHERE id=?", (record_id,)).fetchone()
+            if row is None:
+                raise ValueError("The health record does not exist.")
+            record = self._record(row)
+            if record["kind"] != "health" or record["status"] != "active":
+                raise ValueError("Reclassification requires an active health record.")
+            if (not record["verified"] or record["source_type"] != "user"
+                    or not record["text"].strip() or record["text"] not in record["source_text"]):
+                raise ValueError("Reclassification requires verbatim, verified user provenance.")
+            evidence = _source_context(record["source_text"], record["text"])
+            if (not _positive_health_report(record["text"]) or not _positive_health_report(evidence)
+                    or "?" in evidence or re.search(
+                        r"\b(?:if|might|maybe|could|would|should|hope|wish|assume|"
+                        r"hypothetical|probably|possibly)\b", evidence, re.IGNORECASE)):
+                raise ValueError("Only unambiguous positive-only exercise tolerance can be reclassified.")
+            movement = r"\b" + _family_pattern("exercise:" + movement_key) + r"\b"
+            report = " ".join(_words(record["text"]))
+            if (not re.search(movement, report) or not (
+                    re.search(r"\b(?:during|after|while|with|on|for)\b", report)
+                    or re.search(movement + r".*\b(?:felt|feels|was|were|went|is|are)\b", report))):
+                raise ValueError("anchor_key must name an exercise reported as tolerated in the quote.")
+            for previous_row in db.execute(
+                    "SELECT snapshot_json FROM memory_revisions WHERE record_id=? AND revision<? "
+                    "ORDER BY revision DESC", (record_id, record["revision"])):
+                try:
+                    previous = json.loads(previous_row["snapshot_json"])
+                    if previous["status"] == "resolved":
+                        break
+                    if not _positive_health_report(previous["text"]):
+                        raise ValueError(
+                            "Earlier active symptom history requires explicit review; "
+                            "reclassification cannot silently retire it."
+                        )
+                except (KeyError, TypeError, json.JSONDecodeError) as exc:
+                    raise MemoryStoreError("Invalid memory revision history; database needs review.") from exc
+            if db.execute(
+                    "SELECT 1 FROM memory_records WHERE kind='anchor' AND key=?", (anchor_key,)
+            ).fetchone():
+                raise ValueError("The target anchor already exists; reclassification cannot overwrite it.")
+            anchor_metadata = dict(record["source_metadata"])
+            anchor_metadata["reclassified_from"] = {
+                "record_id": record_id, "kind": "health", "key": record["key"],
+                "revision": record["revision"],
+            }
+            anchor = self._upsert(
+                db, "anchor", anchor_key, record["text"], record["source_text"],
+                "user", record["observed_on"], True, "active", anchor_metadata,
+            )
+            metadata = dict(record["source_metadata"])
+            metadata["reclassification"] = {
+                "reason": "positive_exercise_tolerance", "clinical_resolution": False,
+                "kind": "anchor", "record_id": anchor["id"], "key": anchor_key,
+                "source_revision": record["revision"],
+            }
+            stamp = _now()
+            db.execute(
+                "UPDATE memory_records SET status='resolved', revision=revision+1, "
+                "updated_at=?, resolved_at=?, resolution_source_text='', source_metadata=? WHERE id=?",
+                (stamp, stamp, json.dumps(metadata, ensure_ascii=False, sort_keys=True), record_id),
+            )
+            retired = self._record(db.execute(
+                "SELECT * FROM memory_records WHERE id=?", (record_id,),
+            ).fetchone())
+            self._snapshot(db, retired, "reclassified")
+            return {"health": self._receipt(retired, "reclassified"), "anchor": anchor}
+
     def records(self, kind, status="active"):
         """Return current complete records; ``status=None`` includes resolved facts."""
         _check_kind(kind)
@@ -417,21 +686,34 @@ class MemoryStore:
                 log.error("Coaching memory contains invalid revision JSON.")
                 raise MemoryStoreError("Invalid memory revision history; database needs review.") from exc
 
-    def render(self, kind, query="", max_chars=None):
+    def render(self, kind, query="", max_chars=None, verified_only=False):
         """Render whole current facts, never arbitrary character/recency slices.
 
         Preferences and health constraints cannot be budget-evicted. Anchors rank
         *all* entity keys by query relevance, then recency, and disclose omissions.
         Superseded revisions remain auditable but are never current capabilities.
+        Anchor-only ``verified_only`` excludes non-user or unverified records,
+        disclosing their count without reproducing their claims. It does not
+        change stored records or imply independent verification of user reports.
         """
         _check_kind(kind)
         if not isinstance(query, str):
             raise ValueError("Memory query must be a string.")
         if max_chars is not None and (type(max_chars) is not int or max_chars < 0):
             raise ValueError("max_chars must be a nonnegative integer or None.")
+        if not isinstance(verified_only, bool):
+            raise ValueError("verified_only must be a boolean.")
+        if verified_only and kind != "anchor":
+            raise ValueError("verified_only is anchor-only; standing constraints cannot be hidden.")
         records = self.records(kind)
         if not records:
             return ""
+        excluded = 0
+        if verified_only:
+            trusted = [record for record in records
+                       if record["verified"] and record["source_type"] == "user"]
+            excluded = len(records) - len(trusted)
+            records = trusted
         if kind == "anchor" and query.strip():
             tokens = set(_words(query))
 
@@ -448,6 +730,11 @@ class MemoryStore:
         )
         if kind in ("preference", "health"):
             header += " Retain active restrictions pending explicit correction or resolution."
+        if excluded:
+            header += (
+                f"\n[{excluded} active anchor records excluded by verified-only filter "
+                "(unverified or non-user provenance).]"
+            )
         lines = []
         for record in records:
             provenance = ("user-reported" if record["verified"] else
@@ -456,10 +743,10 @@ class MemoryStore:
                 f"- [{record['key']} | {record['date'] or 'date unknown'} | "
                 f"{provenance} | revision {record['revision']}] {record['text']}"
             )
-        full = header + "\n" + "\n".join(lines)
+        full = "\n".join([header] + lines)
         if max_chars is None or len(full) <= max_chars:
             return full
-        if kind != "anchor":
+        if kind != "anchor" or not lines:
             raise MemoryBudgetError(kind, len(full), max_chars)
 
         def omission(count):
@@ -609,8 +896,10 @@ class MemoryStore:
         """Strip MEMORY markers and return ``(cleaned_text, receipts, errors)``.
 
         Allowed JSON fields: kind, key, text, source_quote, action, observed_on.
-        An upsert saves the source quote's complete enclosing sentence(s), not a
-        model paraphrase or a fragment stripped of negation. No matching current
+        An upsert saves complete contiguous source context, including dependent
+        sentences, not a model paraphrase or a fragment stripped of negation.
+        Positive tolerance belongs in anchors, not active health flags. Family
+        avoidance requires explicit whole-family intent. No matching current
         user quote means no save. A resolve targets one existing exact key, never
         a model-emitted 'all', and requires affirmative named resolution evidence.
         Legacy marker formats are stripped/rejected rather than accepted as evidence.
@@ -661,6 +950,22 @@ class MemoryStore:
                 if action == "upsert":
                     if not isinstance(payload.get("text"), str) or not payload["text"].strip():
                         raise ValueError("MEMORY upsert requires nonempty text.")
+                    if kind == "health" and _positive_health_report(evidence):
+                        raise ValueError(
+                            "Positive exercise-tolerance or symptom-free testimony is not an "
+                            "active health constraint. Re-emit kind='anchor' with the named "
+                            "movement key and the verbatim source_quote, preserving its scope. "
+                            "Do not resolve health unless the source explicitly clears that "
+                            "named condition; exercise tolerance alone does not."
+                        )
+                    if kind == "preference" and key.startswith("avoid_family:") and not (
+                            _family_avoidance_supported(key, evidence)):
+                        raise ValueError(
+                            "avoid_family requires explicit current user intent to avoid the "
+                            "named whole family/all variants. Quote that request, or use "
+                            "separate avoid_exercise keys for the exact excluded movements; "
+                            "a suggestion or hypothetical option is not permission."
+                        )
                     receipt = self.upsert(
                         kind, key, evidence, source_text=source_text, source_type="user",
                         observed_on=payload.get("observed_on"), verified=True,

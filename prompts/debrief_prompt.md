@@ -25,3 +25,7 @@ exercises particularly need tolerance feedback; their first appearance in Garmin
 is not proof they should be progressed. Include programme metadata for revised
 dated prescriptions, and explain deviations rather than silently reverting to an
 old exercise list.
+Use the actual saved future plan when discussing what comes next. Do not invent
+a Thursday workout (or any other dated commitment) in a prose sentence. The app
+renders the saved calendar. Low cardiovascular load does not prove untouched
+muscular reserves, and a recorded rep count does not establish RPE or reserve.

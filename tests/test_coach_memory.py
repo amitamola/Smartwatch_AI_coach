@@ -122,6 +122,80 @@ class MemoryTests(unittest.TestCase):
         with self.assertRaises(MemoryBudgetError):
             self.store.render("anchor", max_chars=1)
 
+    def test_verified_only_anchors_hide_unverified_claims_without_changing_default(self):
+        quote = "I used seven fictional units for the moon press."
+        self.store.upsert("anchor", "moon_press", quote, source_text=quote, verified=True)
+        for source_type in ("user", "assistant", "legacy"):
+            self.store.upsert(
+                "anchor", "invented_" + source_type,
+                "Invented capability from " + source_type + ": effortless and pain-free.",
+                source_type=source_type,
+            )
+        default = self.store.render("anchor")
+        filtered = self.store.render("anchor", query="invented capability", verified_only=True)
+        self.assertIn(quote, filtered)
+        self.assertIn("3 active anchor records excluded by verified-only filter", filtered)
+        self.assertIn("user-reported is not independently verified", filtered)
+        self.assertNotIn("Invented capability", filtered)
+        self.assertNotIn("invented_", filtered)
+        self.assertNotIn("effortless", filtered)
+        self.assertNotIn("verified-only filter", default)
+        self.assertEqual(default, self.store.render("anchor", verified_only=False))
+        self.assertEqual(len(self.store.records("anchor")), 4)
+        for source_type in ("user", "assistant", "legacy"):
+            self.assertIn("Invented capability from " + source_type, default)
+            self.assertEqual(len(self.store.revisions("anchor", "invented_" + source_type)), 1)
+
+    def test_verified_only_requires_user_provenance_as_well_as_verified_flag(self):
+        quote = "I reported a synthetic movement observation."
+        self.store.upsert("anchor", "moon_press", quote, source_text=quote, verified=True)
+        records = self.store.records("anchor")
+        records[0]["source_type"] = "assistant"
+        with patch.object(self.store, "records", return_value=records):
+            filtered = self.store.render("anchor", verified_only=True)
+        self.assertIn("1 active anchor records excluded by verified-only filter", filtered)
+        self.assertNotIn(quote, filtered)
+        self.assertNotIn("moon_press", filtered)
+
+    def test_all_unverified_anchors_return_only_disclosure_and_respect_exact_budget(self):
+        self.assertEqual(self.store.render("anchor", verified_only=True), "")
+        self.store.upsert("anchor", "invented", "Invented limitless moon press capability.")
+        self.store.upsert("anchor", "retired", "Retired invented capability.", status="resolved")
+        filtered = self.store.render("anchor", verified_only=True)
+        self.assertIn("1 active anchor records excluded by verified-only filter", filtered)
+        self.assertNotIn("capability", filtered)
+        self.assertNotIn("omitted by character budget", filtered)
+        self.assertEqual(
+            filtered, self.store.render("anchor", max_chars=len(filtered), verified_only=True),
+        )
+        with self.assertRaises(MemoryBudgetError) as error:
+            self.store.render("anchor", max_chars=len(filtered) - 1, verified_only=True)
+        self.assertEqual(error.exception.required_chars, len(filtered))
+
+    def test_verified_only_discloses_provenance_and_budget_exclusions_separately(self):
+        quote = "A complete synthetic user report. " * 100
+        self.store.upsert("anchor", "long_report", quote, source_text=quote, verified=True)
+        for index in range(2):
+            self.store.upsert("anchor", f"invented_{index}", "Invented moon press capability.")
+        output = self.store.render("anchor", max_chars=400, verified_only=True)
+        self.assertLessEqual(len(output), 400)
+        self.assertIn("2 active anchor records excluded by verified-only filter", output)
+        self.assertIn("1 active anchor records omitted by character budget", output)
+        self.assertNotIn("Invented moon press", output)
+        self.assertNotIn("A complete synthetic user report.", output)
+        with self.assertRaises(MemoryBudgetError):
+            self.store.render("anchor", max_chars=1, verified_only=True)
+
+    def test_verified_only_filter_cannot_hide_standing_constraints(self):
+        for kind in ("health", "preference"):
+            self.store.upsert(kind, "synthetic", "Keep this synthetic standing constraint.")
+            with self.assertRaisesRegex(ValueError, "anchor-only"):
+                self.store.render(kind, verified_only=True)
+            self.assertIn("standing constraint", self.store.render(kind))
+        for value in ("true", 1, None):
+            with self.assertRaisesRegex(ValueError, "boolean"):
+                self.store.render("anchor", verified_only=value)
+
     def test_legacy_import_is_idempotent_unverified_and_originals_unchanged(self):
         texts = {
             "health.jsonl": [{"date": "2001-01-01", "text": "Thoracic discomfort.", "status": "active"},
@@ -278,6 +352,124 @@ class MemoryTests(unittest.TestCase):
         self.assertIsNone(result["resolved_at"])
         self.assertEqual(result["resolution_source_text"], "")
 
+    def test_tolerance_reclassification_preserves_provenance_without_clinical_resolution(self):
+        quote = "My lower back felt all good during and after moon squats and star bridges."
+        source = "An unrelated opening sentence. " + quote
+        original = self.store.upsert(
+            "health", "low_back", quote, source_text=source, verified=True, observed_on="2025-02-03",
+        )
+        other = self.store.upsert("health", "thoracic", "Synthetic thoracic symptom.")
+        self.store.upsert("preference", "avoid_exercise:moon_hinge", "Avoid moon hinge.")
+        result = self.store.reclassify_tolerance(original["id"], "Moon Squat")
+        anchor, retired = result["anchor"], result["health"]
+        self.assertEqual(anchor["action"], "created")
+        self.assertEqual(anchor["key"], "moon_squat")
+        self.assertTrue(anchor["verified"])
+        self.assertEqual(anchor["source_type"], "user")
+        self.assertEqual(anchor["observed_on"], original["observed_on"])
+        self.assertEqual(anchor["text"], quote)
+        self.assertEqual(anchor["source_text"], source)
+        self.assertEqual(anchor["source_metadata"]["reclassified_from"]["record_id"], original["id"])
+        self.assertEqual(retired["id"], original["id"])
+        self.assertEqual(retired["action"], "reclassified")
+        self.assertEqual(retired["status"], "resolved")
+        self.assertEqual(retired["revision"], original["revision"] + 1)
+        self.assertEqual(retired["resolution_source_text"], "")
+        self.assertEqual(retired["text"], quote)
+        self.assertEqual(retired["source_text"], source)
+        self.assertFalse(retired["source_metadata"]["reclassification"]["clinical_resolution"])
+        self.assertEqual(retired["source_metadata"]["reclassification"]["record_id"], anchor["id"])
+        self.assertEqual([r["id"] for r in self.store.records("health")], [other["id"]])
+        self.assertEqual(len(self.store.records("preference")), 1)
+        self.assertEqual([r["action"] for r in self.store.revisions("health", "low_back")],
+                         ["created", "reclassified"])
+        self.assertIn(quote, MemoryStore(self.db_path).render("anchor", verified_only=True))
+
+    def test_tolerance_reclassification_rejects_mixed_hypothetical_and_nonspecific_reports(self):
+        for quote, source, key in (
+            ("My lower back is fine.", "My lower back is fine.", "moon_squat"),
+            ("The moon squat felt fine except for lower back pain.",
+             "The moon squat felt fine except for lower back pain.", "moon_squat"),
+            ("My lower back is not fine during moon squats.",
+             "My lower back is not fine during moon squats.", "moon_squat"),
+            ("My lower back might feel fine during moon squats.",
+             "My lower back might feel fine during moon squats.", "moon_squat"),
+            ("My lower back feels fine during moon squats.",
+             "My lower back feels fine during moon squats. But it still hurts when bending.",
+             "moon_squat"),
+            ("My lower back feels fine during moon squats.",
+             "My lower back feels fine during moon squats.", "star_bridge"),
+            ("My lower back feels fine during moon squats.",
+             "My lower back feels fine during moon squats.", "lower_back"),
+        ):
+            with self.subTest(quote=quote, key=key):
+                record = self.store.upsert(
+                    "health", "low_back", quote, source_text=source, verified=True,
+                )
+                with self.assertRaises(ValueError):
+                    self.store.reclassify_tolerance(record["id"], key)
+                self.assertEqual(self.store.records("health")[0]["revision"], record["revision"])
+                self.assertEqual(self.store.records("anchor"), [])
+
+    def test_tolerance_reclassification_requires_active_verified_user_record(self):
+        quote = "My lower back felt fine during moon squats."
+        for kind, source_type, verified, status in (
+            ("health", "user", False, "active"),
+            ("health", "assistant", False, "active"),
+            ("health", "legacy", False, "active"),
+            ("health", "user", True, "resolved"),
+            ("anchor", "user", True, "active"),
+        ):
+            with self.subTest(kind=kind, source_type=source_type, status=status):
+                record = self.store.upsert(
+                    kind, "source", quote, source_text=quote,
+                    source_type=source_type, verified=verified, status=status,
+                )
+                with self.assertRaises(ValueError):
+                    self.store.reclassify_tolerance(record["id"], "moon_squat")
+                self.assertEqual(len(self.store.revisions(kind, "source")), record["revision"])
+        for record_id in (True, -1, "1", 999999):
+            with self.assertRaises(ValueError):
+                self.store.reclassify_tolerance(record_id, "moon_squat")
+
+    def test_tolerance_reclassification_cannot_overwrite_an_existing_anchor(self):
+        quote = "The moon squat felt fine."
+        record = self.store.upsert("health", "low_back", quote, source_text=quote, verified=True)
+        existing = self.store.upsert("anchor", "moon_squat", "Keep this separate synthetic report.")
+        with self.assertRaisesRegex(ValueError, "already exists"):
+            self.store.reclassify_tolerance(record["id"], "moon_squat")
+        self.assertEqual(self.store.records("health")[0]["revision"], record["revision"])
+        self.assertEqual(self.store.records("anchor")[0]["text"], existing["text"])
+        self.assertEqual(self.store.records("anchor")[0]["revision"], existing["revision"])
+
+    def test_tolerance_reclassification_never_retires_earlier_unresolved_symptoms(self):
+        symptom = "My lower back hurts when bending."
+        self.store.upsert("health", "low_back", symptom, source_text=symptom, verified=True)
+        quote = "My lower back felt fine during moon squats."
+        record = self.store.upsert("health", "low_back", quote, source_text=quote, verified=True)
+        with self.assertRaisesRegex(ValueError, "Earlier active symptom history"):
+            self.store.reclassify_tolerance(record["id"], "moon_squat")
+        self.assertEqual(self.store.records("health")[0]["revision"], record["revision"])
+        self.assertEqual(self.store.records("anchor"), [])
+
+    def test_tolerance_reclassification_rolls_back_anchor_if_retirement_audit_fails(self):
+        quote = "My lower back felt fine during moon squats."
+        record = self.store.upsert("health", "low_back", quote, source_text=quote, verified=True)
+        original_snapshot = self.store._snapshot
+
+        def snapshot(db, current, action):
+            if action == "reclassified":
+                raise sqlite3.OperationalError("Synthetic audit failure.")
+            return original_snapshot(db, current, action)
+
+        with patch.object(self.store, "_snapshot", side_effect=snapshot):
+            with self.assertLogs("coach_memory", level="ERROR"):
+                with self.assertRaises(MemoryStoreError):
+                    self.store.reclassify_tolerance(record["id"], "moon_squat")
+        self.assertEqual(self.store.records("anchor"), [])
+        self.assertEqual(self.store.records("health")[0]["revision"], record["revision"])
+        self.assertEqual(len(self.store.revisions("health", "low_back")), 1)
+
     def test_failed_revision_write_rolls_back_current_record(self):
         self.store.upsert("anchor", "moon_press", "Original fact.")
         with patch.object(self.store, "_snapshot", side_effect=sqlite3.OperationalError("synthetic")):
@@ -352,6 +544,275 @@ class MemoryTests(unittest.TestCase):
         _, receipts, errors = self.store.process_markers(marker, source)
         self.assertFalse(errors)
         self.assertEqual(receipts[0]["text"], quote)
+
+    def test_standalone_also_report_does_not_absorb_rep_correction_or_later_class(self):
+        for quote in (
+            "Also, for single arm cable row, I was able to do 20kg but it was kind of difficult.",
+            "I also tried the single arm cable row at 20kg, but it was difficult.",
+        ):
+            with self.subTest(quote=quote):
+                source = (
+                    "The fictional log says 21 reps, but I completed 15 reps.\n\n"
+                    + quote
+                    + "\n\nAlso, tomorrow we will have a class with an unknown routine."
+                )
+                marker = self.marker(kind="anchor", key="single_arm_cable_row",
+                                     text="An invented capability.", source_quote=quote)
+                _, receipts, errors = self.store.process_markers(marker, source)
+                self.assertFalse(errors)
+                self.assertEqual(receipts[0]["text"], quote)
+                self.assertEqual(receipts[0]["source_text"], source)
+                rendered = self.store.render("anchor", verified_only=True)
+                self.assertIn(quote, rendered)
+                self.assertNotIn("21 reps", rendered)
+                self.assertNotIn("15 reps", rendered)
+                self.assertNotIn("tomorrow", rendered)
+                self.assertNotIn("class", rendered)
+
+    def test_positive_tolerance_requires_anchor_repair_without_clearing_health(self):
+        original = self.store.upsert("health", "low_back", "Synthetic lumbar symptom.")
+        for quote in (
+            "My lower back felt all good during and after moon squats and star bridges.",
+            "My lower back felt fine during the moon squat.",
+            "There was no pain or discomfort during the moon squat.",
+            "I did not feel pain during the moon squat.",
+            "I have no lower back pain during the moon squat.",
+            "The moon squat was pain-free.",
+            "My lower back is better.",
+        ):
+            with self.subTest(quote=quote):
+                marker = self.marker(kind="health", key="low_back", text="Active injury.",
+                                     source_quote=quote)
+                with self.assertLogs("coach_memory", level="WARNING"):
+                    clean, receipts, errors = self.store.process_markers("Visible. " + marker, quote)
+                self.assertEqual(clean, "Visible.")
+                self.assertEqual(receipts, [])
+                self.assertIn("kind='anchor'", errors[0])
+                self.assertIn("Do not resolve", errors[0])
+                self.assertEqual(self.store.records("health")[0]["revision"], original["revision"])
+                repaired = self.marker(kind="anchor", key="moon_squat", text="No spinal strain.",
+                                       source_quote=quote)
+                _, receipts, errors = self.store.process_markers(repaired, quote)
+                self.assertFalse(errors)
+                self.assertEqual(receipts[0]["text"], quote)
+                self.assertIn(quote, self.store.render("anchor", query="moon squat"))
+        self.assertEqual(len(self.store.records("health")), 1)
+        self.assertNotIn("No spinal strain", self.store.render("anchor"))
+
+    def test_mixed_conditional_and_negated_positive_health_reports_stay_faithful(self):
+        for quote in (
+            "My lower back is fine except pain on the moon hinge.",
+            "My lower back feels fine unless I bend.",
+            "My lower back only feels fine at rest.",
+            "My lower back feels fine if I avoid bending.",
+            "My lower back feels fine, but it hurts on the moon hinge.",
+            "My lower back isn't feeling fine.",
+            "My lower back doesn't feel fine.",
+            "My lower back is anything but fine.",
+            "My lower back is not all good.",
+            "My lower back is fine but stiff.",
+            "My lower back is not without discomfort.",
+            "I have less lower back pain than last week, but it still hurts.",
+            "The moon squat caused lower back pain when I bent.",
+            "If I bend, my lower back hurts.",
+            "I cannot say my lower back is pain-free.",
+        ):
+            with self.subTest(quote=quote):
+                marker = self.marker(kind="health", key="low_back", text="Resolved.",
+                                     source_quote=quote)
+                _, receipts, errors = self.store.process_markers(marker, quote)
+                self.assertFalse(errors)
+                self.assertEqual(receipts[0]["text"], quote)
+                self.assertEqual(receipts[0]["status"], "active")
+                self.assertIn(quote, self.store.render("health"))
+
+    def test_scoped_tolerance_and_mixed_recovery_never_resolve_health(self):
+        self.store.upsert("health", "low_back", "Synthetic lumbar symptom.")
+        for quote in (
+            "My lower back is pain-free during the moon squat.",
+            "My lower back is pain-free while doing the moon squat.",
+            "My lower back is pain-free, but only at rest.",
+            "My lower back has no pain after the moon squat.",
+            "My lower back is pain-free at rest.",
+            "My lower back is pain-free for moon squats.",
+            "My lower back is pain-free most of the time.",
+            "My lower back is pain-free except on the moon hinge.",
+            "My lower back pain is gone but it still hurts when bending.",
+            "My lower back is pain-free but not fully recovered.",
+            "My lower back pain was gone last year.",
+            "Previously my lower back was pain-free. Now it hurts when bending.",
+            "My lower back pain is gone. But it still hurts when bending.",
+            "My lower back pain is gone. My lower back hurts when bending.",
+            "My lower back pain is gone. Pain with bending remains.",
+        ):
+            with self.subTest(quote=quote):
+                marker = self.marker(kind="health", key="low_back",
+                                     source_quote=quote.split(".")[0], action="resolve")
+                with self.assertLogs("coach_memory", level="WARNING"):
+                    _, receipts, errors = self.store.process_markers(marker, quote)
+                self.assertFalse(receipts)
+                self.assertTrue(errors)
+        self.assertEqual(self.store.records("health")[0]["revision"], 1)
+
+    def test_current_named_recovery_stays_scoped_despite_other_area_symptoms(self):
+        self.store.upsert("health", "low_back", "Synthetic lumbar symptom.")
+        self.store.upsert("health", "thoracic", "Synthetic thoracic symptom.")
+        quote = "My lower back pain is gone but my thoracic area still hurts."
+        marker = self.marker(kind="health", key="low_back", source_quote=quote, action="resolve")
+        _, receipts, errors = self.store.process_markers(marker, quote)
+        self.assertFalse(errors)
+        self.assertEqual(receipts[0]["status"], "resolved")
+        self.assertEqual([r["key"] for r in self.store.records("health")], ["thoracic"])
+
+    def test_unqualified_named_recovery_and_historical_comparison_still_resolve(self):
+        for source in (
+            "My lower back no longer hurts.",
+            "My lower back is no longer sore.",
+            "Previously my lower back hurt. Now my lower back pain is gone.",
+        ):
+            with self.subTest(source=source):
+                self.store.upsert("health", "low_back", "Synthetic lumbar symptom.")
+                marker = self.marker(kind="health", key="low_back", source_quote=source,
+                                     action="resolve")
+                _, receipts, errors = self.store.process_markers(marker, source)
+                self.assertFalse(errors)
+                self.assertEqual(receipts[0]["status"], "resolved")
+
+    def test_dependent_pronoun_keeps_contiguous_antecedents_and_not_model_paraphrase(self):
+        antecedent = "I tried the cable moon hinge and a bench-contact variation."
+        report = "But they usually cause back issues."
+        context = antecedent + "\n\n" + report
+        source = "An unrelated opening sentence.\n\n" + context + "\n\nAn unrelated closing sentence."
+        for key in ("avoid_exercise:cable_moon_hinge", "avoid_exercise:bench_contact_moon_hinge"):
+            marker = self.marker(kind="preference", key=key,
+                                 text="All hinge variants are dangerous.", source_quote=report)
+            _, receipts, errors = self.store.process_markers(marker, source)
+            self.assertFalse(errors)
+            self.assertTrue(receipts[0]["verified"])
+            self.assertEqual(receipts[0]["text"], context)
+            self.assertEqual(receipts[0]["source_text"], source)
+            self.assertIn(receipts[0]["text"], receipts[0]["source_text"])
+            self.assertIn(context, self.store.render("preference"))
+        self.assertNotIn("All hinge variants", self.store.render("preference"))
+        self.assertNotIn("unrelated", self.store.render("preference"))
+        self.assertEqual(len(self.store.records("preference")), 2)
+
+    def test_context_follows_pronoun_chain_and_right_hand_exception(self):
+        source = ("I tried a moon squat.\nI also tried a star bridge.\n"
+                  "Both felt fine.\nBut the second one caused lower back pain later.")
+        for quote in ("Both felt fine.", "lower back pain"):
+            with self.subTest(quote=quote):
+                marker = self.marker(kind="health", key="low_back", text="Pain-free.",
+                                     source_quote=quote)
+                _, receipts, errors = self.store.process_markers(marker, source)
+                self.assertFalse(errors)
+                self.assertEqual(receipts[0]["text"], source)
+                self.assertIn(source, self.store.render("health"))
+
+    def test_repeated_quote_requires_unique_context_instead_of_choosing_old_claim(self):
+        source = "Last year I was pain-free. Today I am not pain-free."
+        marker = self.marker(kind="anchor", key="moon_squat", text="Recovered.",
+                             source_quote="pain-free")
+        with self.assertLogs("coach_memory", level="WARNING"):
+            _, receipts, errors = self.store.process_markers(marker, source)
+        self.assertFalse(receipts)
+        self.assertIn("unique passage", errors[0])
+
+    def test_availability_keeps_old_versus_current_scope_verbatim(self):
+        for context, quote in (
+            ("Previously five days; now three days per week.", "five days"),
+            ("Previously five days. Now three days per week.", "five days"),
+            ("Previously five days.\n\nNow three days per week.", "three days per week"),
+        ):
+            with self.subTest(context=context):
+                source = "An unrelated opening sentence. " + context + " Unrelated closing."
+                marker = self.marker(kind="preference", key="schedule",
+                                     text="Five days per week.", source_quote=quote)
+                _, receipts, errors = self.store.process_markers(marker, source)
+                self.assertFalse(errors)
+                self.assertEqual(receipts[0]["text"], context)
+                self.assertIn(receipts[0]["text"], source)
+                self.assertIn(context, self.store.render("preference"))
+                self.assertNotIn("Five days per week.", self.store.render("preference"))
+
+    def test_family_scope_requires_explicit_user_exclusion_not_named_variants(self):
+        for source in (
+            "The cable moon hinge and bench-contact variation cause back issues.",
+            "Avoid the cable moon hinge and bench-contact moon hinge.",
+            "Could I avoid all moon hinge variants?",
+            "If I avoid all moon hinges, would that help?",
+            "My trainer suggested avoiding all moon hinges.",
+            "I do not want to avoid all moon hinges.",
+            "Do not avoid all moon hinges.",
+            "Avoid the star press. I enjoy all moon hinge variants.",
+            "Avoid the star press because all moon hinge variants felt fine.",
+            "Avoid all cable moon hinges.",
+            "Avoid all moon hinges except cable moon hinges.",
+        ):
+            with self.subTest(source=source):
+                marker = self.marker(kind="preference", key="avoid_family:moon_hinge",
+                                     text="Avoid all moon hinges.", source_quote=source)
+                with self.assertLogs("coach_memory", level="WARNING"):
+                    _, receipts, errors = self.store.process_markers(marker, source)
+                self.assertFalse(receipts)
+                self.assertIn("avoid_family requires", errors[0])
+                self.assertIn("avoid_exercise", errors[0])
+        self.assertEqual(self.store.records("preference"), [])
+
+    def test_explicit_family_avoidance_uses_existing_preference_namespace(self):
+        for source in (
+            "Please avoid all moon hinge variants.",
+            "I want to avoid all moon hinges.",
+            "Exclude the entire moon hinge family.",
+            "No moon hinge variants.",
+            "Avoid moon hinges and all their variations.",
+        ):
+            with self.subTest(source=source):
+                marker = self.marker(kind="preference", key="Avoid Family:Moon Hinge",
+                                     text="Broad invented interpretation.", source_quote=source)
+                _, receipts, errors = self.store.process_markers(marker, source)
+                self.assertFalse(errors)
+                self.assertEqual(receipts[0]["key"], "avoid_family:moon_hinge")
+                self.assertEqual(receipts[0]["text"], source)
+                self.assertIn(source, self.store.render("preference"))
+
+    def test_one_variant_revocation_cannot_clear_a_whole_family(self):
+        self.store.upsert("preference", "avoid_family:moon_hinge", "Avoid all moon hinges.")
+        for source in (
+            "Reintroduce the cable moon hinge.",
+            "Remove my cable moon hinge restriction.",
+            "Remove my cable moon hinge restriction because all moon hinges feel fine.",
+        ):
+            with self.subTest(source=source):
+                marker = self.marker(kind="preference", key="avoid_family:moon_hinge",
+                                     source_quote=source, action="resolve")
+                with self.assertLogs("coach_memory", level="WARNING"):
+                    _, receipts, errors = self.store.process_markers(marker, source)
+                self.assertFalse(receipts)
+                self.assertTrue(errors)
+        source = "Remove my restriction on all moon hinges."
+        marker = self.marker(kind="preference", key="avoid_family:moon_hinge",
+                             source_quote=source, action="resolve")
+        _, receipts, errors = self.store.process_markers(marker, source)
+        self.assertFalse(errors)
+        self.assertEqual(receipts[0]["status"], "resolved")
+
+    def test_hypothetical_or_reported_suggestion_does_not_revoke_avoidance(self):
+        self.store.upsert("preference", "avoid_exercise:moon_hinge", "Avoid moon hinge.")
+        for source in (
+            "Could I reintroduce the moon hinge?",
+            "If I reintroduce the moon hinge, how would that work?",
+            "My trainer suggested I reintroduce the moon hinge.",
+            "I am considering whether to reintroduce the moon hinge.",
+        ):
+            with self.subTest(source=source):
+                marker = self.marker(kind="preference", key="avoid_exercise:moon_hinge",
+                                     source_quote=source, action="resolve")
+                with self.assertLogs("coach_memory", level="WARNING"):
+                    _, receipts, errors = self.store.process_markers(marker, source)
+                self.assertFalse(receipts)
+                self.assertTrue(errors)
+        self.assertEqual(self.store.records("preference")[0]["revision"], 1)
 
     def test_marker_missing_current_quote_or_assistant_source_saves_nothing(self):
         marker = self.marker(kind="anchor", key="moon_press", text="It was easy.",

@@ -32,8 +32,9 @@ BRIEF_STATE = os.path.join(STATE_DIR, "last_brief_date.txt")
 SETS_CACHE = os.path.join(STATE_DIR, "exercise_sets_cache.json")
 METRICS_CACHE = os.path.join(STATE_DIR, "metrics_cache.json")
 # A recently-finished session can still be EDITED in Garmin Connect (fixing a
-# mis-detected exercise type, reps, etc). Within this many days we always refetch
-# its logged sets so corrections show up; older sessions are treated as immutable
+# mis-detected exercise type, reps, etc). Within this many days we refresh its
+# logged sets on a bounded TTL; explicit correction checks bypass that TTL.
+# Older sessions are treated as immutable
 # and served from the by-id cache.
 EDITABLE_DAYS = 3
 # A night is considered "logged" once at least this much sleep is recorded.
@@ -1733,11 +1734,26 @@ def _within_days(start_local, days):
     return 0 <= (date.today() - d).days <= days
 
 
-def _sets_for(g, activity_id, cache=None, refresh=False, metadata=None, allow_fetch=True):
-    """Logged sets for one activity. Cached by activity_id, but a recently-finished
-    session can still be edited in Garmin Connect, so callers pass refresh=True to
-    bypass the cached value and pull fresh (the cache is then updated). A transient
-    empty/failed refetch never clobbers a previously-good cached value."""
+def _set_source_values(summaries):
+    """Compare source measurements, not freshness or configured unit conversion."""
+    sequence = (summaries or [{}])[0].get("set_sequence")
+    if not isinstance(sequence, list) or not sequence:
+        return None
+    fields = ("source_index", "set_type", "start_time", "duration_s", "exercise",
+              "exercises", "reps", "weight_raw", "weight_unit", "workout_step_index",
+              "message_index")
+    return [{key: row.get(key) for key in fields} for row in sequence]
+
+
+def _sets_for(g, activity_id, cache=None, refresh=False, metadata=None, allow_fetch=True,
+              force_refresh=False):
+    """Return cached sets with provenance.
+
+    refresh=True permits a six-hour TTL for editable workouts. force_refresh=True
+    always requests this activity from Garmin, unless allow_fetch=False explicitly
+    forbids network access. Empty/failed responses retain the last good source.
+    data_changed is None when comparison is unavailable or no refresh succeeded.
+    """
     key, now = str(activity_id), datetime.now(timezone.utc)
     unit_policy = _strength_weight_policy()
     entry = (cache or {}).get(key)
@@ -1751,13 +1767,16 @@ def _sets_for(g, activity_id, cache=None, refresh=False, metadata=None, allow_fe
     except (ValueError, TypeError):
         age = None
     meta = {"status": "unavailable", "fetched": False, "fetched_at": fetched_at,
+            "force_refresh": bool(force_refresh), "data_changed": None,
+            "refresh_status": "not_requested",
             "cache_age_hours": round(age, 2) if age is not None else None,
             "schema_version": metrics.SCHEMA_VERSION, "sequence_complete": current and bool(previous),
             "weight_unit_policy": entry.get("weight_unit_policy") if isinstance(entry, dict) else None,
             "requested_weight_unit_policy": unit_policy, "weight_unit_policy_current": current}
     parsed = None
     # Recently editable entries have a short TTL, not one API request per chat message.
-    cache_fresh = current and (not refresh or (age is not None and 0 <= age < 6))
+    cache_fresh = (not force_refresh and current
+                   and (not refresh or (age is not None and 0 <= age < 6)))
     if previous and cache_fresh:
         parsed = previous
         meta["status"] = "available"
@@ -1771,8 +1790,13 @@ def _sets_for(g, activity_id, cache=None, refresh=False, metadata=None, allow_fe
         status = metrics.payload_status(xs)
         if parsed:
             fetched_at = now.isoformat()
+            before, after = _set_source_values(previous), _set_source_values(parsed)
+            changed = before != after if before is not None and after is not None else None
             meta.update(status="available", fetched_at=fetched_at, cache_age_hours=0, sequence_complete=True,
-                        weight_unit_policy=unit_policy, weight_unit_policy_current=True)
+                        weight_unit_policy=unit_policy, weight_unit_policy_current=True,
+                        data_changed=changed,
+                        refresh_status=("changed" if changed else "unchanged")
+                        if changed is not None else "fetched_without_comparable_baseline")
             if cache is not None:
                 cache[key] = {"schema_version": metrics.SCHEMA_VERSION,
                               "fetched_at": fetched_at, "summaries": parsed,
@@ -1786,22 +1810,33 @@ def _sets_for(g, activity_id, cache=None, refresh=False, metadata=None, allow_fe
         metadata.update(meta)
     if parsed:
         # Annotate a copy; never contaminate the persisted last-good source with fallback state.
-        parsed = [dict(row) for row in parsed]
+        parsed = copy.deepcopy(parsed)
         parsed[0]["data_freshness"] = dict(meta)
     return parsed
 
 
-def exercise_sets(activity_id):
+def exercise_sets(activity_id, force_refresh=False, metadata=None):
     """Per-exercise set summary for a strength activity (exercise, #sets, rep
-    range, top weight in kg). None when the activity logs no sets."""
+    range, top weight in kg). None when the activity logs no sets.
+
+    force_refresh checks this activity even inside the six-hour cache TTL. metadata
+    receives refresh/fallback provenance and data_changed (True, False, or unknown).
+    """
+    login_error = None
     try:
         g = client()
     except Exception as exc:  # noqa: BLE001
-        return {"__error__": f"login failed: {exc}"}
+        # Login failures follow the same last-good fallback contract as endpoint failures.
+        class UnavailableClient:
+            def get_activity_exercise_sets(self, _activity_id):
+                return {"__error__": f"login failed: {login_error}"}
+        login_error = str(exc)
+        g = UnavailableClient()
     cache = _load_sets_cache()
-    out = _sets_for(g, activity_id, cache, refresh=True)
+    out = _sets_for(g, activity_id, cache, refresh=True, force_refresh=force_refresh,
+                    metadata=metadata)
     _save_sets_cache(cache)
-    return out
+    return out if out or not login_error else {"__error__": f"login failed: {login_error}"}
 
 
 def cmd_dump(args):

@@ -11,6 +11,7 @@ from datetime import date, datetime, timedelta
 
 
 PLAN_MARKER = re.compile(r"\[\[SESSION_PLAN:\s*(.*?)\]\]", re.DOTALL | re.IGNORECASE)
+PATCH_MARKER = re.compile(r"\[\[SESSION_PATCH:\s*(.*?)\]\]", re.DOTALL | re.IGNORECASE)
 
 
 def canonical_exercise(name):
@@ -33,11 +34,47 @@ def avoided_exercises(preferences):
     return result
 
 
-def parse_plans(text, preferences=(), today=None):
+def exercise_excluded(name, preferences):
+    canonical = canonical_exercise(name)
+    if canonical in avoided_exercises(preferences):
+        return True
+    for record in preferences:
+        key = record.get("key", "")
+        if record.get("status", "active") == "active" and key.startswith("avoid_family:"):
+            family = canonical_exercise(key.split(":", 1)[1])
+            if family and (" " + family + " ") in (" " + canonical + " "):
+                return True
+    return False
+
+
+def parse_plans(text, preferences=(), today=None, existing_plans=()):
     today = today or date.today()
     plans, errors = [], []
-    forbidden = avoided_exercises(preferences)
-    for raw in PLAN_MARKER.findall(text or ""):
+    raw_plans = PLAN_MARKER.findall(text or "")
+    existing = {row["date"]: row.get("payload", row) for row in existing_plans}
+    patches = {}
+    for raw in PATCH_MARKER.findall(text or ""):
+        try:
+            patch = json.loads(raw)
+            day = patch["date"]
+            if day not in existing:
+                raise ValueError("SESSION_PATCH needs an existing dated plan")
+            plan = patches.setdefault(day, json.loads(json.dumps(existing[day])))
+            matches = [i for i, move in enumerate(plan.get("exercises", []))
+                       if canonical_exercise(move["name"]) == canonical_exercise(patch["exercise"])]
+            if len(matches) != 1 or not isinstance(patch.get("replacement"), dict):
+                raise ValueError("SESSION_PATCH must identify one existing exercise and its replacement")
+            if not isinstance(patch.get("reason"), str) or not patch["reason"].strip():
+                raise ValueError("SESSION_PATCH needs a reason")
+            plan["exercises"][matches[0]] = patch["replacement"]
+            plan["reason"] = patch["reason"]
+            plan["program_adjustment"] = patch["reason"]
+            if "program_revision" in patch:
+                plan["program_revision"] = patch["program_revision"]
+        except (ValueError, TypeError, KeyError) as exc:
+            errors.append(str(exc))
+    raw_plans += [json.dumps(plan) for plan in patches.values()]
+    for raw in raw_plans:
         try:
             plan = json.loads(raw)
             if not isinstance(plan, dict):
@@ -49,6 +86,19 @@ def parse_plans(text, preferences=(), today=None):
                 raise ValueError("unknown session kind")
             if plan.get("detail_level", "prescription") not in ("outline", "prescription"):
                 raise ValueError("unknown plan detail level")
+            if plan.get("delivery", "self_directed") not in ("self_directed", "instructor_led"):
+                raise ValueError("unknown session delivery")
+            if plan.get("delivery") == "instructor_led":
+                guidance = plan.get("participation_guidance")
+                if (not isinstance(guidance, list) or not 1 <= len(guidance) <= 6
+                        or any(not isinstance(g, str) or not g.strip() for g in guidance)):
+                    raise ValueError("An instructor-led class needs explicit participation guidance")
+                if plan.get("kind") not in ("strength", "cardio", "mixed", "recovery"):
+                    raise ValueError("An instructor-led class must name its actual activity kind")
+            if "start_time" in plan and (
+                    not isinstance(plan["start_time"], str) or not re.fullmatch(
+                        r"(?:[01]\d|2[0-3]):[0-5]\d", plan["start_time"])):
+                raise ValueError("start_time must use local HH:MM")
             if not isinstance(plan.get("objective"), str) or not plan["objective"].strip():
                 raise ValueError("plan needs an objective")
             if not isinstance(plan.get("reason"), str) or not plan["reason"].strip():
@@ -58,6 +108,8 @@ def parse_plans(text, preferences=(), today=None):
                 raise ValueError("exercises must be a list")
             if plan["kind"] == "rest" and exercises:
                 raise ValueError("a rest day cannot contain a prescribed workout")
+            if day > today and not exercises:
+                plan["detail_level"] = "outline"
             for exercise in exercises:
                 if (not isinstance(exercise, dict) or not isinstance(exercise.get("name"), str)
                         or not exercise["name"].strip()):
@@ -70,14 +122,14 @@ def parse_plans(text, preferences=(), today=None):
                 if plan.get("detail_level") == "outline" and (
                         exercise.get("sets") or exercise.get("blocks")):
                     raise ValueError("an outline must not contain placeholder working sets or blocks")
-                if canonical_exercise(exercise["name"]) in forbidden:
+                if exercise_excluded(exercise["name"], preferences):
                     raise ValueError("plan contains a movement the user explicitly excluded")
             plans.append(plan)
         except (ValueError, TypeError, KeyError) as exc:
             errors.append(str(exc))
     if len({p["date"] for p in plans}) != len(plans):
         errors.append("multiple competing plans for the same date")
-    return PLAN_MARKER.sub("", text or "").rstrip(), plans, errors
+    return PATCH_MARKER.sub("", PLAN_MARKER.sub("", text or "")).rstrip(), plans, errors
 
 
 def render_plans(plans):
@@ -86,8 +138,19 @@ def render_plans(plans):
     for plan in plans:
         day = date.fromisoformat(plan["date"])
         label = "Today" if day == date.today() else day.strftime("%a %d %b")
+        if plan.get("delivery") == "instructor_led" and day == date.today():
+            lines = ["**Today · Instructor-led session**",
+                     plan["objective"] + (f" · {plan['start_time']}" if plan.get("start_time") else ""),
+                     "**Why:** " + plan["reason"],
+                     "Class content/intensity must be confirmed; this is not a prescribed set list."]
+            lines.extend("- " + g for g in plan["participation_guidance"])
+            sections.append("\n".join(lines))
+            continue
         if plan.get("detail_level") == "outline" or (day > date.today() and not plan.get("exercises")):
-            upcoming.append(f"- **{label}**: {plan['objective']} (provisional outline)")
+            objective = re.sub(r"\s*\(provisional outline\)", "", plan["objective"],
+                               flags=re.IGNORECASE)
+            start = f" · {plan['start_time']}" if plan.get("start_time") else ""
+            upcoming.append(f"- **{label}{start}**: {objective} (provisional outline)")
             continue
         icon = "\U0001F33F" if plan["kind"] == "rest" else "\U0001F4CB"
         lines = [f"**{icon} {label} \u00b7 {plan['kind'].title()} plan**",
@@ -126,19 +189,50 @@ def unsupported_claims(text):
     pattern = (r"\b(?:zero[- ]spinal[- ]load|zero (?:spinal|back) stress|"
                r"guaranteed back[- ]safe|proves? (?:no|zero) muscle loss|"
                r"(?:without|no) (?:axial |added |any )?(?:spinal|spine|lumbar) "
-               r"(?:loading|load|compression|stress|overload))\b")
+               r"(?:loading|load|compression|stress|strain|overload)|"
+               r"muscular reserves (?:are |remain )?untouched|"
+               r"(?:deep )?neural recovery (?:is )?(?:already )?(?:running )?(?:behind|complete))\b")
+    semantic_patterns = [
+        r"\bproductive\b[^.!?\n]{0,150}\b(?:only|requires?)\b[^.!?\n]{0,100}"
+        r"\b(?:continual\w*|constant\w*)\b[^.!?\n]{0,50}\b(?:increas\w*|climb\w*)",
+        r"\bproductive\b[^.!?\n]{0,100}\b(?:simply requires?|only requires?|requires? "
+        r"(?:ratchet\w*|increas\w*))\b[^.!?\n]{0,100}\bload\b",
+        r"\bmaintaining\b[^.!?\n]{0,160}\b(?:proves?|confirms?|guarantees?)\b"
+        r"[^.!?\n]{0,100}\b(?:muscl\w*|muscular|lean mass)\b",
+        r"\bmaintaining\b[^.!?\n]{0,160}\b(?:protects?|preserv\w*|retains?)\b"
+        r"[^.!?\n]{0,100}\b(?:muscl\w*|capacity|lean mass)\b",
+        r"\b(?:moderate|readiness)\b[^.!?\n]{0,130}\b"
+        r"(?:capacity for light activity|light (?:activity|exercise) only|only light (?:activity|exercise))",
+        r"\b\d+\s*hours?\b[^.!?\n]{0,90}\b(?:is|are)\s+(?:categorically |always )?"
+        r"insufficient\b[^.!?\n]{0,80}\brecovery\b",
+        r"\b(?:reps|repetitions|set)\b[^.!?\n]{0,90}\b(?:keeps?|confirms?|proves?|ensures?|means?)\b"
+        r"[^.!?\n]{0,80}\b(?:reserve|RIR|RPE)\b",
+        r"\b(?:holding|taking|scheduling)\b[^.!?\n]{0,100}\brest\b"
+        r"[^.!?\n]{0,60}\bensures?\b[^.!?\n]{0,100}\brecover\w*",
+        r"\b(?:you are|you're|you have been)\s+(?:fully )?cleared\s+to\s+"
+        r"(?:join|attend|train|exercise|work out)",
+        r"\b(?:systemic|neural|muscular|full)\s+recovery\s+(?:will|should)\s+be\s+"
+        r"(?:solid|complete|good|fine)",
+        r"\brecovery (?:time|timer)\b[^.!?\n]{0,50}\b(?:will|should)\s+"
+        r"(?:clear|(?:be|reach|hit) (?:at )?zero)",
+        r"\b(?:[5-7](?:th)?|fifth|sixth|seventh|extra)\s+(?:rolling )?"
+        r"(?:session|training day)\s+is\s+(?:fine|safe)\b",
+    ]
     problems = []
-    for match in re.finditer(pattern, text or "", re.IGNORECASE):
-        prefix = text[max(0, match.start() - 70):match.start()].lower()
-        if not re.search(r"\b(?:not|never|no|cannot|can't|isn't|avoid claiming|don't claim)\b",
-                         prefix):
+    for match in re.finditer(pattern + "|" + "|".join(semantic_patterns), text or "", re.IGNORECASE):
+        prefix = re.split(r"[.!?;\n]", text[:match.start()])[-1][-100:].lower()
+        claim = match.group(0).lower()
+        denial = r"\b(?:not|never|cannot|can't|isn't|avoid claiming|don't claim|no guarantee)\b"
+        if not re.search(denial, prefix) and not re.search(denial, claim):
             problems.append("unsupported physiological certainty: " + match.group(0))
     return problems
 
 
 class TrainingStore:
     def __init__(self, db_path):
+        from coach_corrections import CorrectionStore
         self.path = str(db_path)
+        self.corrections = CorrectionStore(db_path)
         with self.connection() as db:
             db.executescript("""
                 CREATE TABLE IF NOT EXISTS training_plans (
@@ -155,6 +249,9 @@ class TrainingStore:
                 CREATE TABLE IF NOT EXISTS training_completion_context (
                     date TEXT PRIMARY KEY, plan_kind_at_report TEXT,
                     plan_revision_at_report INTEGER, reported_at TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS training_plan_sources (
+                    date TEXT NOT NULL, revision INTEGER NOT NULL, request_id TEXT,
+                    source_text TEXT NOT NULL, PRIMARY KEY(date,revision));
                 INSERT OR IGNORE INTO training_day_status
                     SELECT date,status,updated_at FROM training_plans
                     WHERE status IN ('user_completed','user_skipped','user_planned');
@@ -184,7 +281,7 @@ class TrainingStore:
         finally:
             db.close()
 
-    def save(self, plans, source="model_proposal"):
+    def save(self, plans, source="model_proposal", request_id=None, source_text=""):
         now = datetime.now().isoformat(timespec="seconds")
         with self.connection() as db:
             for plan in plans:
@@ -206,6 +303,8 @@ class TrainingStore:
                 db.execute("INSERT INTO training_plan_events(date,payload,revision,source,"
                            "recorded_at) VALUES (?,?,?,?,?)",
                            (plan["date"], payload, revision, source, now))
+                db.execute("INSERT INTO training_plan_sources VALUES (?,?,?,?)",
+                           (plan["date"], revision, request_id, source_text))
 
     def set_status(self, day, status):
         if status not in ("user_completed", "user_skipped", "user_planned"):
@@ -230,6 +329,9 @@ class TrainingStore:
         now = datetime.now().isoformat(timespec="seconds")
         with self.connection() as db:
             for activity in activities or []:
+                if any(g.get("user_corrections") or g.get("garmin_original_summary")
+                       for g in activity.get("logged_sets", []) or []):
+                    raise ValueError("Correction overlays must not overwrite raw Garmin outcomes.")
                 aid = activity.get("activity_id")
                 start = str(activity.get("start", ""))[:10]
                 if aid is None or not start:
@@ -248,6 +350,15 @@ class TrainingStore:
                     "ON CONFLICT(activity_id) DO UPDATE SET payload=excluded.payload,"
                     "observed_at=excluded.observed_at",
                     (str(aid), start, json.dumps(payload, ensure_ascii=False, default=str), now))
+
+    def raw_activities(self, today=None, days=28):
+        today = today or date.today()
+        with self.connection() as db:
+            rows = db.execute(
+                "SELECT payload FROM training_outcomes WHERE date>=? AND date<=? "
+                "ORDER BY date,activity_id",
+                ((today - timedelta(days=days)).isoformat(), today.isoformat())).fetchall()
+        return [json.loads(row[0]) for row in rows]
 
     def context(self, today=None, outcome_limit=12):
         today = today or date.today()
@@ -271,6 +382,7 @@ class TrainingStore:
                 "WHERE s.date>=? ORDER BY s.date", (start,))]
         for row in plans + outcomes:
             row["payload"] = json.loads(row["payload"])
+        outcomes = self.corrections.apply(outcomes)
         outcomes.sort(key=lambda row: (
             str(row["payload"].get("start") or row["date"]).replace(" ", "T"),
             row["activity_id"]))

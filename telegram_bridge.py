@@ -104,6 +104,7 @@ PROGRAM_ENABLED = os.environ.get("AGBOT_PROGRAM_ENABLED", "false").strip().lower
 PROGRAM_REVIEW_DAYS = int(os.environ.get("AGBOT_PROGRAM_REVIEW_DAYS", "7"))
 PROGRAM_BLOCK_DAYS = int(os.environ.get("AGBOT_PROGRAM_BLOCK_DAYS", "28"))
 PROGRAM_REVIEW_TIMEOUT = int(os.environ.get("AGBOT_PROGRAM_REVIEW_TIMEOUT", "180"))
+PROGRAM_POLICY_VERSION = 2
 
 # Auto-summary window (local time). If no summary has been sent yet today and the
 # current time falls in this window, one is pushed automatically.
@@ -204,6 +205,10 @@ from coach_memory import MemoryStore
 from coach_plan import TrainingStore, canonical_exercise, parse_plans, render_plans, unsupported_claims
 from coach_program import ProgramStore, build_review_evidence, parse_program_review, render_program
 from coach_runtime import RuntimeStore, SnapshotCache, message_key
+from coach_context import (
+    compact_workouts, plan_request_scope, schedule_claim_errors, strip_schedule_rendering,
+)
+from coach_corrections import correction_intent
 from telegram_formatting import md_to_html, html_chunks, html_to_plain as _html_to_plain
 
 _memory_store = None
@@ -262,6 +267,49 @@ def get_snapshot(force=False):
     return result
 
 
+def _correction_request_id(question):
+    return _current_request or "correction:" + hashlib.sha256(
+        (date.today().isoformat() + question).encode("utf-8")).hexdigest()
+
+
+def _prepare_workout_correction(question):
+    if not correction_intent(question):
+        return None
+    store = training_store()
+    # Preserve old source values before a normal snapshot or targeted refresh can replace them.
+    before = {str(a["activity_id"]): a for a in store.raw_activities()}
+    get_snapshot()
+    sources = {str(a["activity_id"]): a for a in store.raw_activities()}
+    sources.update({aid: a for aid, a in before.items() if a.get("logged_sets")})
+    history = load_history()
+    previous = history[-1] if history else {}
+    referents = previous.get("activity_ids") if previous.get("role") == "agbot" else None
+    if referents and re.search(r"\b(?:that|it|those|them)\b", question, re.I):
+        # These identifiers were attached by the application, not inferred from model prose.
+        sources = {aid: a for aid, a in sources.items() if aid in referents}
+    request_id = _correction_request_id(question)
+    result = store.corrections.process_report(
+        question, list(sources.values()), request_id=request_id,
+        observed_on=_sent_backdate() or date.today().isoformat())
+    refreshes = {}
+    candidates = result["candidate_activity_ids"]
+    if not result["replayed"] and len(candidates) <= 3:
+        for aid in candidates:
+            metadata = {}
+            sets = garmin_coach.exercise_sets(aid, force_refresh=True, metadata=metadata)
+            refreshes[aid] = metadata
+            if isinstance(sets, list) and sets and aid in sources:
+                updated = dict(sources[aid], logged_sets=sets, logged_sets_coverage=metadata)
+                store.record_activities([updated])
+        if candidates:
+            _snapshot_cache.invalidate()
+    elif len(candidates) > 3:
+        refreshes["deferred"] = "More than three possible activities; clarify the workout first."
+    log.info("stage=workout_correction saved=%s clarification=%s reason=%s",
+             result["saved"], result["needs_clarification"], result["reason"])
+    return {**result, "refreshes": refreshes}
+
+
 # --------------------------------------------------------------------- helpers
 def read_file(path):
     try:
@@ -311,7 +359,7 @@ def _defang_markers(text):
     return text.replace("[[", "[\u200b[").replace("]]", "]\u200b]")
 
 
-def append_history(role, text):
+def append_history(role, text, activity_ids=None):
     if role == "user":
         text = _defang_markers(text)
     hist = load_history()
@@ -322,6 +370,8 @@ def append_history(role, text):
                  "request_id": _current_request,
                  "ts": ((_MSG_SENT_AT if role == "user" and _MSG_SENT_AT else datetime.now())
                         .isoformat(timespec="seconds"))})
+    if activity_ids:
+        hist[-1]["activity_ids"] = [str(aid) for aid in activity_ids]
     hist = [t for t in hist if _within_days(t.get("ts"), HISTORY_KEEP_DAYS)]
     hist = hist[-MAX_STORED_TURNS:]
     try:
@@ -434,11 +484,12 @@ def recent_history_text():
     hist = [t for t in hist if _within_days(t.get("ts"), HISTORY_PROMPT_DAYS)]
     hist = hist[-HISTORY_PROMPT_TURNS:]
     # Older user statements are more useful than repeatedly injecting long bot answers.
-    last_assistants = {id(t) for t in [t for t in hist if t.get("role") != "user"][-4:]}
+    last_assistants = {id(t) for t in [t for t in hist if t.get("role") != "user"][-2:]}
     hist = [t for t in hist if t.get("role") == "user" or id(t) in last_assistants]
     lines, used, omitted = [], 0, 0
     for turn in reversed(hist):
-        who = "You" if turn.get("role") == "user" else "AgBot"
+        who = ("You" if turn.get("role") == "user"
+               else "AgBot (historical model advice, not evidence; may be incorrect)")
         raw = turn.get("ts") or ""
         short = raw[:16].replace("T", " ")
         tag = _day_tag(raw)
@@ -449,7 +500,10 @@ def recent_history_text():
             continue
         lines.append(line)
         used += len(line) + 1
-    prefix = f"[Bounded context: {omitted} older/oversized turns omitted.]\n" if omitted else ""
+    prefix = ("[User reports are evidence; past model explanations are not. "
+              "Use the saved schedule and current metric definitions over old bot claims.]\n")
+    if omitted:
+        prefix += f"[Bounded context: {omitted} older/oversized turns omitted.]\n"
     return prefix + "\n".join(reversed(lines))
 
 
@@ -669,7 +723,7 @@ _HEALTH_FLAG_RE = re.compile(r"\[\[HEALTH_FLAG:\s*(.*?)\]\]", re.IGNORECASE | re
 
 def active_anchors_text(query=""):
     """Retrieve source-labelled capability records by entity, not just recency."""
-    return memory_store().render("anchor", query=query, max_chars=8000)
+    return memory_store().render("anchor", query=query, max_chars=8000, verified_only=True)
 
 
 _ANCHOR_MARKER_RE = re.compile(r"\[\[ANCHOR:\s*(.*?)\]\]", re.IGNORECASE | re.DOTALL)
@@ -1175,6 +1229,9 @@ def _program_inputs():
     records = []
     for kind in ("preference", "anchor", "health"):
         for record in memory_store().records(kind):
+            if kind == "anchor" and not (
+                    record.get("verified") and record.get("source_type") == "user"):
+                continue
             if kind == "preference" and re.search(
                     r"nutrition|food|meal|protein|calorie|hydration", record["key"], re.IGNORECASE):
                 continue
@@ -1191,7 +1248,8 @@ def _program_inputs():
 def _resolved_health_reports():
     return [{key: record.get(key) for key in (
         "key", "status", "resolved_at", "resolution_source_text")}
-        for record in memory_store().records("health", status="resolved")]
+        for record in memory_store().records("health", status="resolved")
+        if not (record.get("source_metadata") or {}).get("reclassification")]
 
 
 def _program_training_context():
@@ -1211,6 +1269,10 @@ def _program_context(nutrition_focused=False):
     result = {key: context.get(key) for key in (
         "review_due", "due_reason", "next_review_date", "last_error", "retry_after")}
     result["enabled"] = True
+    result["frequency_interpretation"] = (
+        "weekly_training_days is a usual planning target, NOT a physiological ceiling. "
+        "SCHEDULING_CONTEXT identifies any separately explicit hard limit. Older review "
+        "wording about a budget/cap does not turn a target into an injury or recovery finding.")
     result["active"] = None
     if active:
         result["active"] = {key: active.get(key) for key in (
@@ -1277,6 +1339,10 @@ def ensure_program_review(force=False):
             return prior
     profile, records, fingerprint = _program_inputs()
     context = store.context(fingerprint=fingerprint)
+    if (context.get("active") and
+            context["active"].get("evidence", {}).get("policy_version") != PROGRAM_POLICY_VERSION):
+        store.request_review("policy_changed")
+        context = store.context(fingerprint=fingerprint)
     if not force and not context["review_due"]:
         return None
     snapshot = get_snapshot()
@@ -1287,6 +1353,7 @@ def ensure_program_review(force=False):
     training_store().record_activities(history["activities"])
     training = _program_training_context()
     evidence = build_review_evidence(training, records, profile)
+    evidence["policy_version"] = PROGRAM_POLICY_VERSION
     evidence["refs"]["history_coverage"] = {"kind": "history_coverage", "data": history["coverage"]}
     evidence["refs"]["snapshot"] = {
         "kind": "device_snapshot",
@@ -1385,6 +1452,50 @@ def maybe_program_review(now=None):
     ensure_program_review()
 
 
+def _scheduling_context(plans=()):
+    training = _program_training_context()
+    profile, records, _ = _program_inputs()
+    evidence = build_review_evidence(training, records, profile)
+    active = program_store().context().get("active") if PROGRAM_ENABLED else None
+    review = active["review"] if active else {}
+    target = review.get("weekly_training_days")
+    availability = evidence["weekly_training_days"]
+    prior = (active.get("evidence") or {}).get("weekly_training_days") if active else None
+    if availability is not None and (target is None or target == prior or availability < target):
+        target = availability
+    intentional = {"strength", "cardio", "mixed"}
+    observed = {r["date"] for r in training["recent_outcomes"]
+                if r["classification"] == "intentional_training"}
+    reported = {r["date"] for r in training["user_reported_day_status"]
+                if r["status"] == "user_completed" and r.get("plan_kind_at_report") in intentional
+                and r["date"] <= date.today().isoformat()}
+    proposals = {r["date"]: r["payload"] for r in training["plans"]
+                 if r["date"] >= date.today().isoformat()}
+    proposals.update({p["date"]: p for p in plans})
+    planned = {day for day, p in proposals.items() if p["kind"] in intentional}
+    all_days = observed | reported | planned
+    proposed_days = {p["date"] for p in plans if p["kind"] in intentional}
+    windows = []
+    for day in sorted(planned):
+        start = (date.fromisoformat(day) - timedelta(days=6)).isoformat()
+        if plans and not any(start <= proposed <= day for proposed in proposed_days):
+            continue
+        counted = sorted(d for d in all_days if start <= d <= day)
+        windows.append({"start": start, "end": day, "dates": counted, "count": len(counted)})
+    return {
+        "usual_target_days": target, "hard_limit_days": evidence["hard_weekly_limit"],
+        "frequency_source_refs": evidence["weekly_training_days_refs"],
+        "observed_training_dates": sorted(observed), "reported_training_dates": sorted(reported),
+        "proposed_training_dates": sorted(planned), "rolling_windows": windows,
+        "interpretation": (
+            "A frequency target is flexible, not a recovery diagnosis or user consent to extra "
+            "sessions. Discuss one-off changes using session duration/intensity, muscle overlap, "
+            "symptoms, user-reported effort and current Garmin estimates. Preserve a planned "
+            "recovery opportunity. Do not claim a rest day is medically required just to meet "
+            "a number. A hard limit, if supplied, is an explicit user/configuration restriction."),
+    }
+
+
 def _program_plan_errors(plans):
     if not plans or not PROGRAM_ENABLED:
         return []
@@ -1394,7 +1505,6 @@ def _program_plan_errors(plans):
     review = active["review"]
     templates = {item["id"]: item for item in review["session_templates"]}
     errors = []
-    intentional = {"strength", "cardio", "mixed"}
     for plan in plans:
         if (plan["kind"] == "rest" or (plan.get("detail_level") == "outline"
                                       and plan["date"] > date.today().isoformat())):
@@ -1423,45 +1533,16 @@ def _program_plan_errors(plans):
         if actual != expected and not adjustment:
             errors.append("Changing programme exercises needs a program_adjustment: "
                           "explain the scope, recovery, equipment or tolerability reason.")
-    training = _program_training_context()
-    profile, records, _ = _program_inputs()
-    availability = build_review_evidence(training, records, profile)["weekly_training_days"]
-    prior_availability = (active.get("evidence") or {}).get("weekly_training_days")
-    limit = review.get("weekly_training_days")
-    if availability is not None:
-        if limit is None or availability < limit:
-            limit = availability
-        elif (prior_availability is not None and limit == prior_availability
-              and availability > prior_availability
-              and any(isinstance(p.get("program_adjustment"), str)
-                      and p["program_adjustment"].strip() for p in plans)):
-            # New explicit availability can raise an unchanged budget, not cancel a deload.
-            limit = availability
+    schedule = _scheduling_context(plans)
+    limit = schedule["hard_limit_days"]
     if limit is not None:
-        observed = {row["date"] for row in training["recent_outcomes"]
-                    if row["classification"] == "intentional_training"}
-        reported = {row["date"] for row in training["user_reported_day_status"]
-                    if row["status"] == "user_completed"
-                    and row.get("plan_kind_at_report") in intentional
-                    and row["date"] <= date.today().isoformat()}
-        proposals = {row["date"]: row["payload"] for row in training["plans"]
-                     if row["date"] >= date.today().isoformat()}
-        proposals.update({plan["date"]: plan for plan in plans})
-        planned = {day for day, proposal in proposals.items() if proposal["kind"] in intentional}
-        known_training_days = observed | reported | planned
-        proposed_training = {plan["date"] for plan in plans if plan["kind"] in intentional}
-        for day in sorted(planned):
-            end = date.fromisoformat(day)
-            start = (end - timedelta(days=6)).isoformat()
-            if not any(start <= candidate <= day for candidate in proposed_training):
-                continue
-            if sum(start <= day <= end.isoformat() for day in known_training_days) > limit:
-                counted = sorted(day for day in known_training_days if start <= day <= end.isoformat())
+        for window in schedule["rolling_windows"]:
+            if window["count"] > limit:
                 errors.append(
-                    f"The {start} through {end.isoformat()} window has {len(counted)} known "
-                    f"observed/reported/proposed training dates {counted}, above budget {limit}. "
-                    "Revise provisional future recovery slots rather than silently cancelling "
-                    "today's agreed session or adding more training; transport does not count.")
+                    f"The {window['start']} through {window['end']} window exceeds the user's "
+                    f"explicit maximum of {limit} training days. Explain this as a user-set "
+                    "scheduling restriction, NOT evidence of insufficient physical recovery. "
+                    "Ask about changing the explicit limit rather than inventing medical reasons.")
                 break
     return errors
 
@@ -1577,19 +1658,35 @@ def _nutrition_context(data, training):
     return data, training
 
 
+def _qa_plan_scope(question, training=None):
+    training = training if training is not None else training_store().context()
+    completed = any(r["date"] == date.today().isoformat() and r["status"] == "user_completed"
+                    for r in training["user_reported_day_status"])
+    return plan_request_scope(question, completed_today=completed)
+
+
 def _assemble(prompt_file, question=None, include_history=True,
               data=None, data_key="GARMIN_JSON", include_brief=True):
+    correction = _prepare_workout_correction(question) if question else None
     if data is None:
         data = get_snapshot()
-    nutrition_focused = _nutrition_focused(prompt_file, question)
+    nutrition_focused = _nutrition_focused(prompt_file, question) and not plan_request_scope(question)
     if (prompt_file in (SUMMARY_PROMPT_FILE, PERF_PROMPT_FILE)
             or re.search(r"\b(?:workout|exercise|training|stamina|running dynamics|"
                          r"fat burner|fat burned|fuel use|carbohydrate burned)\b",
                          question or "", re.IGNORECASE)):
         _enrich_activity_context(data, question or "", summary=prompt_file == SUMMARY_PROMPT_FILE)
+    for field in ("recent_activities_7d", "activities"):
+        if isinstance(data.get(field), list):
+            data[field] = training_store().corrections.apply(data[field])
     training = training_store().context()
     if nutrition_focused:
         data, training = _nutrition_context(data, training)
+    else:
+        chronology = (prompt_file == DEBRIEF_PROMPT_FILE or _is_workout_review(question)
+                      or bool(re.search(r"\b(?:order|sequence|superset)\b", question or "", re.I)))
+        data = compact_workouts(data, full_chronology=chronology)
+        training = compact_workouts(training, full_chronology=chronology)
     js = json.dumps(data, separators=(",", ":"), default=str)
     parts = [
         read_file(prompt_file),
@@ -1603,9 +1700,10 @@ def _assemble(prompt_file, question=None, include_history=True,
                      + " - you may address them by their first name.\n")
     flags = active_health_text()
     if flags:
-        parts.append("\nACTIVE HEALTH FLAGS (injuries/illness the user reported and has NOT "
-                     "marked recovered - respect these: adapt or rest, don't train through "
-                     "them, and check how they're doing):\n" + flags + "\n")
+        parts.append("\nACTIVE HEALTH REPORTS (read the actual statement and scope; "
+                     "a positive exercise-tolerance report is NOT an active injury. "
+                     "Respect actual symptoms, not a diagnosis inferred from this heading):\n"
+                     + flags + "\n")
     if PROGRAM_ENABLED:
         resolved = _resolved_health_reports()
         if resolved:
@@ -1658,8 +1756,24 @@ def _assemble(prompt_file, question=None, include_history=True,
     training = _compact_training_context(training, data, data_key, keep_older_sequences)
     parts.append("\n\nTRAINING_STATE:\n" + json.dumps(training,
                  separators=(",", ":"), default=str))
+    if correction:
+        parts.append("\n\nWORKOUT_CORRECTION_RESULT:\n" + json.dumps(correction, default=str)
+                     + "\nSaved corrections are user-reported overlays, not Garmin verification. "
+                     "Use effective corrected sets and their source/freshness. If clarification "
+                     "is needed, name the ambiguity and ask for activity/exercise/set; do not "
+                     "claim the edit was applied. Handle other feedback in the message normally.")
     parts.append("\n\nPROGRAMME_STATE:\n" + json.dumps(
         _program_context(nutrition_focused), separators=(",", ":"), default=str))
+    if not nutrition_focused:
+        parts.append("\n\nSCHEDULING_CONTEXT:\n" + json.dumps(
+            _scheduling_context(), separators=(",", ":"), default=str))
+        parts.append("\n\n" + read_file(os.path.join(PROMPTS, "garmin_interpretation.md")))
+    scope = _qa_plan_scope(question, training)
+    if scope:
+        parts.append("\n\nPLAN UPDATE CONTRACT: This request needs a dated SESSION_PLAN "
+                     "or SESSION_PATCH, even when it is phrased as an exercise clarification. "
+                     "Use a provisional outline for an unfamiliar future class; do not invent "
+                     "its exercises or clear the user for an unknown intensity.")
     parts.append("\n\n" + read_file(os.path.join(PROMPTS, "coaching_policy.md")))
     if question is not None:
         parts.append("\n\nQUESTION:\n" + question)
@@ -1720,7 +1834,7 @@ def _present_reply(text):
     return "\n".join(lines)
 
 
-def _generate_checked(prompt, source_text="", images=None, require_plan=False):
+def _generate_checked(prompt, source_text="", images=None, require_plan=False, show_schedule=False):
     """Persist source-backed facts and validate proposals before returning an answer."""
     text = run_llm(prompt, images=images)
     receipts = []
@@ -1737,9 +1851,13 @@ def _generate_checked(prompt, source_text="", images=None, require_plan=False):
             pending_memory_errors = memory_errors
         elif changes:
             pending_memory_errors = []
-        clean, plans, errors = parse_plans(candidate, memory_store().records("preference"))
+        existing = training_store().context()["plans"]
+        clean, plans, errors = parse_plans(candidate, memory_store().records("preference"),
+                                          existing_plans=existing)
         errors.extend(_program_plan_errors(plans))
         errors.extend(unsupported_claims(clean))
+        if show_schedule or plans or require_plan:
+            errors.extend(schedule_claim_errors(clean, plans, existing))
         errors.extend(_food_reporting_errors(clean, source_text))
         if require_plan and not plans:
             errors.append("a dated structured SESSION_PLAN is required")
@@ -1749,6 +1867,7 @@ def _generate_checked(prompt, source_text="", images=None, require_plan=False):
         if require_plan in (True, "today") and any(
                 p["date"] == date.today().isoformat() and p["kind"] != "rest"
                 and (p.get("detail_level") == "outline" or not p.get("exercises"))
+                and p.get("delivery") != "instructor_led"
                 for p in plans):
             errors.append("Today's non-rest plan needs an actual exercise prescription, not an empty outline.")
         repair_reasons = errors + (pending_memory_errors if source_text else [])
@@ -1763,11 +1882,16 @@ def _generate_checked(prompt, source_text="", images=None, require_plan=False):
                        "\n\nOUTPUT ERRORS:\n" + "\n".join(repair_reasons) +
                        "\nReturn a corrected complete answer. Keep all visible food totals. "
                        "Copy MEMORY source_quote verbatim from the CURRENT USER MESSAGE, "
-                       "never a paraphrase. Do not relax user constraints.",
+                       "never a paraphrase. Preserve the user's requested schedule where "
+                       "possible. Correct false claims or metadata, NOT the recommendation "
+                       "merely to avoid a repair. A frequency target is not a hard limit or "
+                       "medical finding. Do not invent recovery reasons. Put the calendar "
+                       "only in SESSION_PLAN; the application renders it.",
                        images=images)
     if plans:
-        training_store().save(plans, source="user_requested_revision" if source_text
-                              else "scheduled_coaching_proposal")
+        training_store().save(plans, source="model_proposal_in_response_to_user" if source_text
+                              else "scheduled_coaching_proposal",
+                              request_id=_current_request, source_text=source_text)
         for plan in plans:
             if plan["date"] == date.today().isoformat():
                 _set_coach_rest(plan["kind"] == "rest")
@@ -1781,11 +1905,38 @@ def _generate_checked(prompt, source_text="", images=None, require_plan=False):
                                replaces_entry_id=replacements[0] if replacements else None)
         clean = re.sub(r"(?m)^Logged\.\s*", "", clean)
         clean += _logged_confirmation(entry["date"], updated=bool(replacements))
-    if source_text:
-        clean = _harvest_exercise_plan(clean)
     clean = _strip_control_markers(clean)
-    if plans:
-        clean += "\n\n" + render_plans(plans)
+    if plans or show_schedule:
+        clean = strip_schedule_rendering(clean)
+        visible = plans[:]
+        mentioned = {p["date"] for p in visible}
+        visible.extend(r["payload"] for r in training_store().context()["plans"]
+                       if date.today().isoformat() < r["date"] <=
+                       (date.today() + timedelta(days=7)).isoformat() and r["date"] not in mentioned)
+        if visible:
+            clean += "\n\n" + render_plans(visible)
+        if plans and PROGRAM_ENABLED:
+            schedule = _scheduling_context(plans)
+            target = schedule["usual_target_days"]
+            above = [w for w in schedule["rolling_windows"]
+                     if target is not None and w["count"] > target]
+            if above:
+                window = above[0]
+                clean += (f"\n\nSchedule note: this proposal includes {window['count']} training "
+                          f"days in {window['start']} to {window['end']}, against your usual "
+                          f"target of {target}. This is a planning deviation, not evidence of "
+                          "physical readiness; it does not change your ongoing target.")
+    if source_text and correction_intent(source_text):
+        corrections = [r for r in training_store().corrections.history()
+                       if r["request_id"] == _correction_request_id(source_text)]
+        if corrections:
+            correction = corrections[-1]
+            clean += (f"\n\nWorkout correction saved: {correction['target']['exercise']}, "
+                      f"{correction['original_value']} → {correction['corrected_value']} reps "
+                      "(user-reported; original Garmin data are preserved separately).")
+        else:
+            clean += ("\n\nNo workout correction was saved: the activity, exercise and set "
+                      "need to be identified unambiguously.")
     saved = [r for r in receipts if r.get("saved")]
     if saved:
         if PROGRAM_ENABLED:
@@ -1818,11 +1969,9 @@ def generate_qa(question):
     prompt, snap = _assemble(QA_PROMPT_FILE, question=question, include_history=True)
     if isinstance(snap, dict) and "__error__" in snap:
         return None, snap
-    require_plan = bool(re.search(
-        r"\b(?:give|recommend|prescribe|plan)\b.{0,60}\b(?:workout|session|routine)\b",
-        question, re.IGNORECASE | re.DOTALL))
+    require_plan = _qa_plan_scope(question)
     text = _generate_checked(prompt, source_text=question,
-                             require_plan="any" if require_plan else False)
+                             require_plan=require_plan, show_schedule=bool(require_plan))
     if text:
         append_history("user", question)
         append_history("agbot", text)
@@ -1915,7 +2064,10 @@ def generate_debrief(activities):
                   "plan note the pivot supportively - never ask 'is that all?' after one part")
     else:
         header = "JUST_FINISHED_ACTIVITY"
-    parts.append("\n\n" + header + ":\n" + json.dumps(activities, indent=2, default=str))
+    training_store().record_activities(activities)
+    effective = training_store().corrections.apply(activities)
+    parts.append("\n\n" + header + ":\n" + json.dumps(
+        compact_workouts(effective, full_chronology=True), separators=(",", ":"), default=str))
     extras_all = {}
     for a in activities:
         ex = garmin_coach.activity_extras(a.get("activity_id"))
@@ -1924,10 +2076,10 @@ def generate_debrief(activities):
     if extras_all:
         parts.append("\n\nACTIVITY_EXTRAS (per activity; time-in-HR-zone minutes; weather if "
                      "outdoor):\n" + json.dumps(extras_all, indent=2, default=str))
-    training_store().record_activities(activities)
-    text = _generate_checked("".join(parts))
+    text = _generate_checked("".join(parts), show_schedule=True)
     if text:
-        append_history("agbot", "[post-workout debrief] " + text)
+        append_history("agbot", "[post-workout debrief] " + text,
+                       activity_ids=[a["activity_id"] for a in activities if a.get("activity_id")])
     return text
 
 

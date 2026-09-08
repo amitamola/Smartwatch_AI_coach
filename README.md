@@ -176,8 +176,10 @@ working kg/lb/watt targets. Those stay in dated daily prescriptions so newer
 feedback cannot be overridden by an old multi-week target.
 
 Daily prescriptions use the saved templates and revision, or explicitly explain a
-scope/safety/equipment adjustment. The known intentional-training day budget is
-checked across rolling seven-day windows. Templates are options, not extra weekly
+scope/safety/equipment adjustment. Starting availability is a flexible frequency
+target, not a physiological ceiling. Rolling seven-day counts expose deviations;
+only explicit maximum-frequency statements impose hard scheduling limits.
+One-off class requests do not silently increase the ongoing target. Templates are options, not extra weekly
 sessions. Routine reviews require no user nudge, but honest effort and symptom
 feedback still matter: the bot cannot observe what a trainer beside you could.
 
@@ -188,6 +190,23 @@ retried after backoff. Copilot review generation, including one optional repair,
 shares a bounded `AGBOT_PROGRAM_REVIEW_TIMEOUT` budget (180 seconds by default);
 ordinary requests retain their existing timeout. This is structured coaching support, not a clinician or a
 guarantee of fitness outcomes. No model weights are trained on the user's data.
+
+The application owns the dated calendar and renders it once. Exercise clarifications
+can use a `SESSION_PATCH` to change one exact variant/prescription without replacing
+the rest of the day. Proposal provenance records the triggering request separately;
+a recommendation in response to the user is not automatically their consent.
+Ordinary coaching omits unverified legacy capability prose and uses source-backed
+reports plus observed sets. Garmin metric meanings are grounded in the linked
+device manual; output guards reject known unsupported recovery/effort claims.
+These guards are not a complete medical or semantic verification system.
+
+Explicit rep corrections are saved as source-linked user reports overlaid on the
+original Garmin sets, not replacements for measured data. The affected activity
+is refreshed without waiting for the normal set-cache expiry. Debrief references
+help identify the set; ambiguous reports ask for clarification rather than
+guessing. Weight corrections still require explicit unit/variant clarification.
+Positive exercise tolerance is stored separately from active symptoms, and
+administrative reclassification is not presented as clinical recovery.
 
 ## Persistence and limits
 

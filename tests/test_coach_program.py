@@ -630,6 +630,30 @@ class ProgramStoreTests(unittest.TestCase):
         with closing(sqlite3.connect(self.path)) as db:
             return db.execute("SELECT COUNT(*) FROM training_program_reviews").fetchone()[0]
 
+    def test_policy_review_request_survives_restart_and_failure_then_clears(self):
+        self.save()
+        self.store.request_review("policy_changed")
+        self.store.request_review("other_request")
+        restarted = ProgramStore(self.path)
+        context = restarted.context(TODAY, fingerprint="feedback-a")
+        self.assertTrue(context["review_due"])
+        self.assertEqual(context["due_reason"], "policy_changed")
+        self.assertIsNone(context["feedback_detected_on"])
+        failed = datetime.combine(TODAY, datetime.min.time()).replace(
+            hour=12, tzinfo=timezone.utc)
+        restarted.record_failure("Synthetic unavailable model", now=failed)
+        self.assertFalse(restarted.context(TODAY, now=failed)["review_due"])
+        retry = restarted.context(TODAY, now=failed + timedelta(minutes=31))
+        self.assertTrue(retry["review_due"])
+        self.assertEqual(retry["pending_review_reason"], "policy_changed")
+        self.sources["policy_version"] = 2
+        record = self.save(request_key="policy-v2")
+        self.assertEqual(record["revision"], 2)
+        updated = restarted.context(TODAY, fingerprint="feedback-a")
+        self.assertIsNone(updated["pending_review_reason"])
+        self.assertIsNone(updated["last_error"])
+        self.assertFalse(updated["review_due"])
+
     def test_initial_record_full_shape_and_weekly_cadence(self):
         initial = self.store.context(today=TODAY, fingerprint="feedback-a")
         self.assertTrue(initial["review_due"])
@@ -855,7 +879,7 @@ class ProgramStoreTests(unittest.TestCase):
             action="progress", evidence_refs=["activity:one", "activity:two", "memory:1"])
         record = self.save(review=review)
         text = render_program(record)
-        for expected in ("**Goal:**", "**Block:**", "up to 4 days/week", "Strength A",
+        for expected in ("**Goal:**", "**Block:**", "usually 4 days/week", "Strength A",
                          "not a promise", "Synthetic press", "Progress", "Retain the observed",
                          "Progression condition:", "**Recovery:**", "**Success signals:**",
                          "**Coverage / alternatives:**", "**Questions:**", record["next_review_date"]):
