@@ -2,7 +2,7 @@
 # Unofficial Garmin Connect client. Pulls curl_cffi / requests in automatically.
 # NOTE: the old `garth` auth library is deprecated and is NOT used by modern
 # garminconnect (>=0.3) — do not add it.
-garminconnect>=0.3.6
+garminconnect==0.3.6
 
 # IANA timezone database (zoneinfo data). Needed so the bot can resolve the user's real
 # Garmin-profile timezone on platforms without a system tz database (Windows, slim

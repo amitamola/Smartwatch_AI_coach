@@ -18,19 +18,23 @@ Exit codes for `should-brief`:
 import os
 import sys
 import json
+import copy
 import tempfile
 import argparse
 from datetime import date, timedelta, datetime, timezone
 from zoneinfo import ZoneInfo
 
 from garminconnect import Garmin
+import garmin_metrics as metrics
 
-STATE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state")
+STATE_DIR = os.path.join(os.environ.get("AGBOT_DATA_DIR", os.path.dirname(os.path.abspath(__file__))), "state")
 BRIEF_STATE = os.path.join(STATE_DIR, "last_brief_date.txt")
 SETS_CACHE = os.path.join(STATE_DIR, "exercise_sets_cache.json")
+METRICS_CACHE = os.path.join(STATE_DIR, "metrics_cache.json")
 # A recently-finished session can still be EDITED in Garmin Connect (fixing a
-# mis-detected exercise type, reps, etc). Within this many days we always refetch
-# its logged sets so corrections show up; older sessions are treated as immutable
+# mis-detected exercise type, reps, etc). Within this many days we refresh its
+# logged sets on a bounded TTL; explicit correction checks bypass that TTL.
+# Older sessions are treated as immutable
 # and served from the by-id cache.
 EDITABLE_DAYS = 3
 # A night is considered "logged" once at least this much sleep is recorded.
@@ -171,6 +175,7 @@ def _trim_activity(a):
         "avg_speed_mps": _round(a.get("averageSpeed"), 2),
     }
     out.update({k: v for k, v in extras.items() if v is not None})
+    out["classification"] = classify_activity(a)
     return out
 
 
@@ -212,55 +217,199 @@ def _epoch_ms_local(ms):
         return None
 
 
-# Activity types that are transport / commute or trivial - NOT a training session. A day whose
-# only activities are these (each below a genuine training load) counts as a REST day for the
-# streak, so an e-bike commute or a short walk doesn't inflate the consecutive-training count.
-_COMMUTE_TYPES = {"e_bike_fitness", "e_biking", "walking", "indoor_walking",
-                  "transition", "other"}
-_GENUINE_LOAD = 50.0  # a normally-commute activity carrying load this high still counts as training
+def _activity_labels():
+    try:
+        value = json.loads(os.environ.get("AGBOT_ACTIVITY_LABELS", "{}"))
+        return value if isinstance(value, dict) else {}
+    except (TypeError, ValueError):
+        return {}
+
+
+def classify_activity(a, labels=None):
+    """Public {classification, reason} contract shared by snapshots and training checks."""
+    return metrics.classify_activity(a, _activity_labels() if labels is None else labels)
 
 
 def _is_training_activity(a):
-    """True when an activity is a genuine training session (not a commute/stroll). A non-commute
-    type always counts; a commute type counts only if it carried real training load."""
-    t = ((a.get("activityType") or {}).get("typeKey") or "").lower()
-    if t not in _COMMUTE_TYPES:
-        return True
-    load = a.get("activityTrainingLoad")
-    return isinstance(load, (int, float)) and load >= _GENUINE_LOAD
+    return classify_activity(a)["classification"] == "intentional_training"
 
 
-def _training_rhythm(g, d_today):
-    """Consecutive training-day streak + most recent rest day, so the coach can PROACTIVELY
-    schedule rest instead of only resting on a RED-readiness day. A 'training day' = a day with
-    a genuine training activity (an e-bike commute or short walk does NOT count); a REST day has
-    none. The streak counts back from today (or from yesterday when nothing is logged yet)."""
-    acts = safe(lambda: g.get_activities(0, 50))
-    if not isinstance(acts, list) or not acts:
-        return None
-    active = set()
-    for a in acts:
-        if isinstance(a, dict) and _is_training_activity(a):
-            d = str(a.get("startTimeLocal", ""))[:10]
-            if d:
-                active.add(d)
-    if not active:
-        return None
-    cur = d_today
-    if cur.isoformat() not in active:  # no genuine training yet today -> start streak at yesterday
-        cur = cur - timedelta(days=1)
-    streak = 0
-    while cur.isoformat() in active:
-        streak += 1
-        cur = cur - timedelta(days=1)
-    last_rest = cur.isoformat()  # first non-training day walking back = most recent rest day
-    rest_last_7 = sum(1 for i in range(7)
-                      if (d_today - timedelta(days=i)).isoformat() not in active)
-    return {
-        "consecutive_training_days": streak,
-        "last_rest_day": last_rest,
-        "rest_days_last_7": rest_last_7,
+def _activity_history(g, start, end, page_size=50, max_pages=6):
+    """Bounded descending pagination. Missing days are only rest after proven coverage."""
+    rows, seen, all_dates = [], set(), []
+    complete, malformed, stop = False, False, "page_limit"
+    scanned = 0
+    for page in range(max_pages):
+        batch = safe(lambda: g.get_activities(page * page_size, page_size))
+        if not isinstance(batch, list):
+            stop = metrics.payload_status(batch)
+            break
+        scanned += len(batch)
+        dates, new = [], 0
+        for a in batch:
+            if not isinstance(a, dict):
+                malformed = True
+                continue
+            day = str(a.get("startTimeLocal") or "")[:10]
+            try:
+                date.fromisoformat(day)
+            except ValueError:
+                malformed = True
+                continue
+            dates.append(day)
+            key = str(a.get("activityId")) if a.get("activityId") is not None else json.dumps(a, sort_keys=True)
+            if key in seen:
+                continue
+            seen.add(key)
+            new += 1
+            if iso(start) <= day <= iso(end):
+                rows.append(a)
+        all_dates.extend(dates)
+        ordered = all_dates == sorted(all_dates, reverse=True)
+        if len(batch) < page_size:
+            complete, stop = True, "exhausted"
+            break
+        if dates and min(dates) < iso(start) and ordered:
+            complete, stop = True, "range_boundary"
+            break
+        if batch and not new:
+            stop = "repeated_page"
+            break
+    ordered = all_dates == sorted(all_dates, reverse=True)
+    complete = complete and not malformed and ordered
+    complete_from = iso(start) if complete else (
+        (date.fromisoformat(min(all_dates)) + timedelta(days=1)).isoformat()
+        if all_dates and ordered and not malformed else None)
+    if complete_from and complete_from > iso(end):
+        complete_from = None
+    coverage = {
+        "requested_from": iso(start), "requested_through": iso(end),
+        "returned": len(rows), "total": len(rows) if complete else None,
+        "omitted": 0 if complete else None, "unknown": not complete,
+        "complete": complete, "complete_from": max(iso(start), complete_from) if complete_from else None,
+        "complete_through": iso(end) if complete_from else None,
+        "stop_reason": stop, "pages_requested": page + 1, "rows_scanned": scanned,
+        "malformed_rows": malformed, "observed_order_descending": ordered,
     }
+    return rows, coverage
+
+
+def _training_rhythm(g, d_today, activities=None, coverage=None):
+    if activities is None:
+        activities, coverage = _activity_history(g, d_today - timedelta(days=28), d_today)
+    return metrics.training_rhythm(activities, d_today, coverage or {}, _activity_labels())
+
+
+def program_history(d_today=None, days=28, max_set_fetches=8, g=None):
+    """Bounded programme lookback, including workouts predating the local bot store."""
+    d_today = d_today or date.today()
+    if isinstance(days, bool) or not isinstance(days, int) or not 1 <= days <= 90:
+        raise ValueError("Programme history days must be between 1 and 90.")
+    if (isinstance(max_set_fetches, bool) or not isinstance(max_set_fetches, int)
+            or not 0 <= max_set_fetches <= 20):
+        raise ValueError("Programme set-fetch budget must be between 0 and 20.")
+    g = safe(client) if g is None else g
+    if isinstance(g, dict) and "__error__" in g:
+        return {"activities": [], "coverage": {
+            "complete": False, "unknown": True, "total": None,
+            "stop_reason": "history_client_unavailable",
+        }}
+    raw, coverage = _activity_history(g, d_today - timedelta(days=days), d_today)
+    activities = [_trim_activity(activity) for activity in raw]
+    cache = _load_sets_cache()
+    fetched = available = strength = 0
+    for activity in activities:
+        if "strength" not in str(activity.get("type") or "") or activity.get("activity_id") is None:
+            continue
+        strength += 1
+        metadata = {}
+        sets = _sets_for(g, activity["activity_id"], cache,
+                        refresh=_within_days(activity.get("start"), EDITABLE_DAYS),
+                        metadata=metadata, allow_fetch=fetched < max_set_fetches)
+        fetched += int(metadata.get("fetched", False))
+        activity["logged_sets_coverage"] = metadata
+        if sets:
+            activity["logged_sets"] = sets
+            available += 1
+    if fetched:
+        _save_sets_cache(cache)
+    coverage["strength_sets"] = {
+        "activities": strength, "with_available_or_cached_detail": available,
+        "without_detail": strength - available, "fetches": fetched,
+        "max_fetches": max_set_fetches,
+        "interpretation": "Per-activity freshness applies; missing or deferred detail is unknown.",
+    }
+    return {"activities": activities, "coverage": coverage}
+
+
+def _load_metric_cache():
+    # New optional caches are isolated only when an explicit data root is supplied.
+    if not os.environ.get("AGBOT_DATA_DIR"):
+        return {}
+    try:
+        with open(METRICS_CACHE, encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_metric_cache(cache):
+    if os.environ.get("AGBOT_DATA_DIR"):
+        try:
+            _atomic_write(METRICS_CACHE, json.dumps(cache, ensure_ascii=False))
+        except OSError:
+            pass
+
+
+def _cached_metric(key, loader, ttl_hours=24, refresh=False, context=None):
+    """Cache normalized aggregates only; retain last good values after empty/error refresh."""
+    cache = _load_metric_cache()
+    entry = cache.get(key) or {}
+    if not isinstance(entry, dict):
+        entry = {}
+    now = datetime.now(timezone.utc)
+    try:
+        age = (now - datetime.fromisoformat(entry["fetched_at"])).total_seconds() / 3600
+    except (KeyError, TypeError, ValueError):
+        age = None
+    current = (entry.get("schema_version") == metrics.SCHEMA_VERSION
+               and isinstance(entry.get("data"), dict)
+               and (context is None or entry.get("context") == context))
+    if current and not refresh and age is not None and 0 <= age < ttl_hours:
+        result = copy.deepcopy(entry["data"])
+        _update_metric_ages(result, now.date())
+        result["cache"] = {"status": "fresh", "fetched_at": entry["fetched_at"], "age_hours": round(age, 2)}
+        return result
+    result = loader()
+    if result.get("status") == "available":
+        cache[key] = {"schema_version": metrics.SCHEMA_VERSION, "fetched_at": now.isoformat(),
+                      "context": context, "data": result}
+        _save_metric_cache(cache)
+        result["cache"] = {"status": "fresh", "fetched_at": now.isoformat(), "age_hours": 0}
+    elif (isinstance(entry.get("data"), dict) and entry["data"]
+          and (context is None or entry.get("context") is None or entry["context"] <= context)):
+        status = result.get("status")
+        result = copy.deepcopy(entry["data"])
+        _update_metric_ages(result, now.date())
+        result["status"] = "stale"
+        result["cache"] = {"status": "stale_fallback", "fetched_at": entry.get("fetched_at"),
+                           "age_hours": round(age, 2) if age is not None else None,
+                           "refresh_status": status, "schema_upgrade_pending": not current}
+    else:
+        result["cache"] = {"status": "miss", "refresh_status": result.get("status")}
+    return result
+
+
+def _update_metric_ages(value, today):
+    if isinstance(value, dict):
+        if "as_of" in value:
+            value.update(metrics.freshness(value["as_of"], today))
+        for child in value.values():
+            _update_metric_ages(child, today)
+    elif isinstance(value, list):
+        for child in value:
+            _update_metric_ages(child, today)
 
 
 def build_snapshot(d_today=None):
@@ -496,29 +645,39 @@ def build_snapshot(d_today=None):
                 "feedback": lb.get("trainingBalanceFeedbackPhrase"),
             }
 
-    activities = safe(lambda: g.get_activities_by_date(iso(week_start), iso(d_today)))
-    if isinstance(activities, list):
-        activities = [_trim_activity(a) for a in activities[:15]]
-        # Attach logged sets/reps/weights to the most recent strength sessions so
-        # workout recommendations can see muscle groups trained and avoid stacking.
-        # Cached by activity_id, BUT recent sessions may still be edited in Garmin
-        # Connect, so those are refetched every build (see EDITABLE_DAYS).
-        cache = _load_sets_cache()
-        changed = False
-        n_strength = 0
-        for a in activities:
-            if n_strength >= 3:
-                break
-            if a.get("type") and "strength" in a["type"] and a.get("activity_id") is not None:
-                had = str(a["activity_id"]) in cache
-                recent = _within_days(a.get("start"), EDITABLE_DAYS)
-                logged = _sets_for(g, a["activity_id"], cache, refresh=recent)
-                changed = changed or (not had) or recent
-                if logged:
-                    a["logged_sets"] = logged
-                n_strength += 1
-        if changed:
-            _save_sets_cache(cache)
+    history, history_coverage = _activity_history(g, d_today - timedelta(days=28), d_today)
+    activities = [_trim_activity(a) for a in history
+                  if str(a.get("startTimeLocal") or "")[:10] >= iso(week_start)]
+    activities_coverage = dict(history_coverage, requested_from=iso(week_start), returned=len(activities))
+    week_complete = (history_coverage.get("complete_from") is not None
+                     and history_coverage["complete_from"] <= iso(week_start))
+    activities_coverage.update(complete=week_complete, unknown=not week_complete,
+                               total=len(activities) if week_complete else None,
+                               omitted=0 if week_complete else None)
+    cache = _load_sets_cache()
+    refresh_budget = 8
+    strength_total = strength_available = strength_stale = 0
+    for a in activities:
+        if "strength" not in (a.get("type") or "") or a.get("activity_id") is None:
+            continue
+        strength_total += 1
+        meta = {}
+        logged = _sets_for(g, a["activity_id"], cache,
+                           refresh=_within_days(a.get("start"), EDITABLE_DAYS),
+                           metadata=meta, allow_fetch=refresh_budget > 0)
+        refresh_budget -= int(meta.get("fetched", False))
+        a["logged_sets_coverage"] = meta
+        if logged:
+            a["logged_sets"] = logged
+            strength_available += 1
+            strength_stale += int(meta.get("status") == "stale")
+    if refresh_budget < 8:
+        _save_sets_cache(cache)
+    activities_coverage["strength_sets"] = {
+        "total": strength_total, "returned": strength_available,
+        "unavailable_or_deferred": strength_total - strength_available,
+        "stale": strength_stale, "max_refresh_calls": 8,
+    }
 
     body_battery = safe(lambda: g.get_body_battery(iso(d_yest), iso(d_today)))
     bb = None
@@ -818,13 +977,8 @@ def build_snapshot(d_today=None):
         if profile_config:
             _set_local_tz(profile_config.get("timezone"))
 
-    # ---- Daily calorie budget (deterministic fat-loss target) -----------------------
-    # The user logs food in the BOT, not Garmin, so Garmin's remaining_kcal is bogus (it
-    # ignores their intake). Instead compute a real daily intake TARGET from their own body
-    # stats: Mifflin-St Jeor BMR x a Harris-Benedict activity multiplier (banded off
-    # Garmin's 1-10 activityLevel) = maintenance; minus a BMI-scaled fat-loss deficit =
-    # target_kcal. The model then subtracts what they have LOGGED today to show calories
-    # remaining. Reuses the already-fetched user profile, so no extra API call.
+    # Maintenance is an estimate, not an intake prescription. Targets require an explicit
+    # nutrition goal; food logged outside Garmin must not be ignored in a remaining budget.
     calorie_budget = None
     try:
         _sex = (_ud.get("gender") or "").upper()
@@ -848,26 +1002,36 @@ def build_snapshot(d_today=None):
                 _af = (1.2 if _al <= 2 else 1.375 if _al <= 4 else 1.55 if _al <= 6
                        else 1.725 if _al <= 8 else 1.9)
             else:
-                _af = 1.55  # assume moderately active if Garmin gives no activityLevel
+                _af = 1.55  # provisional estimate, disclosed below rather than asserted as observed
             _maint = _bmr * _af
             _bmi_cat = ("underweight" if _bmi < 18.5 else "normal" if _bmi < 25
                         else "overweight" if _bmi < 30 else "obese")
-            _band_deficit = (300 if _bmi < 23 else 400 if _bmi < 25 else 500 if _bmi < 30 else 600)
-            # Cap the deficit at ~0.5% bodyweight/week - the muscle-preserving recomp ceiling
-            # (0.5% x kg x 7700 kcal/kg per week / 7 days ~= 5.5 x kg kcal/day). Protects lean
-            # mass so a fat-loss phase stays a recomp, not a muscle-shedding crash cut.
-            _deficit_cap = round(0.005 * _wt_kg * 7700 / 7)
-            _deficit = min(_band_deficit, _deficit_cap)
-            # Never prescribe below BMR or a hard 1500 floor - no crash dieting (profile rule).
-            _target = max(round(_maint - _deficit), round(_bmr), 1500)
-            # Protein: in a deficit + resistance training, protein is what decides whether the
-            # weight lost is fat or muscle, so it is anchored to bodyweight rather than left to
-            # the model to improvise. 2.2 g/kg == the "1 g per POUND" figure - the top of the
-            # evidence-based range for a lifter cutting; 1.8 g/kg is the floor to stay above.
-            _protein_target = round(2.2 * _wt_kg)
-            _protein_floor = round(1.8 * _wt_kg)
-            _protein_kcal = _protein_target * 4
+            _requested_goal = os.environ.get("AGBOT_NUTRITION_GOAL", "unspecified").strip().lower()
+            _goal = _requested_goal if _requested_goal in {"maintain", "fat_loss"} else "unspecified"
+            _target = _deficit = _deficit_cap = None
+            _protein_target = _protein_floor = _protein_kcal = None
+            _target_status = "not_configured" if _requested_goal in {"", "unspecified"} else "unsupported_goal"
+            _protein_basis = "No protein target configured; do not infer a mandatory intake from maintenance."
+            if _goal == "maintain":
+                _target, _deficit = round(_maint), 0
+                _target_status = "configured_estimate"
+            elif _goal == "fat_loss":
+                if _cb_age < 18 or _bmi < 18.5:
+                    _target_status = "not_appropriate_for_automatic_fat_loss_target"
+                else:
+                    _target_status = "configured_estimate"
+                    _band_deficit = (300 if _bmi < 23 else 400 if _bmi < 25 else 500 if _bmi < 30 else 600)
+                    _deficit_cap = round(0.005 * _wt_kg * 7700 / 7)
+                    _deficit = min(_band_deficit, _deficit_cap)
+                    _target = max(round(_maint - _deficit), round(_bmr), 1500)
+                    _protein_target, _protein_floor = round(2.2 * _wt_kg), round(1.8 * _wt_kg)
+                    _protein_kcal = _protein_target * 4
+                    _protein_basis = ("Explicit fat-loss goal: provisional resistance-training protein estimate "
+                                      "2.2 g/kg, lower reference 1.8 g/kg; individual needs may differ.")
             calorie_budget = {
+                "nutrition_goal": _goal,
+                "goal_explicit": _goal != "unspecified",
+                "target_status": _target_status,
                 "weight_kg": round(_wt_kg, 1),
                 "height_cm": round(_ht_cm),
                 "age": _cb_age,
@@ -875,20 +1039,22 @@ def build_snapshot(d_today=None):
                 "bmi_category": _bmi_cat,
                 "bmr_kcal": round(_bmr),
                 "activity_factor": _af,
+                "activity_factor_source": ("garmin_activity_level_band" if isinstance(_al, (int, float))
+                                           else "provisional_default_not_observed"),
                 "maintenance_kcal": round(_maint),
+                "maintenance_is_estimate": True,
                 "deficit_kcal": _deficit,
                 "deficit_cap_kcal": _deficit_cap,
                 "target_kcal": _target,
                 "protein_target_g": _protein_target,
                 "protein_floor_g": _protein_floor,
                 "protein_kcal": _protein_kcal,
-                "protein_basis": "2.2 g/kg bodyweight (= ~1 g per pound), floor 1.8 g/kg - the "
-                                 "muscle-sparing range for training in a calorie deficit; "
-                                 "recompute from weight, never quote a fixed number.",
-                "basis": "Mifflin-St Jeor BMR x activity factor, minus a fat-loss deficit "
-                         "(BMI-scaled, then capped at ~0.5% bodyweight/week to preserve muscle); "
-                         "food is logged in the bot (not Garmin), so subtract logged intake "
-                         "from target_kcal for calories remaining.",
+                "protein_basis": _protein_basis,
+                "basis": ("Mifflin-St Jeor BMR x activity factor estimates maintenance, not measured expenditure. "
+                          "Only an explicit maintain/fat_loss goal enables an intake target. Fat-loss estimates "
+                          "use a BMI-scaled deficit capped at ~0.5% bodyweight/week, with BMR/1500 kcal guards. "
+                          "No remaining-calorie budget exists when target_kcal is null; otherwise account for "
+                          "all logged intake. These estimates are not a binding diet prescription."),
             }
     except Exception:  # noqa: BLE001
         calorie_budget = None
@@ -946,7 +1112,8 @@ def build_snapshot(d_today=None):
         "hrv": hrv,
         "training_status": train_status,
         "recent_activities_7d": activities,
-        "training_rhythm": _training_rhythm(g, d_today),
+        "recent_activities_7d_coverage": activities_coverage,
+        "training_rhythm": _training_rhythm(g, d_today, history, history_coverage),
         "wellness_today": wellness,
         "strain_yesterday": strain_yesterday,
         "body_battery_current": bb_current,
@@ -980,27 +1147,19 @@ def latest_activity():
     return None
 
 
-def trained_today(min_duration_s=600):
-    """True if Garmin already shows at least one activity that STARTED today and lasted
-    >= min_duration_s (default 10 min). One cheap fetch of the few most recent activities
-    (they return newest-first, so today's are at the top). Lets the bridge stop the
-    'did you exercise?' check-ins once a real workout is already logged - e.g. a commute
-    ride or gym session. Fails OPEN (returns False) on any login/API error so the check-in
-    still asks rather than silently going quiet."""
+def trained_today(min_duration_s=None):
+    """Compatibility boolean using classify_activity; errors/unknown return False.
+
+    min_duration_s is retained for call compatibility, not an all-sports threshold.
+    Coverage-aware callers should consume snapshot.training_rhythm.trained_today.
+    """
     try:
         g = client()
     except Exception:  # noqa: BLE001
         return False
-    acts = safe(lambda: g.get_activities(0, 8))
-    if not isinstance(acts, list):
-        return False
-    today = date.today().isoformat()
-    for a in acts:
-        if str(a.get("startTimeLocal") or "")[:10] != today:
-            continue
-        if (a.get("duration") or 0) >= min_duration_s:
-            return True
-    return False
+    today = datetime.now(_local_zone()).date()
+    acts, _coverage = _activity_history(g, today, today, max_pages=2)
+    return any(_is_training_activity(a) for a in acts)
 
 
 def hydration_today(d_today=None):
@@ -1177,17 +1336,18 @@ def session_block(gap_secs=3600, lookback=15):
     return [r[2] for r in block]
 
 
-def activity_extras(activity_id):
+def activity_extras(activity_id, g=None, refresh=False, include_details=True):
     """Per-activity enrichment for the post-workout debrief: time-in-HR-zone and,
     for outdoor sessions, the weather at activity time. Weather comes back all-null
     for indoor activities (temp is None) and is skipped."""
     if activity_id is None:
         return {}
     try:
-        g = client()
+        g = g or client()
     except Exception as exc:  # noqa: BLE001
         return {"__error__": f"login failed: {exc}"}
-    out = {}
+    out = {"metrics": activity_detail_metrics(activity_id, g=g, refresh=refresh,
+                                             include_details=include_details)}
     hz = safe(lambda: g.get_activity_hr_in_timezones(activity_id))
     if isinstance(hz, list):
         zones = []
@@ -1212,6 +1372,28 @@ def activity_extras(activity_id):
             "conditions": wtype.get("desc") if isinstance(wtype, dict) else None,
         }
     return out
+
+
+def activity_detail_metrics(activity_id, g=None, refresh=False, include_details=True):
+    """On-demand aggregate enrichment, cached 24h; never expose tracks or chart samples."""
+    try:
+        g = g or client()
+    except Exception as exc:
+        return {"status": "error", "__error__": type(exc).__name__}
+
+    def load():
+        summary = safe(lambda: g.get_activity(activity_id))
+        details = (safe(lambda: g.get_activity_details(activity_id, maxchart=100, maxpoly=0))
+                   if include_details else None)
+        result = metrics.activity_metrics(summary, details)
+        if (result["status"] == "available" and include_details
+                and metrics.payload_status(details) in {"error", "not_supported", "unavailable"}):
+            result["status"] = "partial"
+        return result
+
+    return _cached_metric(
+        f"activity:{activity_id}:details:{include_details}:v{metrics.ACTIVITY_METRICS_VERSION}",
+        load, refresh=refresh)
 
 
 def build_weekly(days=7, d_today=None):
@@ -1261,9 +1443,10 @@ def build_weekly(days=7, d_today=None):
                 "body_fat_pct": w.get("bodyFat"),
             })
     out["weight_series"] = wseries
-    acts = safe(lambda: g.get_activities_by_date(iso(start), iso(d_today)))
-    if isinstance(acts, list):
-        out["activities"] = [_trim_activity(a) for a in acts[:25]]
+    acts, coverage = _activity_history(g, start, d_today)
+    out["activities"] = [_trim_activity(a) for a in acts]
+    out["activities_coverage"] = coverage
+    out["training_rhythm"] = _training_rhythm(g, d_today, acts, coverage)
     status = safe(lambda: g.get_training_status(iso(d_today)))
     if isinstance(status, dict) and "__error__" not in status:
         mr = status.get("mostRecentTrainingStatus") or {}
@@ -1341,8 +1524,8 @@ def _format_prs(pr_list):
     return out
 
 
-def fitness_profile(d_today=None):
-    """Slow-changing performance metrics the Epix Pro computes but the daily
+def fitness_profile(d_today=None, g=None, refresh=False):
+    """Slow-changing performance metrics compatible Garmin devices compute but the daily
     snapshot skips: fitness age, race predictions, endurance & hill score,
     VO2max, lactate-threshold HR, cycling FTP, weekly intensity minutes.
     Meant to be cached ~daily by the bot, not fetched on every message."""
@@ -1351,12 +1534,12 @@ def fitness_profile(d_today=None):
     elif isinstance(d_today, str):
         d_today = date.fromisoformat(d_today)
     try:
-        g = client()
+        g = g or client()
     except Exception as exc:  # noqa: BLE001
         return {"__error__": f"login failed: {exc}"}
     today = iso(d_today)
     week = iso(d_today - timedelta(days=7))
-    prof = {"generated_at": datetime.now().isoformat(timespec="seconds")}
+    prof = {"schema_version": 2, "generated_at": datetime.now().isoformat(timespec="seconds")}
 
     fa = safe(lambda: g.get_fitnessage_data(today))
     if isinstance(fa, dict) and "__error__" not in fa:
@@ -1377,40 +1560,25 @@ def fitness_profile(d_today=None):
             "marathon": _fmt_secs(rp.get("timeMarathon")),
         }
 
-    es = safe(lambda: g.get_endurance_score(week, today))
-    dto = (es.get("enduranceScoreDTO") or {}) if isinstance(es, dict) else {}
-    if dto:
-        score = dto.get("overallScore")
-        # Classification thresholds come back with the payload; label by the
-        # highest band the score clears (below Intermediate == Novice).
-        bands = [
-            (dto.get("classificationLowerLimitIntermediate"), "Intermediate"),
-            (dto.get("classificationLowerLimitTrained"), "Trained"),
-            (dto.get("classificationLowerLimitWellTrained"), "Well Trained"),
-            (dto.get("classificationLowerLimitExpert"), "Expert"),
-            (dto.get("classificationLowerLimitSuperior"), "Superior"),
-            (dto.get("classificationLowerLimitElite"), "Elite"),
-        ]
-        label = "Novice"
-        for lim, name in bands:
-            if isinstance(lim, (int, float)) and isinstance(score, (int, float)) and score >= lim:
-                label = name
-        prof["endurance_score"] = {"score": score, "level": label}
+    history_start = iso(d_today - timedelta(days=28))
+    for kind in ("hill", "endurance"):
+        def load_score(kind=kind):
+            daily = safe(lambda: getattr(g, "get_" + kind + "_score")(today))
+            history = safe(lambda: getattr(g, "get_" + kind + "_score")(history_start, today))
+            return metrics.score_metric(daily, kind, d_today, history)
+        prof[kind + "_score"] = _cached_metric(
+            f"{kind}_score", load_score, refresh=refresh, context=today)
 
-    hs = safe(lambda: g.get_hill_score(week, today))
-    hlist = (hs.get("hillScoreDTOList") or []) if isinstance(hs, dict) else []
-    if hlist:
-        last = hlist[-1]
-        prof["hill_score"] = {
-            "score": last.get("overallScore"),
-            "strength": last.get("strengthScore"),
-            "endurance": last.get("enduranceScore"),
-        }
+    def load_lactate():
+        latest = safe(lambda: g.get_lactate_threshold())
+        history = safe(lambda: g.get_lactate_threshold(latest=False, start_date=history_start, end_date=today))
+        return metrics.lactate_metric(latest, d_today, history)
 
-    lt = safe(lambda: g.get_lactate_threshold())
-    shr = (lt.get("speed_and_heart_rate") or {}) if isinstance(lt, dict) else {}
-    if shr.get("heartRate"):
-        prof["lactate_threshold_hr"] = shr.get("heartRate")
+    prof["running_lactate_threshold"] = _cached_metric(
+        "running_lactate_threshold", load_lactate, refresh=refresh, context=today)
+    shr = prof["running_lactate_threshold"].get("measurements", {}).get("heart_rate_bpm", {})
+    if shr.get("value") is not None:
+        prof["lactate_threshold_hr"] = shr["value"]
 
     ftp = safe(lambda: g.get_cycling_ftp())
     if isinstance(ftp, dict) and ftp.get("functionalThresholdPower"):
@@ -1437,27 +1605,73 @@ def fitness_profile(d_today=None):
 
 
 def _parse_exercise_sets(xs):
-    """Aggregate a raw exerciseSets payload into a compact per-exercise summary."""
-    if not isinstance(xs, dict):
+    """Backward-compatible grouped summaries; first row owns the complete set_sequence.
+
+    `order` means first appearance, not chronology. set_sequence preserves every ACTIVE,
+    REST and unknown set, sorted when all timestamps parse; set_indices indexes it.
+    """
+    if not isinstance(xs, dict) or "__error__" in xs:
         return None
+    unit_policy = _strength_weight_policy()
     sets = xs.get("exerciseSets") or []
-    agg, order = {}, []
-    for s in sets:
+    if not isinstance(sets, list):
+        return None
+    indexed = list(enumerate(sets))
+    chronology = "api_order_timestamps_incomplete"
+    try:
+        def start_epoch(pair):
+            dt = datetime.fromisoformat(pair[1]["startTime"].replace("Z", "+00:00"))
+            return dt.replace(tzinfo=dt.tzinfo or timezone.utc).timestamp()
+        indexed.sort(key=start_epoch)
+        chronology = "chronological_start_time"
+    except (ValueError, TypeError, KeyError, AttributeError):
+        indexed = list(enumerate(sets))
+    agg, order, sequence = {}, [], []
+    for index, (source_index, s) in enumerate(indexed):
+        if not isinstance(s, dict):
+            sequence.append({"sequence_index": index, "source_index": source_index, "status": "invalid_set"})
+            continue
+        exs = [e for e in (s.get("exercises") or []) if isinstance(e, dict)]
+        name = ((exs[0].get("name") or exs[0].get("category")) if exs else None) or "UNKNOWN"
+        unit = s.get("weightUnit")
+        if unit is None or unit == "":
+            unit = xs.get("weightUnit")
+        unit_key = unit.get("key") if isinstance(unit, dict) else unit
+        missing_unit = unit is None or unit == ""
+        effective_unit = unit_policy["unit"] if missing_unit else unit_key
+        wt = s.get("weight")
+        valid_weight = metrics.number(wt) and wt >= 0
+        scale = {"g": .001, "gram": .001, "grams": .001, "kg": 1, "kilogram": 1,
+                 "kilograms": 1, "lb": .45359237, "lbs": .45359237, "pound": .45359237}.get(
+                     str(effective_unit).lower())
+        configured = missing_unit and scale is not None
+        kg = round(wt * scale, 3) if valid_weight and scale is not None else None
+        detail = {
+            "sequence_index": index, "source_index": source_index, "set_type": s.get("setType"),
+            "start_time": s.get("startTime"), "duration_s": s.get("duration"),
+            "exercise": name, "exercises": [{k: e[k] for k in ("category", "name", "probability") if k in e} for e in exs],
+            "reps": s.get("repetitionCount"), "weight_raw": wt, "weight_unit": unit,
+            "effective_weight_unit": effective_unit,
+            "weight_kg": kg, "weight_status": "available" if valid_weight else "missing_or_sentinel",
+            "weight_unit_status": "configured" if configured else "verified" if scale is not None else "unknown",
+            "weight_unit_source": ("explicit_private_configuration" if configured else
+                                   "payload" if scale is not None else "unknown"),
+            "weight_unit_provenance": unit_policy["provenance"] if configured else None,
+            "workout_step_index": s.get("wktStepIndex"), "message_index": s.get("messageIndex"),
+        }
+        sequence.append(detail)
         if s.get("setType") != "ACTIVE":
             continue
-        exs = s.get("exercises") or []
-        name = (exs[0].get("category") if exs else None) or "UNKNOWN"
         if name not in agg:
-            agg[name] = {"sets": 0, "reps": [], "top_kg": None}
+            agg[name] = {"sets": 0, "reps": [], "top_kg": None, "indices": []}
             order.append(name)
         a = agg[name]
         a["sets"] += 1
+        a["indices"].append(index)
         reps = s.get("repetitionCount")
-        if isinstance(reps, (int, float)):
+        if metrics.number(reps) and reps >= 0:
             a["reps"].append(int(reps))
-        wt = s.get("weight")  # grams
-        if isinstance(wt, (int, float)) and wt > 0:
-            kg = round(wt / 1000, 1)
+        if kg is not None:
             a["top_kg"] = kg if a["top_kg"] is None else max(a["top_kg"], kg)
     out = []
     for name in order:
@@ -1470,14 +1684,35 @@ def _parse_exercise_sets(xs):
             "reps": (f"{min(reps)}-{max(reps)}" if reps and min(reps) != max(reps)
                      else (str(reps[0]) if reps else None)),
             "top_weight_kg": a["top_kg"],
+            "set_indices": a["indices"],
         })
+    if not out and sequence:
+        out = [{"order": 1, "exercise": "No active sets", "sets": 0, "reps": None,
+                "top_weight_kg": None, "set_indices": []}]
+    if out:
+        out[0]["set_sequence"] = sequence
+        out[0]["sequence_order"] = chronology
     return out or None
+
+
+def _strength_weight_policy():
+    """Only an explicit account-scoped setting may supply a missing JSON weight unit."""
+    supplied = os.environ.get("AGBOT_STRENGTH_WEIGHT_UNIT", "").strip().lower()
+    unit = {"g": "g", "gram": "g", "grams": "g", "kg": "kg", "kilogram": "kg", "kilograms": "kg",
+            "lb": "lb", "lbs": "lb", "pound": "lb"}.get(supplied)
+    return {
+        "unit": unit,
+        "provenance": (os.environ.get("AGBOT_STRENGTH_WEIGHT_UNIT_PROVENANCE", "").strip()
+                       or "Explicit private configuration; applicability must be verified for this account")
+                      if unit is not None else None,
+    }
 
 
 def _load_sets_cache():
     try:
         with open(SETS_CACHE, "r", encoding="utf-8") as fh:
-            return json.load(fh)
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
     except Exception:  # noqa: BLE001
         return {}
 
@@ -1499,29 +1734,109 @@ def _within_days(start_local, days):
     return 0 <= (date.today() - d).days <= days
 
 
-def _sets_for(g, activity_id, cache=None, refresh=False):
-    """Logged sets for one activity. Cached by activity_id, but a recently-finished
-    session can still be edited in Garmin Connect, so callers pass refresh=True to
-    bypass the cached value and pull fresh (the cache is then updated). A transient
-    empty/failed refetch never clobbers a previously-good cached value."""
-    key = str(activity_id)
-    if cache is not None and key in cache and not refresh:
-        return cache[key]
-    xs = safe(lambda: g.get_activity_exercise_sets(activity_id))
-    parsed = _parse_exercise_sets(xs) if isinstance(xs, dict) and "__error__" not in xs else None
-    if cache is not None and (parsed is not None or key not in cache):
-        cache[key] = parsed  # store misses too (once), so we don't refetch nothing forever
+def _set_source_values(summaries):
+    """Compare source measurements, not freshness or configured unit conversion."""
+    sequence = (summaries or [{}])[0].get("set_sequence")
+    if not isinstance(sequence, list) or not sequence:
+        return None
+    fields = ("source_index", "set_type", "start_time", "duration_s", "exercise",
+              "exercises", "reps", "weight_raw", "weight_unit", "workout_step_index",
+              "message_index")
+    return [{key: row.get(key) for key in fields} for row in sequence]
+
+
+def _sets_for(g, activity_id, cache=None, refresh=False, metadata=None, allow_fetch=True,
+              force_refresh=False):
+    """Return cached sets with provenance.
+
+    refresh=True permits a six-hour TTL for editable workouts. force_refresh=True
+    always requests this activity from Garmin, unless allow_fetch=False explicitly
+    forbids network access. Empty/failed responses retain the last good source.
+    data_changed is None when comparison is unavailable or no refresh succeeded.
+    """
+    key, now = str(activity_id), datetime.now(timezone.utc)
+    unit_policy = _strength_weight_policy()
+    entry = (cache or {}).get(key)
+    legacy = isinstance(entry, list)
+    previous = entry if legacy else entry.get("summaries") if isinstance(entry, dict) else None
+    current = (isinstance(entry, dict) and entry.get("schema_version") == metrics.SCHEMA_VERSION
+               and entry.get("weight_unit_policy") == unit_policy)
+    fetched_at = entry.get("fetched_at") if isinstance(entry, dict) else None
+    try:
+        age = (now - datetime.fromisoformat(fetched_at)).total_seconds() / 3600
+    except (ValueError, TypeError):
+        age = None
+    meta = {"status": "unavailable", "fetched": False, "fetched_at": fetched_at,
+            "force_refresh": bool(force_refresh), "data_changed": None,
+            "refresh_status": "not_requested",
+            "cache_age_hours": round(age, 2) if age is not None else None,
+            "schema_version": metrics.SCHEMA_VERSION, "sequence_complete": current and bool(previous),
+            "weight_unit_policy": entry.get("weight_unit_policy") if isinstance(entry, dict) else None,
+            "requested_weight_unit_policy": unit_policy, "weight_unit_policy_current": current}
+    parsed = None
+    # Recently editable entries have a short TTL, not one API request per chat message.
+    cache_fresh = (not force_refresh and current
+                   and (not refresh or (age is not None and 0 <= age < 6)))
+    if previous and cache_fresh:
+        parsed = previous
+        meta["status"] = "available"
+    elif not allow_fetch:
+        parsed = previous
+        meta.update(status="stale" if previous else "deferred", refresh_status="budget_deferred")
+    else:
+        xs = safe(lambda: g.get_activity_exercise_sets(activity_id))
+        parsed = _parse_exercise_sets(xs)
+        meta["fetched"] = True
+        status = metrics.payload_status(xs)
+        if parsed:
+            fetched_at = now.isoformat()
+            before, after = _set_source_values(previous), _set_source_values(parsed)
+            changed = before != after if before is not None and after is not None else None
+            meta.update(status="available", fetched_at=fetched_at, cache_age_hours=0, sequence_complete=True,
+                        weight_unit_policy=unit_policy, weight_unit_policy_current=True,
+                        data_changed=changed,
+                        refresh_status=("changed" if changed else "unchanged")
+                        if changed is not None else "fetched_without_comparable_baseline")
+            if cache is not None:
+                cache[key] = {"schema_version": metrics.SCHEMA_VERSION,
+                              "fetched_at": fetched_at, "summaries": parsed,
+                              "weight_unit_policy": unit_policy}
+        else:
+            meta.update(status="stale" if previous else (status if status != "available" else "unavailable"),
+                        refresh_status=status if status != "available" else "unavailable",
+                        schema_upgrade_pending=not current)
+            parsed = previous
+    if metadata is not None:
+        metadata.update(meta)
+    if parsed:
+        # Annotate a copy; never contaminate the persisted last-good source with fallback state.
+        parsed = copy.deepcopy(parsed)
+        parsed[0]["data_freshness"] = dict(meta)
     return parsed
 
 
-def exercise_sets(activity_id):
+def exercise_sets(activity_id, force_refresh=False, metadata=None):
     """Per-exercise set summary for a strength activity (exercise, #sets, rep
-    range, top weight in kg). None when the activity logs no sets."""
+    range, top weight in kg). None when the activity logs no sets.
+
+    force_refresh checks this activity even inside the six-hour cache TTL. metadata
+    receives refresh/fallback provenance and data_changed (True, False, or unknown).
+    """
+    login_error = None
     try:
         g = client()
     except Exception as exc:  # noqa: BLE001
-        return {"__error__": f"login failed: {exc}"}
-    return _sets_for(g, activity_id)
+        # Login failures follow the same last-good fallback contract as endpoint failures.
+        class UnavailableClient:
+            def get_activity_exercise_sets(self, _activity_id):
+                return {"__error__": f"login failed: {login_error}"}
+        login_error = str(exc)
+        g = UnavailableClient()
+    cache = _load_sets_cache()
+    out = _sets_for(g, activity_id, cache, refresh=True, force_refresh=force_refresh,
+                    metadata=metadata)
+    _save_sets_cache(cache)
+    return out if out or not login_error else {"__error__": f"login failed: {login_error}"}
 
 
 def cmd_dump(args):

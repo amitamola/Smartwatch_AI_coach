@@ -1,417 +1,299 @@
-# 🏃 Smartwatch AI coach
+# Smartwatch AI coach
 
-A personal, self-hosted AI fitness coach that lives in **Telegram** and runs on your
-own smartwatch's (currently set up for Garmin Connect) data. Every morning it reads your recovery, sleep, training
-load and workouts, then gives you a readiness-adapted brief and a specific workout
-built around *your* equipment. You can chat with it all day — ask questions, send
-photos of your meals or gym machines, log food, report an injury — and it keeps
-context across the conversation.
+A self-hosted personal fitness assistant using Garmin Connect and Telegram.
+The repository is general-purpose code and synthetic examples. Your filled-in
+profile, conversations, health records, credentials and measurements stay in a
+separate private data directory.
 
-It is **model-agnostic**: it ships working with the GitHub Copilot CLI, and you can
-switch it to OpenAI, Anthropic, a local Ollama model, or anything else by editing one
-function.
+This is general fitness guidance, **not medical advice**. Garmin access uses the
+unofficial `garminconnect` library and can be affected by upstream API changes.
+Device scores and model recommendations are estimates, not diagnoses.
 
-> ⚠️ **Not medical advice.** This is a hobby tool for general fitness guidance. It uses
-> an **unofficial** Garmin Connect client (not an official Garmin API). Don't rely on it
-> for medical, diagnostic or clinical decisions. See [Disclaimer](#-disclaimer).
+## What it does
 
----
+- Morning brief on `GMS`, with an automatic fallback from 09:30 when the worker is
+  available. The brief covers recovery, relevant trends and a dated session/rest plan.
+- Conversational coaching, food logging, photos/albums, and optional voice/video.
+- Revisionable preferences, capability reports and health records with provenance.
+  Supported updates receive a receipt only after persistence succeeds.
+- Separate dated training proposals and observed workouts. A recommendation is not
+  treated as evidence that you completed it.
+- Garmin workout detail and performance metrics, with explicit availability,
+  timestamps and coverage. See [metric coverage](docs/metrics.md).
+- Exercise, movement, meal and hydration reminders with context-sensitive guards.
+- Durable Telegram inbox/outbox, retry state and stage timings. Polling and message
+  delivery continue while the serial coaching worker generates a response.
 
-## ✨ What it does
+The model's weights are **not trained on your chats**. Personalization comes from
+stored facts, relevant retrieval, recorded outcomes and revisions. Source-quoted
+updates are more reliable than an unverified model narrative, but extraction and
+coaching can still be wrong. You can inspect memory using `memory` and the current
+plan using `plan`.
 
-- **Morning brief ("GMS")** — recovery/readiness read (HRV, sleep + Garmin's own sleep
-  verdict & sleep-need, naps, body battery, resting HR, training readiness) + a workout
-  matched to your readiness and your gym kit.
-- **Knows your plans** — mention an activity you've got coming up ("I've got a hike
-  tomorrow") and the next morning's brief makes THAT the day's session: how to pace and fuel
-  it given last night's recovery, plus a readiness-based fallback in case the plan changes.
-- **Readiness-adapted programming** — backs off intensity when readiness is low, ACWR is
-  high, recovery time is still counting down, or illness signals (skin-temp + RHR +
-  respiration) line up — and calls a genuine **rest / recovery day** when readiness is RED
-  or cumulative fatigue is high, instead of always prescribing a workout.
-- **Progression coaching** — if your profile goal is to build (not just maintain), on
-  genuinely good-recovery days (GREEN, or a train-ready AMBER when only sleep is a touch
-  short) it *deliberately* programs vigorous aerobic / VO2max intervals aimed at whatever
-  **Load Focus** is under target — the stimulus that moves your Garmin **Training Status
-  toward Productive** instead of parking at Maintaining. Commit to a multi-day block in chat
-  ("build intervals in over the next few days") and it **remembers the plan** and honours it
-  in the coming briefs.
-- **Calibrated to your real capacity** — prescriptions (watts, weights, paces) anchor to what
-  you can *actually* do, recorded in your profile and learned from what you report you
-  completed — not to stale device numbers like an old cycling FTP. It builds gradually
-  (~5% steps, efforts kept a notch below all-out), so targets stay hard-but-doable.
-- **Chat Q&A with a week of memory** — "how did I sleep?", "what's my predicted 10K time?",
-  "give me a 30-min rowing session". It remembers the **last 7 days** of conversation — food,
-  water, workouts, mood, and any multi-day plans you agreed — so its answers and nudges
-  reflect everything you've told it, not just the last message.
-- **Photo analysis** — send a meal, a machine screen, or an exercise; send **several photos
-  at once** (an album) and it weighs them up as one set (e.g. "which of these breakfast
-  options should I pick?").
-- **Video understanding** *(optional)* — send a short clip; it samples frames and
-  transcribes any narration, then coaches on the whole thing.
-- **Voice notes** *(optional)* — transcribed locally, then answered.
-- **Food logging & nutrition** — just tell it what you ate ("had poha and a protein shake")
-  and it **auto-logs** a dated food journal that feeds calorie/protein coaching; a `log:`
-  prefix (or `log:` photo caption) still works but isn't required. It only confirms a meal
-  once it's actually saved. Optional meal reminders that **skip themselves once you've already
-  logged that meal** — and when one does fire it leads with your **running totals so far today**
-  (≈ protein / calories logged), not just a blank "time for dinner".
-- **Injury/illness awareness** — tell it "my knee hurts" and it asks what's going on,
-  remembers it, and adapts training (or calls for rest) until you say `recovered`.
-- **Session-aware debrief** — a workout logged as several back-to-back Garmin activities
-  (warm-up + strength + cardio + stretch) is treated as ONE session: ~90 min after your last
-  activity the bot sends a single combined debrief graded against the morning plan, instead of
-  nagging after each part. Reply **DWRE** ("done with recommended exercise") any time to get it
-  immediately.
-- **Exercise check-ins** — a few light nudges through the day (10am / 12 / 4pm / 9pm) asking if
-  you did the recommended exercise; reply **DWRE** when done or `rest day` / `skip today` to
-  stop them for the day. When the morning brief itself calls a **rest / recovery day**, the
-  check-ins automatically switch to a single gentle rest-aware note — no "did you exercise?"
-  nagging on a day the coach told you to rest.
-- **Hydration reminders** — a "drink water" nudge every 2 hours from 8am–10pm (you log the
-  actual water on your watch). They're **pace-aware and data-rich**: each nudge shows your real
-  **ml / cups so far vs the day's goal** and how far behind pace you are, and skips entirely if
-  Garmin shows you're already at or ahead of pace for that time (the 8am kick-off always sends).
-  Toggleable like the other reminders.
-- **Proactive nudges** — auto-sends the brief by ~9:30am if you didn't ask, warns you on a
-  rough morning, and (optionally) reminds you to log meals.
-- **Holistic context** — every reply is grounded in your *full* picture: recovery + load +
-  what you've eaten/planned + active health flags. Food and training advice reference each
-  other.
+## Architecture and privacy boundary
 
----
+```text
+public source / versioned release
+  garmin_coach.py + garmin_metrics.py    data collection and interpretation
+  coach_memory.py                     private revisionable memory
+  coach_plan.py                       plans, outcomes and constraint checks
+  coach_runtime.py                    durable transport and snapshot cache
+  telegram_bridge.py                  orchestration, Telegram, model adapter
+  prompts/                            shared policy and task-specific templates
 
-## 🧠 How it works
-
-```
-        Garmin Connect  ──(unofficial garminconnect lib)──►  garmin_coach.py
-                                                                 (data layer:
-                                                                  rich JSON dump)
-                                                                      │
-   Telegram  ◄──── telegram_bridge.py ────────────────────────────────┘
-    (you)          • long-polls Telegram for your messages
-                   • assembles prompt = profile + Garmin JSON + your logs/chat
-                   • calls run_llm(prompt, images) ──►  your chosen model backend
-                   • formats & sends the reply back to you
+private AGBOT_DATA_DIR (outside the source checkout)
+  .env                                local configuration
+  profile.md                          your goals/equipment/preferences
+  state/                              private SQLite, logs/journals, uploads, tokens
+  logs/                               private operational logs
+  backups/                            private recovery copies
+  releases/<commit>/                  immutable copies of public source
 ```
 
-- **`garmin_coach.py`** — the data layer. Logs into Garmin Connect and produces a rich
-  JSON snapshot (sleep + Garmin's sleep verdict / sub-scores / sleep-need, naps, HRV,
-  readiness, training status & load focus, activities with per-session training effect,
-  VO2max, body-battery feedback, hourly stress curve, weekly trends, and more).
-- **`telegram_bridge.py`** — the brain + the Telegram front-end. It classifies your
-  message, assembles a prompt from your `profile.md`, the Garmin snapshot, your food
-  journal and recent chat, sends it to the model via **`run_llm()`**, and returns the
-  answer. A localhost port lock ensures only one instance ever polls.
-- **`prompts/`** — the coaching prompts (summary, Q&A, image, weekly, nutrition, debrief,
-  performance) + a metrics reference. Edit these to change the coach's behavior.
-- **`profile.md`** — *you*. Your goals, equipment and constraints. Injected into every
-  prompt. (Ships as `profile.example.md`; copy it and edit.)
+No personal fixture is required in GitHub or CI. `.gitignore` is a safety net, not
+a substitute for keeping real data outside the checkout. Do not upload raw health
+payloads, screenshots, evaluation outputs, backups or tokens with bug reports.
 
----
+The configured model provider receives the prompt and any supplied attachments.
+Telegram and Garmin also process their respective data. "Private local storage"
+does **not** mean model inference is offline. Protect the data directory with
+appropriate OS permissions/disk encryption and protect its backups.
 
-## ✅ Requirements
+## Setup
 
-- **Python 3.9+**
-- A **Garmin Connect account** (with a Garmin device syncing to it).
-- A **Telegram account** (free).
-- A **model backend**. Out of the box it uses the **GitHub Copilot CLI** (`copilot`). You
-  can swap in OpenAI / Anthropic / Ollama / etc. — see [Choose your model](#4-choose-your-model-backend).
+Requires Python 3.12, a syncing Garmin account, a Telegram bot, and an authenticated
+GitHub Copilot CLI supporting the configured model and command-line flags.
 
----
-
-## 🚀 Quick start
-
-### 1. Get the code & install dependencies
-
-```bash
-git clone https://github.com/amitamola/garmin-ai-coach.git
-cd garmin-ai-coach
-
+```powershell
+git clone https://github.com/amitamola/Smartwatch_AI_coach.git
+Set-Location Smartwatch_AI_coach
 python -m venv .venv
-# Windows:
-.venv\Scripts\activate
-# Linux/Mac:
-source .venv/bin/activate
+.\.venv\Scripts\python.exe -m pip install -r requirements.lock
 
-pip install -r requirements.txt
+# Choose a PRIVATE directory outside this repository.
+$private = Join-Path $HOME ".smartwatch-coach"
+New-Item -ItemType Directory -Path $private -Force
+Copy-Item profile.example.md (Join-Path $private "profile.md")
+Copy-Item .env.example (Join-Path $private ".env")
 ```
 
-### 2. Create your Telegram bot
+Edit the private profile and configuration. Set `AGBOT_TELEGRAM_TOKEN` from
+BotFather and `AGBOT_OWNER_CHAT_ID` to your own chat. Alternatively use the private
+files `state/telegram_token.txt` and `state/telegram_chat_id.txt`. Keep credentials
+out of command history and do not share URLs containing your bot token.
 
-1. In Telegram, open a chat with **[@BotFather](https://t.me/BotFather)** and send `/newbot`.
-2. Give it a **display name** and a **username** (must end in `bot`, e.g. `my_garmin_bot`).
-3. BotFather replies with a **token** like `123456789:AAFD39kkdpWt3ywyRZergyOLMaJhac60qc`.
-   Keep it secret.
-4. **Find your chat id:** send any message to your new bot, then open
-   `https://api.telegram.org/bot<YOUR_TOKEN>/getUpdates` in a browser and read
-   `chat.id` from the JSON. (Alternatively, message [@userinfobot](https://t.me/userinfobot).)
+Authenticate Garmin using the current `garminconnect`/Garmin MCP authentication
+workflow. Existing OAuth credentials at `~/.garminconnect` are reused; override
+with `GARMINTOKENS` if needed. This bot does not drive interactive MFA unattended.
 
-Provide the token & chat id either via environment variables
-(`AGBOT_TELEGRAM_TOKEN`, `AGBOT_OWNER_CHAT_ID`) or as files:
+Authenticate the Copilot CLI interactively, then choose a supported model in your
+private `.env`. Example, **subject to account/CLI availability**:
 
-```bash
-mkdir -p state
-echo "123456789:AA...your-token..." > state/telegram_token.txt
-echo "987654321"                    > state/telegram_chat_id.txt   # your numeric chat id
+```dotenv
+AGBOT_LLM=copilot
+AGBOT_MODEL=gemini-3.8-flash
+AGBOT_REASONING_EFFORT=medium
+AGBOT_LLM_TIMEOUT=600
+AGBOT_SNAPSHOT_TTL=120
 ```
 
-> The `state/` folder holds all runtime secrets and data and is git-ignored.
+The shipped backend is Copilot CLI. The adapter has extension points for other
+providers; those providers are not automatically enabled by changing a name.
+Routine model calls have an empty tool allowlist and explicitly use default context.
+Optionally set `AGBOT_FALLBACK_MODELS` to comma-separated, account-supported,
+vision-capable model IDs. An explicit "model is not available" error tries these
+in order with the same prompt, attachments and permissions. Unavailable IDs are
+rechecked after five minutes; other errors do not switch models. Fallback attempts
+share the original model-call timeout. No fallback is enabled by default.
 
-### 3. Connect your Garmin account
+Launch on Windows:
 
-Garmin has **no public API key** for individuals — its official Health API is a B2B
-partner program. This project uses the community **[`garminconnect`](https://github.com/cyberjunky/python-garminconnect)**
-library, which logs in with your **Garmin Connect email + password** and then caches
-OAuth tokens locally (default `~/.garminconnect`) so it doesn't log in every time.
-
-For the **first login**, provide your credentials (they're only used to obtain the
-token; you can remove them afterwards):
-
-```bash
-# Windows (PowerShell):
-$env:EMAIL="you@example.com"; $env:PASSWORD="your-garmin-password"
-# Linux/Mac:
-export EMAIL="you@example.com" PASSWORD="your-garmin-password"
-
-# Trigger a login + a data dump (this writes the token cache):
-python garmin_coach.py dump
+```powershell
+.\scripts\run_bridge.ps1 -DataDir $private -PythonExe "$PWD\.venv\Scripts\python.exe"
 ```
 
-If your account has **two-factor auth**, you'll be prompted for the one-time code the
-first time. After that, tokens auto-refresh and you won't need to log in again unless the
-refresh token expires or is revoked.
+On Linux/macOS, create the equivalent private files, export `AGBOT_DATA_DIR` and
+optionally `AGBOT_PYTHON`, then run `scripts/run_bridge.sh`. A persistent service
+manager is needed for unattended operation. An interactive terminal is not one.
 
-> **Note:** because it's an unofficial client, Garmin could change their auth at any time
-> and temporarily break logins. Don't hammer it — excessive requests can trigger rate
-> limiting (HTTP 429).
+## Telegram commands
 
-### 4. Choose your model backend
-
-The coach calls a single function, **`run_llm(prompt, images)`**, so the model is
-pluggable. Set `AGBOT_LLM` to pick one.
-
-- **`copilot` (default)** — uses the **[GitHub Copilot CLI](https://docs.github.com/copilot/github-copilot-in-the-cli)**.
-  Install it and sign in once (`copilot`), make sure the `copilot` command is on your PATH
-  (or set `COPILOT_EXE`), and you're done — no API keys to manage.
-  Pin a specific model with **`AGBOT_MODEL`** (any id from `/model`, e.g. `gpt-5.6-luna`, or
-  `auto`) and its reasoning depth with **`AGBOT_REASONING_EFFORT`** (`low` … `max`); leave both
-  unset for the CLI's own defaults. High-reasoning models are slower per brief, so raise
-  **`AGBOT_LLM_TIMEOUT`** (seconds) if generations start timing out.
-- **OpenAI / Anthropic / Ollama / …** — open `telegram_bridge.py`, find the
-  `# --- Optional alternative backends ---` section, **uncomment** the one you want (each is
-  ~8 lines), register it in the `_LLM_BACKENDS` dict, `pip install` its SDK, set its API key,
-  and set `AGBOT_LLM=openai` (or `anthropic`, `ollama`, …). Adding a brand-new backend is
-  just writing one `def my_backend(prompt, images) -> str` and adding it to that dict.
-
-### 5. Personalize your profile
-
-```bash
-# Windows:
-Copy-Item profile.example.md profile.md
-# Linux/Mac:
-cp profile.example.md profile.md
-```
-
-Edit **`profile.md`** — your goals, your gym/home equipment, any constraints. The more
-specific the equipment list, the better the workout programming. `profile.md` is
-git-ignored, so your details stay local.
-
-### 6. (Optional) Use a `.env` file
-
-Instead of setting env vars each time, copy `.env.example` to `.env` and fill it in. The
-run scripts in `scripts/` auto-load it.
-
-```bash
-cp .env.example .env      # then edit .env
-```
-
-### 7. Run it
-
-```bash
-# Windows:
-./scripts/run_bridge.ps1
-# Linux/Mac:
-./scripts/run_bridge.sh
-```
-
-You should see `AgBot online as @your_bot`. Message your bot `AgBot: GMS` and you'll get
-your first brief. 🎉
-
----
-
-## 💬 Using the bot
-
-Prefix a message with **`AgBot`** (or `AgBot:`) — or just send it plainly; the bot only
-listens to your owner chat id.
-
-| You send | It does |
+| Command | Purpose |
 |---|---|
-| `AgBot: GMS` (or `summary`, `brief`, `report`) | Morning brief: recovery read + today's workout |
-| `AgBot week` | 7-day trend review |
-| `AgBot nutrition` (or `macros`, `calories`) | Today's calorie/protein targets |
-| `AgBot performance` (or `vo2`, `race`, `fitness age`) | Fitness stats: VO2max, race predictions, endurance/hill, FTP |
-| `DWRE` (or `done`, `finished`) | Marks today's exercise done + sends the combined session debrief vs the plan |
-| `rest day` (or `skip today`) | Stops the day's exercise check-ins |
-| `AgBot how did I sleep?` (any question) | Context-aware answer |
-| `had 3 eggs, oats & coffee` (or `log: …`) | Auto-logs a dated food entry that feeds nutrition coaching — `log:` prefix optional |
-| *send a photo* (optional caption) | Analyzes the meal / machine screen / exercise |
-| *send several photos together* | Weighs them as one set and recommends |
-| *send a short video* 🎥 | Samples frames + transcribes narration, then coaches *(needs optional extras)* |
-| *send a voice note* 🎤 | Transcribes locally, then answers *(needs optional extra)* |
-| `my knee hurts` / `I feel sick` | Asks what's wrong, remembers it, adapts training until you say `recovered` |
-| `recovered` | Clears active injury/illness flags |
-| `/reset` | Clears recent-chat memory |
-| `/help` | Shows the built-in help |
+| `GMS` / `AgBot: GMS` | Morning brief |
+| Ordinary text | Coaching question, preference, correction or feedback |
+| `memory` | Inspect active preferences, health and capability records |
+| `plan` | Inspect saved dated session proposals and user-reported status |
+| `programme` / `program` | View the saved multi-week framework and next review |
+| `review programme` / `review program` | Request a programme review now |
+| `week` | Weekly review and proposed upcoming schedule |
+| `performance` / `stats` | Available performance metrics and their dates |
+| `nutrition` | Targets and reported intake context |
+| `log: ...` | Log a report through the same validated update pipeline |
+| `DWRE` | Report completion and request the collective debrief |
+| `rest day` / `skip today` | Opt out of exercise reminders today |
+| `recovered` | Explicitly resolve all active health flags, not movement exclusions |
+| `/reset` | Clear recent conversation only; durable memory remains |
 
-The bot also **auto-sends** your brief by ~9:30am if you didn't ask, sends **one combined
-debrief** ~90 min after your last logged activity (or immediately on `DWRE`), **checks in**
-through the day on whether you did the recommended exercise, **warns** you on a rough morning,
-and (if enabled) **reminds** you to log meals and to drink water.
+For selective recovery or correction, use ordinary language naming the relevant
+body area or fact. Prefer an exact movement variant and clear units for training
+feedback. Proposed, completed and too-difficult loads are different facts.
 
----
+## Autonomous training programmes
 
-## 🔌 Optional extras
+Opt in with `AGBOT_PROGRAM_ENABLED=true` in the private `.env`. State goals,
+equipment, constraints and explicit availability (for example, "I can train three
+days per week") in the private profile. Missing availability is not a default
+training commitment.
 
-These features degrade gracefully — if the dependency isn't installed, the bot just skips
-that capability.
+The app maintains four-week blocks with weekly reviews by default
+(`AGBOT_PROGRAM_BLOCK_DAYS=28`, `AGBOT_PROGRAM_REVIEW_DAYS=7`). It checks during
+the daytime scheduling window and before morning/weekly reports. New durable
+training feedback or profile changes can bring a review forward to the following
+day; current symptoms and exclusions override the programme immediately.
+The machine must be awake, connected and running the bridge. An overdue review
+is performed when it resumes, not replayed once for every missed week.
 
-- **Voice-note transcription** (local, offline):
-  ```bash
-  pip install faster-whisper
-  ```
-  First use downloads a small Whisper model from Hugging Face and caches it. CPU-only is
-  fine.
+Reviews use the observed 28-day workout history, explicit source-backed feedback,
+dated recovery/fitness metrics and existing commitments.
+The review refreshes a bounded Garmin lookback so a newly deployed bot can use
+older workouts too, with at most eight additional strength-set fetches and
+per-activity coverage/freshness disclosure.
+Routine prompts retain older movement-specific sets without repeating every older
+session timeline; explicit workout/order reviews retain the fuller sequence context.
+Reviews retain anchor movements, assess accessory/skill alternatives, set progression conditions,
+identify useful success signals and preserve recovery. Each exercise decision
+cites supplied evidence. A progression decision requires two distinct observed
+session dates for that exercise plus verified user capability feedback; these
+checks establish evidence presence, **not** proof of good form or safe exertion.
+Recorded mobility/recovery work can support its own capability progression;
+it still does not count as an intentional-training day, and commutes are not
+progression proof.
+New or unknown loads remain a tolerance/effort assessment, not an inferred
+capability. Commuting and proposals are not proof of training.
+Programme rules include stop/tolerance conditions and do not freeze numeric
+working kg/lb/watt targets. Those stay in dated daily prescriptions so newer
+feedback cannot be overridden by an old multi-week target.
 
-- **Video understanding** (sample frames from clips):
-  ```bash
-  pip install av Pillow
-  ```
-  PyAV bundles the decoders (no system ffmpeg needed); Pillow resizes the sampled frames.
+Daily prescriptions use the saved templates and revision, or explicitly explain a
+scope/safety/equipment adjustment. Starting availability is a flexible frequency
+target, not a physiological ceiling. Rolling seven-day counts expose deviations;
+only explicit maximum-frequency statements impose hard scheduling limits.
+One-off class requests do not silently increase the ongoing target. Templates are options, not extra weekly
+sessions. Routine reviews require no user nudge, but honest effort and symptom
+feedback still matter: the bot cannot observe what a trainer beside you could.
 
----
+Successful reviews and their evidence are private, revisioned and audited; their
+Telegram announcements are durably queued once per revision. A failed review
+does not overwrite a programme or disable ordinary replies: it is surfaced and
+retried after backoff. Copilot review generation, including one optional repair,
+shares a bounded `AGBOT_PROGRAM_REVIEW_TIMEOUT` budget (180 seconds by default);
+ordinary requests retain their existing timeout. This is structured coaching support, not a clinician or a
+guarantee of fitness outcomes. No model weights are trained on the user's data.
 
-## 🔁 Running it unattended
+The application owns the dated calendar and renders it once. Exercise clarifications
+can use a `SESSION_PATCH` to change one exact variant/prescription without replacing
+the rest of the day. Proposal provenance records the triggering request separately;
+a recommendation in response to the user is not automatically their consent.
+Ordinary coaching omits unverified legacy capability prose and uses source-backed
+reports plus observed sets. Garmin metric meanings are grounded in the linked
+device manual; output guards reject known unsupported recovery/effort claims.
+These guards are not a complete medical or semantic verification system.
 
-The bridge is a long-running poller; keep it alive so it can push proactive briefs and
-respond any time.
+Explicit rep corrections are saved as source-linked user reports overlaid on the
+original Garmin sets, not replacements for measured data. The affected activity
+is refreshed without waiting for the normal set-cache expiry. Debrief references
+help identify the set; ambiguous reports ask for clarification rather than
+guessing. Weight corrections still require explicit unit/variant clarification.
+Positive exercise tolerance is stored separately from active symptoms, and
+administrative reclassification is not presented as clinical recovery.
 
-**Windows (Task Scheduler)** — create a task that runs at logon:
-- Program: `powershell.exe`
-- Arguments: `-NoProfile -ExecutionPolicy Bypass -File "C:\path\to\garmin-ai-coach\scripts\run_bridge.ps1"`
-- "Run whether user is logged on or not" is optional; "Restart on failure" is nice to have.
+## Persistence and limits
 
-**Linux (systemd user service)** — e.g. `~/.config/systemd/user/garmin-coach.service`:
-```ini
-[Unit]
-Description=Garmin AI Coach
-After=network-online.target
+- First startup imports legacy preference/health/anchor JSONL idempotently without
+  rewriting originals. Imported narratives are labelled unverified.
+- Active preferences and health constraints are not silently trimmed or expired.
+  Capability retrieval is entity-aware; recent chat remains a bounded selection,
+  not a guarantee that every sentence from seven days is in every prompt.
+- Food replies show per-item estimates, meal totals and daily calorie/protein
+  progress. Corrections can supersede an existing journal entry rather than add
+  another meal; originals remain in the append-only audit. Estimates are not
+  measured intake, and unconfigured targets remain unknown.
+- Replies use phone-friendly headings and lists. Markdown tables are converted to
+  labeled cards, and long replies preserve their formatting across Telegram messages.
+- Structured `SESSION_PLAN` proposals are checked against supported explicit
+  exclusions and rest-plan consistency before saving. These checks are not a
+  comprehensive medical or biomechanical safety assessment.
+- Garmin set detail is preserved where available. Missing data/unsupported device
+  metrics remain unknown. Sensor estimates cannot establish form or perceived effort.
+- Morning briefs, performance requests and workout questions include up to three
+  relevant activity-detail records, with explicit coverage and cache status.
+  Collective debriefs request detail for each activity in that session.
+  Repeated workout payloads are referenced within the prompt instead of duplicating
+  entire set timelines. Nutrition-focused replies omit irrelevant set detail while
+  keeping activity totals, symptoms, preferences and planned/reported training state.
+- Transport acknowledges receipt after durable storage and retries generation
+  failures with a finite limit. Failed requests are retained and a notice is queued.
+- Outgoing messages are retained for retry; a summary is marked sent only after
+  delivery acknowledgement. Telegram cannot guarantee exactly-once delivery:
+  a crash after Telegram accepts a message but before local acknowledgement may
+  produce a duplicate.
+- A local `/health` endpoint on `127.0.0.1:49517` reports release/model, queue counts
+  and worker progress. It also reports the last successful `active_model`,
+  configured fallbacks and a sanitized `last_model_error`; known model failures
+  make status `degraded` until a successful call. A null active model means no
+  successful model call has been observed since startup, not verified availability.
+  It is not exposed to the network and has no health records.
 
-[Service]
-ExecStart=%h/garmin-ai-coach/scripts/run_bridge.sh
-Restart=on-failure
-RestartSec=10
+## Models and evaluation
 
-[Install]
-WantedBy=default.target
+Newer is not automatically better. `scripts/evaluate_models.py` uses synthetic
+coaching cases and checks declared decision invariants without touching live state.
+Compare availability, correctness, output format and latency across repeated runs;
+small samples do not prove clinical safety or universal model superiority.
+Keep evaluation outputs private. Run the script with `--help` for its interface.
+Install `requirements-dev.txt` for synthetic image generation and the full suite.
+
+## Development and deployment
+
+Run the offline standard-library regression suite:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
-```bash
-systemctl --user enable --now garmin-coach
+
+CI runs synthetic offline cases on Windows and Linux. `--selftest-*` generation
+modes create temporary state before importing runtime components; they must never
+write your production memory. They can still call Garmin/the model and incur usage.
+
+For an existing Windows scheduled task, commit the reviewed code and deploy:
+
+```powershell
+.\scripts\deploy.ps1 -DataDir $private `
+  -PythonExe "$PWD\.venv\Scripts\python.exe" -TaskName "AgBot-TelegramBridge"
 ```
 
-**Anywhere, quick & dirty:** `nohup ./scripts/run_bridge.sh >/dev/null 2>&1 &`
+Deployment archives the selected commit into a versioned release, runs its offline
+suite, refuses to interrupt an active model reply, stops only the bridge's confirmed
+processes, backs up private state, updates the task and waits for the release health
+endpoint. Startup failure restores the previous task action. Keep the old release
+and private backup for recovery; schema/data rollback requires the matching backup.
+An optional private `-BeforeStartScript` can perform an idempotent migration after
+the stopped-state backup. It receives `DataDir`, `ReleaseDir` and `PythonExe`; keep
+legacy data intact. Profile and `.env` changes from that hook are restored on failure.
 
----
+Deployment runs the full suite, so install `requirements-dev.txt` (which includes
+`requirements.lock`) in the selected interpreter first. Optional voice/video
+dependencies beyond Pillow are installed separately.
+For first-time scheduling, configure Task Scheduler to run the launcher at logon
+with restart-on-failure and no execution time limit. A logon task cannot run while
+the host is unavailable or the required user session is absent.
 
-## 🧪 Testing & troubleshooting
+The repository does not upload personal backups. Choose and maintain your own
+encrypted/off-host backup policy; retaining a local backup alone does not protect
+against host loss.
 
-Run a generation once and print it to the console (no Telegram needed):
+## Licence
 
-```bash
-python telegram_bridge.py --selftest-summary
-python telegram_bridge.py --selftest-qa "how did I sleep last night?"
-python telegram_bridge.py --selftest-weekly
-python telegram_bridge.py --selftest-nutrition
-python telegram_bridge.py --selftest-performance
-python telegram_bridge.py --selftest-voice path\to\audio.ogg
-```
-
-Check the Garmin data layer on its own:
-
-```bash
-python garmin_coach.py dump         # prints the full JSON snapshot
-```
-
-Logs are written to `logs/telegram_bridge.log`.
-
-Common issues:
-- **"No valid Telegram bot token found"** — set `AGBOT_TELEGRAM_TOKEN` or create
-  `state/telegram_token.txt`.
-- **Bot ignores you** — it only replies to the owner chat id. Confirm
-  `AGBOT_OWNER_CHAT_ID` / `state/telegram_chat_id.txt` matches your id.
-- **Garmin login fails / 429** — re-check credentials; if rate-limited, wait a few minutes.
-  On Windows set `PYTHONUTF8=1` so emoji/accents don't crash encoding (the run scripts do
-  this for you).
-- **`copilot` backend errors** — ensure the Copilot CLI is installed, signed in, and on
-  PATH (or set `COPILOT_EXE`), or switch `AGBOT_LLM` to another backend.
-
----
-
-## ⚙️ Configuration reference
-
-Everything has a sensible default; override via environment (or `.env`).
-
-| Variable | Purpose |
-|---|---|
-| `AGBOT_TELEGRAM_TOKEN` | Telegram bot token (else `state/telegram_token.txt`) |
-| `AGBOT_OWNER_CHAT_ID` | Your numeric chat id (else `state/telegram_chat_id.txt`) |
-| `AGBOT_LLM` | Model backend name (default `copilot`) |
-| `AGBOT_USER_NAME` | Optional first name so the coach can greet you |
-| `AGBOT_MODEL` | Pin the Copilot CLI model (e.g. `gpt-5.6-luna`, or `auto`); unset = CLI default |
-| `AGBOT_REASONING_EFFORT` | Copilot reasoning depth: `none`\|`minimal`\|`low`\|`medium`\|`high`\|`xhigh`\|`max` (default `low`) |
-| `AGBOT_LLM_TIMEOUT` | Seconds allowed per generation (default `180`; raise for `max` reasoning) |
-| `EMAIL` / `PASSWORD` | Garmin Connect login (first-run only) |
-| `GARMINTOKENS` | Where Garmin OAuth tokens are cached (default `~/.garminconnect`) |
-| `COPILOT_EXE` / `COPILOT_HOME` | Only for the default `copilot` backend, if needed |
-
-Tunables (meal & hydration reminder times, exercise check-in hours, the ~90-min session
-quiet window before the collective debrief, auto-brief window, poll timeout, history budgets,
-etc.) live as constants near the top of `telegram_bridge.py`.
-
----
-
-## 🔒 Data, privacy & security
-
-- **Everything runs on your machine.** Your Garmin data, food logs and conversation live
-  in `state/` (git-ignored) and never leave your box except in the prompts you send to
-  **your chosen model backend**.
-- **Secrets stay local.** `profile.md`, `.env`, `state/`, `logs/`, and token files are all
-  git-ignored. **Never commit them.** If you fork this, double-check `git status` before
-  your first push.
-- **Token files** are the keys to your bot and your Garmin account — treat them like
-  passwords. Revoke a leaked Telegram token via BotFather (`/mybots` → API Token → Revoke).
-
----
-
-## ⚠️ Disclaimer
-
-This project is **not affiliated with, endorsed by, or supported by Garmin**. It relies on
-an unofficial client that may break if Garmin changes their systems, and it may be subject
-to their terms of service — use it at your own risk. The coaching output is generated by an
-AI model and is **for general informational purposes only — not medical, diagnostic, or
-professional fitness advice**. Consult a qualified professional before starting or changing
-any exercise or nutrition program.
-
----
-
-## 🙌 Credits
-
-- [`cyberjunky/python-garminconnect`](https://github.com/cyberjunky/python-garminconnect) —
-  the Garmin Connect client.
-- [`SYSTRAN/faster-whisper`](https://github.com/SYSTRAN/faster-whisper) — optional local
-  voice transcription.
-- Inspired by the idea behind [Taxuspt/garmin_mcp](https://github.com/Taxuspt/garmin_mcp).
-
-## 📄 License
-
-[MIT](LICENSE) © Amit Amola
+[MIT](LICENSE) - Copyright Amit Amola.
