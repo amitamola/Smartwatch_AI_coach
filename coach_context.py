@@ -104,12 +104,22 @@ def schedule_claim_errors(text, proposals, existing, today=None):
     for sentence in re.split(r"(?<=[.!?])\s+|\n", text):
         if ("?" in sentence or re.search(
                 r"\b(?:previous|earlier|original|showed|said|asked|last|was|had|if|could|consider|"
-                r"depending|pending|possibly|skip|cancel|not)\b", sentence, re.I)):
+                r"depending|pending|possibly|skip|cancel|not|cleared|registered)\b", sentence, re.I)):
             continue
         matches = list(day_pattern.finditer(sentence))
         for index, match in enumerate(matches):
             tail = sentence[match.end():matches[index + 1].start() if index + 1 < len(matches)
                             else len(sentence)][:100]
+            prefix = sentence[:match.start()]
+            if (match.group(1).lower() not in ("today", "tomorrow")
+                    and (re.search(r"\b(?:after|following|since)\s*$", prefix, re.I)
+                         or re.search(r"\b(?:cleared|improved|rebounded|completed|helped)\b",
+                                      tail, re.I))):
+                continue
+            if (re.match(r"['\u2019]s\b", tail)
+                    and not re.search(r"\b(?:will|is|remains|scheduled|planned|follows)\b", tail, re.I)):
+                # A reference to "Thursday's lower-body volume" is not a promise for next Thursday.
+                continue
             rest = re.search(r"\b(?:rest|recovery)\b", tail, re.I)
             training = re.search(r"\b(?:strength|cardio|workout|class|run|cycling|"
                                  r"(?:upper|lower|full)[ -]body)\b", tail, re.I)

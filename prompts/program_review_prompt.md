@@ -6,11 +6,41 @@ proposal against dated observations, not independently verifying fitness or safe
 Return ONE complete `TRAINING_PROGRAM` marker using the schema below. This is NOT
 a dated session prescription: do not emit SESSION_PLAN, MEMORY or food markers.
 The app renders the validated review; do not repeat it as a long prose report.
-Be concise: normally 3-4 session options, one short sentence per decision reason,
+Be concise: normally 3-4 session options unless TRAINING_POLICY requires a longer
+rotation, one short sentence per decision reason,
 and short actionable progression/stop rules. Do not review every historical
 exercise: cover selected template movements and genuinely removed previous anchors.
 
 ## Review decisions
+
+- REVIEW_EVIDENCE.training_policy is application-owned user configuration. When
+  present, honour strength_order, cardio_templates and required_exercises.
+  Supply rotation: an ordered list of every intentional template ID. Preserve
+  strength_order as a subsequence, with the cardio templates inserted sensibly.
+  Rest days are inserted according to fresh evidence, not fixed between EVERY
+  strength session. The sequence can span multiple calendar weeks.
+- With frequency_mode="propose", propose weekly_training_days and frequency_reason
+  from recent completed activity, sleep/recovery, current symptoms and availability.
+  This is a revisable starting recommendation, NOT new user availability/consent.
+  Explain how long the whole cycle approximately takes; don't squeeze five lifting
+  sessions plus cardio into one week by default.
+- Separate aerobic-base from aerobic-quality when configured. Quality means a
+  controlled, progressive high-aerobic/interval session, not mandatory maximal
+  effort. Keep the quality template present during a temporary deferral, with
+  explicit conditions for resuming. A hike/ordinary run is not automatically an
+  executed VO2-max interval prescription.
+- Required conventional biceps curls are distinct from hammer curls. Programme
+  familiar push, vertical/horizontal pull, suitable leg patterns, shoulders,
+  triceps and direct biceps work across the cycle without loading every accessory
+  into every day. Unknown equipment/variant loads need calibration, not transfer.
+- Temporary travel and short sleep can justify a current change, but not indefinite
+  post-flight recovery. Read dates, current recovery and expired-memory disclosures.
+  Old recovery rules are proposals to reassess, not permanent restrictions.
+- Do not reintroduce a blanket rest-between-strength-days rule in recovery_rule.
+  Different strength emphases can be adjacent when current evidence supports that;
+  spacing depends on actual overlap, effort and symptoms, not just the word strength.
+  If a cardio template lists running and cycling, these are alternatives: the daily
+  plan chooses one with an explicit scope adjustment, not two full cardio workouts.
 
 - Start from the user's actual goals, explicit availability, equipment and current
   constraints. Use REVIEW_EVIDENCE.weekly_training_days, not an invented frequency.
@@ -126,6 +156,7 @@ new working weights or set prescriptions. Those belong to each dated daily plan.
 [[TRAINING_PROGRAM: {
   "goal": "The user's actual training goal",
   "weekly_training_days": null,
+  "rotation": ["session-a"],
   "session_templates": [{
     "id": "session-a",
     "kind": "strength",
@@ -148,3 +179,7 @@ new working weights or set prescriptions. Those belong to each dated daily plan.
   "variety_review": "Alternatives/coverage considered; what changes now or why holding is useful",
   "questions": []
 }]]
+
+When frequency_mode is "propose", also include "frequency_reason": a short,
+source-grounded explanation. Optional new fields are rotation and frequency_reason;
+do not invent additional schema fields.

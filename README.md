@@ -208,11 +208,38 @@ guessing. Weight corrections still require explicit unit/variant clarification.
 Positive exercise tolerance is stored separately from active symptoms, and
 administrative reclassification is not presented as clinical recovery.
 
+### Rolling training cycles
+
+Programme reviews can include `rotation`, an ordered list of intentional session
+template IDs. The private SQLite rotation ledger advances from a linked user
+completion report (`DWRE`) or a matching observed strength session containing all
+named main exercises. Neither means the prescribed dose, form or effort was
+verified. A cardio recording alone does not prove the planned intervals were
+completed; confirm the prescribed session with `DWRE`. Report substitutions
+separately. Rest, skips, uncertain completion and proposals never advance the
+cycle. Reviews preserve the pending slot when retaining the order.
+
+Daily alternatives/rest require `rotation_defer` with a reason, reassessment date
+within seven days, and resumption conditions. The pending session stays visible.
+This prevents a cardio option being silently replaced by another upper/lower day;
+it is not a medical rule requiring training on a particular date.
+
+Optional **private** `training_policy.json` in the data directory supplies
+`strength_order` (template IDs), `cardio_templates` (IDs), `required_exercises`
+(exact names), and `frequency_mode` (`availability` or `propose`). The latter
+allows a reasoned, revisable frequency proposal without changing user availability;
+explicit maximums still apply. Missing configuration preserves the existing
+availability contract. Invalid configuration fails visibly rather than silently
+discarding preferences. Personal policies and state must stay outside the repo.
+
 ## Persistence and limits
 
 - First startup imports legacy preference/health/anchor JSONL idempotently without
   rewriting originals. Imported narratives are labelled unverified.
-- Active preferences and health constraints are not silently trimmed or expired.
+- Active health and movement constraints are not silently trimmed or expired.
+  Explicit short durations on `travel:`/`temporary:` preferences carry an audited
+  expiry and omission disclosure; permanent training availability is separate
+  from travel schedules. Historical quotes remain available without being current.
   Capability retrieval is entity-aware; recent chat remains a bounded selection,
   not a guarantee that every sentence from seven days is in every prompt.
 - Food replies show per-item estimates, meal totals and daily calorie/protein

@@ -71,6 +71,8 @@ class CoachingContextTests(unittest.TestCase):
             "Your recovery time should clear before the class.",
             "A fifth rolling session is fine given your energy.",
             "Maintaining is a strong outcome that protects muscle and current capacity.",
+            "Balanced HRV confirms systemic freshness.",
+            "Friday's rest cleared fatigue from the training block.",
         ]:
             with self.subTest(text=text):
                 self.assertTrue(unsupported_claims(text))
@@ -99,6 +101,13 @@ class CoachingContextTests(unittest.TestCase):
             "We could consider Thursday for cardio, depending on symptoms.", [], [rest], today))
         self.assertFalse(schedule_claim_errors(
             "The earlier outline showed Thursday for cardio.", [], [rest], today))
+        self.assertFalse(schedule_claim_errors(
+            "Training today following Monday's rest.", [], [], today))
+        self.assertFalse(schedule_claim_errors(
+            "Monday's rest helped with the earlier fatigue.", [], [], today))
+        self.assertFalse(schedule_claim_errors(
+            "Readiness is improving after Tuesday's run and Thursday's lower-body volume.",
+            [], [], today))
 
     def test_compaction_keeps_per_set_values_and_explicit_full_chronology(self):
         value = {"logged_sets": [

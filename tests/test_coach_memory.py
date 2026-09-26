@@ -50,6 +50,39 @@ class MemoryTests(unittest.TestCase):
             self.store.render("preference", max_chars=240)
         self.assertGreater(error.exception.required_chars, 240)
 
+    def test_explicit_temporary_duration_expires_without_clinical_resolution(self):
+        text = "My flight may disrupt sleep for two to three days."
+        receipt = self.store.upsert("preference", "travel:flight_schedule", text,
+                                    source_text=text, verified=True, observed_on="2020-01-01")
+        self.assertEqual(receipt["source_metadata"]["valid_until"], "2020-01-04")
+        self.assertEqual(self.store.records("preference"), [])
+        self.assertIn("expired temporary", self.store.render("preference"))
+        self.assertEqual(self.store.records("preference", status=None)[0]["status"], "active")
+        health = self.store.upsert("health", "knee", "My knee hurts",
+                                   source_text="My knee hurts", verified=True)
+        with self.assertRaises(ValueError):
+            self.store.set_temporary_scope(health["id"], "2020-01-04", "Do not expire symptoms")
+        self.assertEqual(len(self.store.records("health")), 1)
+
+    def test_expiry_metadata_cannot_hide_health_or_movement_restrictions(self):
+        for kind, key in (("health", "travel:back"),
+                          ("preference", "avoid_exercise:moon_press")):
+            record = self.store.upsert(kind, key, "Synthetic standing restriction.")
+            with closing(sqlite3.connect(self.db_path)) as db, db:
+                db.execute("UPDATE memory_records SET source_metadata=? WHERE id=?",
+                           (json.dumps({"valid_until": "2020-01-01"}), record["id"]))
+            self.assertEqual(len(self.store.records(kind)), 1)
+
+    def test_temporary_scope_retains_source_and_audits_change(self):
+        text = "I am in transit this weekend."
+        original = self.store.upsert("preference", "travel:transit", text,
+                                     source_text=text, verified=True, observed_on="2020-01-01")
+        fixed = self.store.set_temporary_scope(original["id"], "2020-01-06", "Audited weekend scope")
+        self.assertEqual(fixed["source_text"], text)
+        self.assertEqual(fixed["observed_on"], original["observed_on"])
+        self.assertEqual(len(self.store.revisions("preference", "travel:transit")), 2)
+        self.assertEqual(self.store.records("preference"), [])
+
     def test_refinement_supersedes_key_and_preserves_audit(self):
         first = self.store.upsert(
             "anchor", "moon press", "The moon press caused fatigue.",

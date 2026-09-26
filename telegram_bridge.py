@@ -104,7 +104,7 @@ PROGRAM_ENABLED = os.environ.get("AGBOT_PROGRAM_ENABLED", "false").strip().lower
 PROGRAM_REVIEW_DAYS = int(os.environ.get("AGBOT_PROGRAM_REVIEW_DAYS", "7"))
 PROGRAM_BLOCK_DAYS = int(os.environ.get("AGBOT_PROGRAM_BLOCK_DAYS", "28"))
 PROGRAM_REVIEW_TIMEOUT = int(os.environ.get("AGBOT_PROGRAM_REVIEW_TIMEOUT", "180"))
-PROGRAM_POLICY_VERSION = 2
+PROGRAM_POLICY_VERSION = 3
 
 # Auto-summary window (local time). If no summary has been sent yet today and the
 # current time falls in this window, one is pushed automatically.
@@ -209,6 +209,7 @@ from coach_context import (
     compact_workouts, plan_request_scope, schedule_claim_errors, strip_schedule_rendering,
 )
 from coach_corrections import correction_intent
+from coach_rotation import RotationStore, load_training_policy, rotation_plan_errors, project_rotation
 from telegram_formatting import md_to_html, html_chunks, html_to_plain as _html_to_plain
 
 _memory_store = None
@@ -1240,9 +1241,24 @@ def _program_inputs():
         "id", "kind", "key", "text", "status", "source_type", "source_text",
         "verified", "revision", "observed_on")} for record in records]
     fingerprint = hashlib.sha256(json.dumps(
-        {"profile": profile, "memory": facts}, sort_keys=True, ensure_ascii=False
+        {"profile": profile, "memory": facts, "training_policy": _training_policy()},
+        sort_keys=True, ensure_ascii=False
     ).encode("utf-8")).hexdigest()
     return profile, records, fingerprint
+
+
+def _training_policy():
+    return load_training_policy(os.path.join(os.path.dirname(STATE), "training_policy.json"))
+
+
+def _rotation_context():
+    if not PROGRAM_ENABLED:
+        return {"enabled": False}
+    programme = program_store().context().get("active")
+    store = RotationStore(os.path.join(STATE, "coach.sqlite3"))
+    if programme:
+        store.configure(programme)
+    return store.context(_program_training_context())
 
 
 def _resolved_health_reports():
@@ -1285,8 +1301,30 @@ def _program_context(nutrition_focused=False):
 
 def _program_evidence_prompt(evidence, repair=False):
     """Show each fact once; retain full provenance in the stored review audit."""
+    def observation_view(observation):
+        result = {k: v for k, v in observation.items() if k != "logged_sets"}
+        result["logged_sets"] = []
+        for group in observation.get("logged_sets", []):
+            reduced = {k: group[k] for k in (
+                "exercise", "sets", "reps", "top_weight_kg", "user_corrections", "correction_warnings")
+                       if k in group}
+            freshness = group.get("data_freshness")
+            if isinstance(freshness, dict):
+                reduced["data_freshness"] = {k: freshness[k] for k in (
+                    "status", "refresh_status", "weight_unit_policy_current", "weight_unit_policy")
+                                            if k in freshness}
+            result["logged_sets"].append(reduced)
+        return result
+
     view = {key: value for key, value in evidence.items() if key not in ("memory", "profile")}
+    view["observations"] = [observation_view(r) for r in evidence.get("observations", [])]
     view["refs"] = {key: dict(value) for key, value in evidence["refs"].items()}
+    baseline = view["refs"].get("block_baseline")
+    if baseline:
+        baseline["observations"] = [observation_view(r) for r in baseline.get("observations", [])]
+    view["detail_scope"] = ("Programme summary view: per-set chronology/group indices and repeated "
+                            "refresh metadata omitted. Full evidence remains in the stored audit. "
+                            "Rep ranges/top loads do not prove prescribed dose, form or effort.")
     if "profile" in view["refs"]:
         view["refs"]["profile"] = {"type": "profile", "text_reference": "PROFILE"}
     for record in evidence.get("memory", []):
@@ -1351,8 +1389,10 @@ def ensure_program_review(force=False):
         return None
     history = garmin_coach.program_history()
     training_store().record_activities(history["activities"])
+    _rotation_context()
     training = _program_training_context()
     evidence = build_review_evidence(training, records, profile)
+    evidence["training_policy"] = _training_policy()
     evidence["policy_version"] = PROGRAM_POLICY_VERSION
     evidence["refs"]["history_coverage"] = {"kind": "history_coverage", "data": history["coverage"]}
     evidence["refs"]["snapshot"] = {
@@ -1418,6 +1458,7 @@ def ensure_program_review(force=False):
             previous=previous["review"] if previous else None)
         if not errors and review is not None:
             record = store.save_review(review, evidence, fingerprint, request_key=request_key)
+            RotationStore(os.path.join(STATE, "coach.sqlite3")).configure(record)
             _queue_program_update(record)
             log.info("stage=program_review saved revision=%s next_review=%s",
                      record["revision"], record["next_review_date"])
@@ -1462,7 +1503,8 @@ def _scheduling_context(plans=()):
     availability = evidence["weekly_training_days"]
     prior = (active.get("evidence") or {}).get("weekly_training_days") if active else None
     if availability is not None and (target is None or target == prior or availability < target):
-        target = availability
+        if _training_policy().get("frequency_mode") != "propose" or target is None:
+            target = availability
     intentional = {"strength", "cardio", "mixed"}
     observed = {r["date"] for r in training["recent_outcomes"]
                 if r["classification"] == "intentional_training"}
@@ -1504,7 +1546,35 @@ def _program_plan_errors(plans):
         return []
     review = active["review"]
     templates = {item["id"]: item for item in review["session_templates"]}
-    errors = []
+    rotation = _rotation_context()
+    errors = rotation_plan_errors(plans, rotation)
+    required = {canonical_exercise(name) for name in _training_policy().get("required_exercises", [])}
+    required.update(canonical_exercise(d["exercise"]) for d in review["decisions"]
+                    if d["action"] == "introduce")
+    observed = training_store().context()["latest_observed_per_movement"]
+    feedback = [r for r in memory_store().records("anchor")
+                if r.get("verified") and r.get("source_type") == "user"]
+    for plan in plans:
+        for move in plan.get("exercises", []):
+            name = canonical_exercise(move["name"])
+            recorded = observed.get(name, {}).get("recorded_sets", {})
+            own_load = (isinstance(recorded.get("top_weight_kg"), (int, float))
+                        and recorded["top_weight_kg"] > 0
+                        and recorded.get("weight_basis") == move.get("weight_basis")
+                        and move.get("weight_basis") not in (None, "unspecified"))
+            basis_pattern = {"per_hand": r"\b(?:per|each) hand\b",
+                             "machine_stack": r"\b(?:machine|stack)\b"}.get(move.get("weight_basis"))
+            if basis_pattern:
+                own_load = own_load or any(
+                    name in canonical_exercise(r["key"] + " " + r["text"])
+                    and re.search(r"\b\d+(?:\.\d+)?\s*kg\b", r["text"], re.I)
+                    and re.search(basis_pattern, r["text"], re.I) for r in feedback)
+            if name in required and not own_load and any(
+                    item.get("weight_kg") is not None for item in move.get("sets", [])):
+                errors.append("A new exercise without its own observed load needs "
+                              "weight_kg=null and a calibration/effort instruction. Observations "
+                              "must also establish the same apparatus/per-hand weight basis; "
+                              "do not borrow a weight from a different curl or machine.")
     for plan in plans:
         if (plan["kind"] == "rest" or (plan.get("detail_level") == "outline"
                                       and plan["date"] > date.today().isoformat())):
@@ -1765,6 +1835,7 @@ def _assemble(prompt_file, question=None, include_history=True,
     parts.append("\n\nPROGRAMME_STATE:\n" + json.dumps(
         _program_context(nutrition_focused), separators=(",", ":"), default=str))
     if not nutrition_focused:
+        parts.append("\n\nROTATION_STATE:\n" + json.dumps(_rotation_context(), default=str))
         parts.append("\n\nSCHEDULING_CONTEXT:\n" + json.dumps(
             _scheduling_context(), separators=(",", ":"), default=str))
         parts.append("\n\n" + read_file(os.path.join(PROMPTS, "garmin_interpretation.md")))
@@ -1855,6 +1926,10 @@ def _generate_checked(prompt, source_text="", images=None, require_plan=False, s
         clean, plans, errors = parse_plans(candidate, memory_store().records("preference"),
                                           existing_plans=existing)
         errors.extend(_program_plan_errors(plans))
+        if (not source_text and plans and _rotation_context().get("completed_today")
+                and any(p["date"] == date.today().isoformat() for p in plans)):
+            errors.append("Today's rotation session is already completed; automatic advice must "
+                          "not rewrite it or prescribe another session. Emit future dates only.")
         errors.extend(unsupported_claims(clean))
         if show_schedule or plans or require_plan:
             errors.extend(schedule_claim_errors(clean, plans, existing))
@@ -1889,9 +1964,13 @@ def _generate_checked(prompt, source_text="", images=None, require_plan=False, s
                        "only in SESSION_PLAN; the application renders it.",
                        images=images)
     if plans:
+        plans, projection_errors = project_rotation(plans, _rotation_context())
+        if projection_errors:
+            raise ValueError("Rotation changed before plan save: " + "; ".join(projection_errors))
         training_store().save(plans, source="model_proposal_in_response_to_user" if source_text
                               else "scheduled_coaching_proposal",
                               request_id=_current_request, source_text=source_text)
+        RotationStore(os.path.join(STATE, "coach.sqlite3")).save_deferrals(plans)
         for plan in plans:
             if plan["date"] == date.today().isoformat():
                 _set_coach_rest(plan["kind"] == "rest")
@@ -1947,6 +2026,18 @@ def _generate_checked(prompt, source_text="", images=None, require_plan=False, s
         log.warning("stage=memory rejected_updates=%s", pending_memory_errors)
         clean += "\n\nA memory update was not saved; that change has not been made permanent."
     clean = _present_reply(clean)
+    if plans and PROGRAM_ENABLED:
+        rotation = _rotation_context()
+        if rotation.get("enabled"):
+            clean += ("\n\n**Rolling programme:** " + " → ".join(rotation["upcoming"])
+                      + "\nRest does not skip a session. This is an order, not consecutive days.")
+            deferred = rotation.get("deferral")
+            if deferred:
+                clean += ("\n**Reassess pending session:** " + deferred["reassess_on"]
+                          + " — " + deferred["resume_when"])
+            if rotation.get("unconfirmed_sessions"):
+                clean += ("\nThe previous rotation session is unconfirmed. After completing "
+                          "the prescribed session, use DWRE; report substitutions separately.")
     if plans and source_text and any(p["date"] == date.today().isoformat() for p in plans):
         save_todays_brief(clean)
     return clean
@@ -1957,7 +2048,11 @@ def generate_summary():
     prompt, snap = _assemble(SUMMARY_PROMPT_FILE, include_history=True, include_brief=False)
     if isinstance(snap, dict) and "__error__" in snap:
         return None, snap
-    text = _generate_checked(prompt, require_plan=True)
+    completed_rotation = bool(_rotation_context().get("completed_today"))
+    if completed_rotation:
+        prompt += ("\n\nTODAY'S ROTATION SESSION IS ALREADY COMPLETED. Do not emit or rewrite "
+                   "a plan for today; summarise the recorded session and outline future dates.")
+    text = _generate_checked(prompt, require_plan=not completed_rotation, show_schedule=completed_rotation)
     if text:
         append_history("user", "GMS (requested the morning brief)")
         append_history("agbot", text)

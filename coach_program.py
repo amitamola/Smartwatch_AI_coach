@@ -240,6 +240,8 @@ def build_review_evidence(training_context, memory_records, profile, today=None)
         text = str(record.get("text", ""))
         schedule_key = re.search(r"schedule|availability|training_days|weekly_training",
                                  str(record.get("key", "")), re.IGNORECASE)
+        if str(record.get("key", "")).startswith(("travel:", "temporary:", "equipment:")):
+            schedule_key = False
         if (record["verified"] and observed and
                 (schedule_key or (_DAYS.search(text) and re.search(
                     r"\b(?:train\w*|workout\w*|gym|exercise|available)\b", text, re.IGNORECASE)))):
@@ -369,15 +371,24 @@ def _anchor_for(source, exercise):
 def _validate_review(review, evidence, preferences, previous):
     fields = {"goal", "weekly_training_days", "session_templates", "decisions",
               "recovery_rule", "success_signals", "variety_review", "questions"}
-    _shape(review, fields, (), "programme")
+    policy = evidence.get("training_policy") or {}
+    _shape(review, fields, {"rotation", "frequency_reason"}, "programme")
     result = {"goal": _text(review["goal"], "goal", 600)}
     budget, requested = evidence.get("weekly_training_days"), review["weekly_training_days"]
     if requested is not None and (type(requested) is not int or not 1 <= requested <= 7):
         raise ValueError("weekly_training_days must be an integer 1..7 or null")
-    if requested is not None and (budget is None or requested > budget):
+    proposing = policy.get("frequency_mode") == "propose"
+    if requested is not None and not proposing and (budget is None or requested > budget):
         raise ValueError("weekly_training_days cannot be invented or exceed known availability; "
                          "use null when unknown, or reduce to the evidenced budget")
     result["weekly_training_days"] = requested
+    if proposing:
+        if requested is None:
+            raise ValueError("Propose a starting frequency with a frequency_reason; not a user commitment")
+        hard_limit = evidence.get("hard_weekly_limit")
+        if hard_limit is not None and requested > hard_limit:
+            raise ValueError("Proposed frequency exceeds an explicit user maximum")
+        result["frequency_reason"] = _text(review.get("frequency_reason"), "frequency_reason", 1000)
     constraints = list(preferences) + evidence.get("memory", [])
     templates, exercises, ids = [], {}, set()
     total = 0
@@ -423,6 +434,10 @@ def _validate_review(review, evidence, preferences, previous):
     if total > 96:
         raise ValueError("programme must have at most 96 exercise entries")
     result["session_templates"] = templates
+    if "rotation" in review or policy:
+        from coach_rotation import validate_rotation
+        result["rotation"] = review.get("rotation")
+        validate_rotation(result, policy)
     refs = evidence.get("refs", {})
     prior = _previous_exercises(previous)
     decisions, by_name, replacements = [], {}, set()
@@ -805,6 +820,12 @@ def render_program(record):
         f"**Training target:** {availability} (adjustable, not a recovery test)",
         "**Session options** (not a promise to schedule every option each week)",
     ]
+    if review.get("rotation"):
+        lines.insert(4, "**Rolling order:** " + " → ".join(review["rotation"])
+                     + "\nRest/recovery can be inserted; this is not seven consecutive training days.")
+    if review.get("frequency_reason"):
+        lines.insert(4, "**Proposed frequency rationale:** " + review["frequency_reason"]
+                     + " (proposal, not a permanent availability change)")
     hard = (record.get("evidence") or {}).get("hard_weekly_limit")
     if hard is not None:
         lines.insert(4, f"**Explicit scheduling maximum:** {hard} days per rolling seven days")
