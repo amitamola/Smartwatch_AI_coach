@@ -50,6 +50,15 @@ exercise: cover selected template movements and genuinely removed previous ancho
 - Retain useful anchor movements long enough to compare performance. Repeating a
   movement is not stagnation; increasing weight is not the only form of progress.
   Do not reset every exercise merely because a new block starts.
+- When the user requests full-body training, each strength template must include
+  appropriate lower-body work, upper-body pushing and pulling, rather than simply
+  relabelling a split session. Distribute arm, forearm and core accessories across
+  distinct sessions within the user's time budget. Do not combine the entire old
+  split's volume into every session. Keep comparable anchors across reviews;
+  rotate selected accessories for engagement or tolerance, not all movements at once.
+  Full-body and split schedules are alternatives, not a universal ranking.
+  Cable and reverse crunches do not isolate separate upper/lower abdominal muscles;
+  introduce them only with the user's consent, suitable equipment and symptom limits.
 - Assess strength movement coverage, aerobic development, relevant mobility/skills,
   weekly training consistency, fatigue and recovery. Do not prescribe missing
   patterns at the expense of symptoms or an explicit movement exclusion.

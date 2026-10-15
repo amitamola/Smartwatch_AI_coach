@@ -153,6 +153,20 @@ class RotationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_rotation(review, policy)
 
+    def test_refining_later_session_preserves_earlier_saved_forecast_slots(self):
+        tomorrow = TODAY + timedelta(days=1)
+        later = TODAY + timedelta(days=3)
+        self.training.save([self.plan(tomorrow),
+                            self.plan(later, program_template_id="pull", rotation_slot="1:1")])
+        update = self.plan(later, program_template_id="pull", objective="Refine the later session")
+        update.pop("rotation_slot")
+        projected, errors = project_rotation([update], self.context(), TODAY)
+        self.assertFalse(errors)
+        self.assertEqual(projected[0]["rotation_slot"], "1:1")
+        self.assertEqual(self.context()["slot"], "1:0")
+        self.training.set_status(tomorrow, "user_skipped")
+        self.assertTrue(project_rotation([update], self.context(), TODAY)[1])
+
     def test_private_policy_missing_invalid_and_valid(self):
         path = Path(self.temp.name) / "training_policy.json"
         self.assertEqual(load_training_policy(path), {})

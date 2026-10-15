@@ -559,7 +559,7 @@ class CoverageTests(unittest.TestCase):
 
 
 class NutritionGoalTests(unittest.TestCase):
-    def budget(self, goal=None, weight_g=70000, birth_date="1990-01-01"):
+    def budget(self, goal=None, weight_g=70000, birth_date="1990-01-01", protein=None):
         class FakeGarmin:
             def __getattr__(self, _name):
                 return lambda *_args, **_kwargs: {}
@@ -572,6 +572,8 @@ class NutritionGoalTests(unittest.TestCase):
                                      "weight": weight_g, "birthDate": birth_date}}
 
         env = {} if goal is None else {"AGBOT_NUTRITION_GOAL": goal}
+        if protein is not None:
+            env.update(protein)
         with patch.dict(os.environ, env, clear=True), \
              patch.object(coach, "client", return_value=FakeGarmin()), \
              patch.object(coach, "_load_sets_cache", return_value={}), \
@@ -616,6 +618,33 @@ class NutritionGoalTests(unittest.TestCase):
             budget = self.budget("fat_loss", **kwargs)
             self.assertEqual(budget["target_status"], "not_appropriate_for_automatic_fat_loss_target")
             self.assertIsNone(budget["target_kcal"])
+
+    def test_explicit_protein_range_overrides_weight_formula_not_calories(self):
+        config = {"AGBOT_PROTEIN_MIN_G": "100", "AGBOT_PROTEIN_MAX_G": "125"}
+        for goal in ("fat_loss", "maintain", None):
+            with self.subTest(goal=goal):
+                before = self.budget(goal)
+                after = self.budget(goal, protein=config)
+                self.assertEqual(after["protein_range_g"], {"min": 100, "max": 125})
+                self.assertIsNone(after["protein_target_g"])
+                self.assertIsNone(after["protein_floor_g"])
+                self.assertIsNone(after["protein_kcal"])
+                self.assertEqual(after["target_kcal"], before["target_kcal"])
+                self.assertIn("goal is met", after["protein_basis"])
+
+    def test_explicit_protein_range_does_not_require_garmin_biometrics(self):
+        budget = self.budget(weight_g=None, protein={
+            "AGBOT_PROTEIN_MIN_G": "100", "AGBOT_PROTEIN_MAX_G": "125"})
+        self.assertEqual(budget["protein_range_g"]["min"], 100)
+        self.assertIsNone(budget["target_kcal"])
+        self.assertEqual(budget["target_status"], "biometrics_unavailable")
+
+    def test_invalid_protein_range_never_falls_back_to_high_estimate(self):
+        for low, high in (("100", ""), ("", "125"), ("0", "125"), ("130", "125"),
+                          ("nan", "125"), ("100", "inf"), ("one hundred", "125")):
+            with self.subTest(low=low, high=high), self.assertRaises(ValueError):
+                self.budget("fat_loss", protein={
+                    "AGBOT_PROTEIN_MIN_G": low, "AGBOT_PROTEIN_MAX_G": high})
 
 
 if __name__ == "__main__":

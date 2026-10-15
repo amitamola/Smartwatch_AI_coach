@@ -178,6 +178,13 @@ class RotationStore:
             "pending_today": any(p["date"] == today.isoformat()
                                  and p.get("status") != "user_skipped"
                                  and p["payload"].get("rotation_slot") == slot for p in plans),
+            "future_plans": [
+                {key: p["payload"][key] for key in (
+                    "date", "kind", "program_template_id", "program_adjustment", "rotation_slot")
+                 if key in p["payload"]}
+                for p in plans if p["date"] > today.isoformat()
+                and p.get("status") != "user_skipped"
+                and p["payload"].get("program_template_id") in sequence],
             "interpretation": "Sequence of sessions, NOT consecutive calendar days. Rest does not advance "
                               "it. Completion is participation only, never proof of safe effort or full dose.",
         }
@@ -241,7 +248,11 @@ def project_rotation(plans, context, today=None):
     offset = int(scheduled_today)
     epoch, position = map(int, context["slot"].split(":"))
     errors = []
-    for plan in sorted(result, key=lambda p: p["date"]):
+    last_requested = max((p["date"] for p in result), default=today.isoformat())
+    forecast = {p["date"]: copy.deepcopy(p) for p in context.get("future_plans", [])
+                if p["date"] <= last_requested}
+    forecast.update({p["date"]: p for p in result})
+    for plan in sorted(forecast.values(), key=lambda p: p["date"]):
         if plan["date"] <= today.isoformat() or plan["kind"] in ("rest", "recovery"):
             continue
         expected = context["upcoming"][offset % len(context["upcoming"])]

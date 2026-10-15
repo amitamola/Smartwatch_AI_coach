@@ -76,7 +76,6 @@ PENDING_DEBRIEF_FILE = os.path.join(STATE, "pending_debrief.json")
 RED_FLAGS_FILE = os.path.join(STATE, "red_flags_date.txt")
 MEAL_STATE_FILE = os.path.join(STATE, "meal_reminders.json")
 HYDRATION_STATE_FILE = os.path.join(STATE, "hydration_reminders.json")
-MOVEMENT_STATE_FILE = os.path.join(STATE, "movement_reminders.json")
 EXERCISE_STATE_FILE = os.path.join(STATE, "exercise_adherence.json")
 FITNESS_FILE = os.path.join(STATE, "fitness_profile.json")
 INCOMING = os.path.join(STATE, "incoming")
@@ -142,34 +141,6 @@ HYDRATION_MESSAGES = (
     "\U0001F4A7 AgBot \u00B7 Hydration nudge - grab a glass of water. Little and often "
     "beats gulping it all at once.",
     "\U0001F6B0 AgBot \u00B7 Time to hydrate - a cup of water now keeps you ahead of thirst.",
-)
-
-# Movement nudges: if Garmin shows a long uninterrupted SITTING stretch during the day, a light
-# "get up and move" reminder - modelled on the hydration nudge but FAIL-CLOSED: it fires ONLY
-# when recent inactivity is CONFIRMED (never on stale data, during a nap, or when the user has
-# been moving), matching a "remind me only when I've actually been sedentary" request. Deduped
-# per slot per day in MOVEMENT_STATE_FILE.
-MOVEMENT_START = 9
-MOVEMENT_END = 21
-MOVEMENT_EVERY_H = 2
-MOVEMENT_CATCHUP_MIN = 45
-MOVEMENT_SEDENTARY_MIN = 50    # need at least this many trailing sedentary minutes to nudge
-MOVEMENT_STALE_MAX_MIN = 60    # skip if the latest intraday bucket is older than this (unconfirmed)
-MOVEMENT_POST_ACTIVITY_MIN = 60  # stay quiet this long after a logged workout/commute ends -
-                                 # step-less efforts (e-bike, cycling, lifting) look 'sedentary'
-                                 # in Garmin's step buckets, so never nudge straight after one
-# ...and never nudge DURING a step-less workout that hasn't saved yet (indoor bike, rowing):
-# a fresh, elevated heart rate means the user is exercising right now even with ~zero steps.
-MOVEMENT_HR_ACTIVE_DELTA = 30    # bpm over resting that flags "currently exercising"
-MOVEMENT_HR_ACTIVE_FLOOR = 100   # ...and an absolute bpm floor
-MOVEMENT_HR_MAX_AGE = 20         # only trust an HR reading this fresh (minutes)
-MOVEMENT_MESSAGES = (
-    "\U0001FA91 AgBot \u00B7 Move break - Garmin suggests little recent movement "
-    "({mins}). If you aren't already active and it feels comfortable, take a short break.",
-    "\U0001F9CD AgBot \u00B7 Movement check ({mins} with little recorded movement). "
-    "A comfortable change of position or brief walk may be useful; skip anything painful.",
-    "\U0001FA91 AgBot \u00B7 Break reminder - limited movement recorded for {mins}. "
-    "If appropriate, pause work and move comfortably. The watch cannot confirm your posture.",
 )
 
 POLL_TIMEOUT = 50          # long-poll seconds
@@ -1993,7 +1964,7 @@ def _generate_checked(prompt, source_text="", images=None, require_plan=False, s
                        if date.today().isoformat() < r["date"] <=
                        (date.today() + timedelta(days=7)).isoformat() and r["date"] not in mentioned)
         if visible:
-            clean += "\n\n" + render_plans(visible)
+            clean += "\n\n" + render_plans(sorted(visible, key=lambda p: p["date"]))
         if plans and PROGRAM_ENABLED:
             schedule = _scheduling_context(plans)
             target = schedule["usual_target_days"]
@@ -2949,99 +2920,6 @@ def maybe_hydration_reminders():
         write_file(HYDRATION_STATE_FILE, json.dumps(sent))
 
 
-def movement_slots_due(now, sent, today):
-    """Hourly-grid movement slots that have arrived today and aren't already handled;
-    should_send is False past the catch-up window (mirror of hydration_slots_due)."""
-    due = []
-    for hh in range(MOVEMENT_START, MOVEMENT_END + 1, MOVEMENT_EVERY_H):
-        slot = "m%02d" % hh
-        if sent.get(slot) == today:
-            continue
-        target = now.replace(hour=hh, minute=0, second=0, microsecond=0)
-        if now < target:
-            continue
-        late_min = (now - target).total_seconds() / 60
-        due.append((slot, hh, late_min <= MOVEMENT_CATCHUP_MIN))
-    return due
-
-
-def _movement_mins_phrase(mins):
-    if mins >= 120:
-        return "over 2 hours"
-    if mins >= 90:
-        return "~1.5 hours"
-    if mins >= 60:
-        return "over an hour"
-    return "about %d min" % mins
-
-
-def _movement_hr_active(info):
-    """True when a fresh, elevated intraday HR shows the user is exercising right now - covers
-    step-less workouts (indoor bike, rowing, lifting) that read 'sedentary' on step buckets."""
-    hr = info.get("last_hr")
-    age = info.get("last_hr_age_min")
-    if hr is None or age is None or age > MOVEMENT_HR_MAX_AGE:
-        return False
-    rest = info.get("resting_hr") or 60
-    return hr >= max(rest + MOVEMENT_HR_ACTIVE_DELTA, MOVEMENT_HR_ACTIVE_FLOOR)
-
-
-def maybe_movement_reminders():
-    """Gentle 'get up and move' nudge - fires ONLY when Garmin confirms a long recent sedentary
-    stretch (fail-closed). Never on stale data, during a nap, or when the user has been moving.
-    One evaluation per slot per day, deduped in MOVEMENT_STATE_FILE."""
-    own = owner()
-    if not own:
-        return
-    now = datetime.now()
-    today = date.today().isoformat()
-    try:
-        sent = json.loads(read_file(MOVEMENT_STATE_FILE) or "{}")
-    except Exception:  # noqa: BLE001
-        sent = {}
-    if not isinstance(sent, dict):
-        sent = {}
-    due = movement_slots_due(now, sent, today)
-    if not due:
-        return
-    info = None
-    try:
-        info = garmin_coach.recent_inactivity()
-    except Exception as exc:  # noqa: BLE001
-        log.error("recent_inactivity fetch failed: %s", exc)
-    changed = False
-    for i, (slot, hh, should) in enumerate(due):
-        if not should:
-            log.info("Movement %s missed window - skipping", slot)
-        elif not isinstance(info, dict):
-            log.info("Movement %s skipped - no intraday data (fail-closed)", slot)
-        elif info.get("data_age_min", 999) > MOVEMENT_STALE_MAX_MIN:
-            log.info("Movement %s skipped - data stale (%s min old)", slot, info.get("data_age_min"))
-        elif info.get("last_level") == "sleeping":
-            log.info("Movement %s skipped - resting/napping", slot)
-        elif (info.get("since_activity_min") is not None
-              and info["since_activity_min"] < MOVEMENT_POST_ACTIVITY_MIN):
-            log.info("Movement %s skipped - workout/commute ended %s min ago", slot,
-                     info.get("since_activity_min"))
-        elif _movement_hr_active(info):
-            log.info("Movement %s skipped - HR %s bpm shows an active workout now "
-                     "(resting %s, %s min old)", slot, info.get("last_hr"),
-                     info.get("resting_hr"), info.get("last_hr_age_min"))
-        elif (info.get("sedentary_run_min") or 0) < MOVEMENT_SEDENTARY_MIN:
-            log.info("Movement %s skipped - not sedentary (run=%s min)", slot,
-                     info.get("sedentary_run_min"))
-        else:
-            mins = info["sedentary_run_min"]
-            log.info("Movement reminder %s at %s (sedentary %s min, %s steps last hour)",
-                     slot, now.strftime("%H:%M"), mins, info.get("last_hour_steps"))
-            send_message(own, MOVEMENT_MESSAGES[i % len(MOVEMENT_MESSAGES)].format(
-                mins=_movement_mins_phrase(mins)))
-        sent[slot] = today
-        changed = True
-    if changed:
-        write_file(MOVEMENT_STATE_FILE, json.dumps(sent))
-
-
 # ---- Daily exercise-adherence check-ins -------------------------------------------------
 # Ask a few times a day whether the recommended exercise got done. Fires ONLY while today is
 # unresolved; once the user replies DWRE (done -> summary), says they're skipping/resting, or
@@ -3405,7 +3283,7 @@ def main():
         threading.Thread(target=target, args=args, daemon=True).start()
     next_schedule = 0
     jobs = (maybe_program_review, maybe_auto_summary, maybe_red_flags, maybe_post_workout, maybe_meal_reminders,
-            maybe_hydration_reminders, maybe_movement_reminders, maybe_exercise_checkins)
+            maybe_hydration_reminders, maybe_exercise_checkins)
     while not _stop.is_set():
         item = runtime_store().claim()
         if item:

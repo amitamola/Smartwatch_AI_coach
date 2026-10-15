@@ -19,6 +19,7 @@ import os
 import sys
 import json
 import copy
+import math
 import tempfile
 import argparse
 from datetime import date, timedelta, datetime, timezone
@@ -412,7 +413,30 @@ def _update_metric_ages(value, today):
             _update_metric_ages(child, today)
 
 
+def configured_protein_range():
+    """An explicit range overrides automatic estimates, independently of Garmin biometrics."""
+    low = os.environ.get("AGBOT_PROTEIN_MIN_G", "").strip()
+    high = os.environ.get("AGBOT_PROTEIN_MAX_G", "").strip()
+    if not low and not high:
+        return None
+    try:
+        low, high = float(low), float(high)
+    except ValueError as exc:
+        raise ValueError("Set both AGBOT_PROTEIN_MIN_G and AGBOT_PROTEIN_MAX_G to positive grams/day") from exc
+    if not (math.isfinite(low) and math.isfinite(high) and 0 < low <= high):
+        raise ValueError("Protein range must be finite, positive and ordered min <= max")
+    return {
+        "protein_range_g": {"min": low, "max": high},
+        "protein_target_g": None, "protein_floor_g": None, "protein_kcal": None,
+        "protein_basis": ("Explicit user-configured daily range overrides automatic g/kg estimates. "
+                          "Within the range means the goal is met; the upper end is not a mandatory "
+                          "minimum or a medical maximum. Do not prescribe catch-up protein to reach "
+                          "the upper end. Medical dietary guidance takes priority."),
+    }
+
+
 def build_snapshot(d_today=None):
+    protein_range = configured_protein_range()
     if d_today is None:
         d_today = date.today()
     elif isinstance(d_today, str):
@@ -1059,6 +1083,11 @@ def build_snapshot(d_today=None):
     except Exception:  # noqa: BLE001
         calorie_budget = None
 
+    if protein_range:
+        if calorie_budget is None:
+            calorie_budget = {"target_kcal": None, "target_status": "biometrics_unavailable"}
+        calorie_budget.update(protein_range)
+
     # ---- Weekly intensity minutes vs Garmin's goal (WHO 150-min target; vigorous counts double) ----
     wim = safe(lambda: g.get_weekly_intensity_minutes(iso(week_start), iso(d_today)))
     weekly_intensity = None
@@ -1179,112 +1208,6 @@ def hydration_today(d_today=None):
     logged = logged if isinstance(logged, (int, float)) else None
     goal = round(goal) if isinstance(goal, (int, float)) else None
     return (logged, goal)
-
-
-def _recent_hr(g, now_utc):
-    """Most recent intraday heart-rate sample as (bpm, age_min, resting_hr), or (None, None, rhr).
-    Lets the mover-nudge detect that the user is CURRENTLY exercising even when the workout is
-    step-less (indoor bike, rowing, lifting) and not yet saved as an activity - HR stays high
-    while step buckets read 'sedentary'."""
-    local_today = now_utc.astimezone(_local_zone()).date().isoformat()
-    hr = safe(lambda: g.get_heart_rates(local_today))
-    if not isinstance(hr, dict) or "__error__" in hr:
-        return None, None, None
-    resting = hr.get("restingHeartRate")
-    last_ts = last_bpm = None
-    for pair in (hr.get("heartRateValues") or []):
-        if not isinstance(pair, (list, tuple)) or len(pair) < 2:
-            continue
-        ts, bpm = pair[0], pair[1]
-        if bpm is None or not isinstance(ts, (int, float)):
-            continue
-        if last_ts is None or ts > last_ts:
-            last_ts, last_bpm = ts, bpm
-    if last_bpm is None:
-        return None, None, resting
-    age_min = round((now_utc.timestamp() - last_ts / 1000.0) / 60)
-    return last_bpm, age_min, resting
-
-
-def recent_inactivity(now_utc=None):
-    """Look at today's 15-min intraday step buckets (Garmin) and report how long the user
-    has been CONTINUOUSLY sedentary up to the most recent synced bucket. Lets the bridge send
-    a 'get up and move' nudge ONLY when recent inactivity is confirmed (fail-closed - returns
-    None on any error so the caller stays quiet). Bucket timestamps are GMT/UTC ('endGMT'),
-    compared against UTC now.
-
-    Step buckets alone are NOT enough: Garmin derives primaryActivityLevel largely from step
-    count, so step-less work - cycling, e-bike commuting, rowing, lifting - lands in buckets
-    labelled 'sedentary' even though the user was moving hard. The intraday feed also lags a
-    sync behind. So today's ACTIVITIES are read too, and the sedentary run is never allowed to
-    reach back past the end of the last one. Returns {data_age_min, sedentary_run_min,
-    last_hour_steps, last_level, since_activity_min} or None."""
-    try:
-        g = client()
-    except Exception:  # noqa: BLE001
-        return None
-    now_utc = now_utc or datetime.now(timezone.utc)
-    local_today = now_utc.astimezone(_local_zone()).date().isoformat()
-    buckets = safe(lambda: g.get_steps_data(local_today))
-    if not isinstance(buckets, list) or not buckets:
-        return None
-    parsed = []
-    for b in buckets:
-        try:
-            end = datetime.fromisoformat(b["endGMT"]).replace(tzinfo=timezone.utc)
-        except Exception:  # noqa: BLE001
-            continue
-        parsed.append((end, b))
-    if not parsed:
-        return None
-    parsed.sort(key=lambda x: x[0])
-    last_end, last_b = parsed[-1]
-    data_age_min = round((now_utc - last_end).total_seconds() / 60)
-    run_min = 0
-    for _end, b in reversed(parsed):
-        if b.get("primaryActivityLevel") == "sedentary":
-            run_min += 15
-        else:
-            break
-    hour_cutoff = last_end - timedelta(minutes=60)
-    last_hour_steps = sum((b.get("steps") or 0) for _end, b in parsed if _end > hour_cutoff)
-    since_activity_min = _minutes_since_last_activity(g, now_utc, local_today)
-    if since_activity_min is not None:
-        # Can't have been sitting longer than the time since the last workout/commute ended.
-        run_min = min(run_min, since_activity_min)
-    last_hr, last_hr_age_min, resting_hr = _recent_hr(g, now_utc)
-    return {
-        "data_age_min": data_age_min,
-        "sedentary_run_min": run_min,
-        "last_hour_steps": last_hour_steps,
-        "last_level": last_b.get("primaryActivityLevel"),
-        "since_activity_min": since_activity_min,
-        "last_hr": last_hr,
-        "last_hr_age_min": last_hr_age_min,
-        "resting_hr": resting_hr,
-    }
-
-
-def _minutes_since_last_activity(g, now_utc, local_today):
-    """Minutes since the END of the most recent activity that STARTED today, or None when
-    there is none (or the lookup fails). Used to stop the movement nudge treating a
-    step-less workout - an e-bike commute, a ride, a lifting session - as sitting still."""
-    acts = safe(lambda: g.get_activities(0, 8))
-    if not isinstance(acts, list):
-        return None
-    latest_end = None
-    for a in acts:
-        if str(a.get("startTimeLocal") or "")[:10] != local_today:
-            continue
-        start = _parse_local_epoch(a.get("startTimeLocal"))
-        if start is None:
-            continue
-        end = start + (a.get("duration") or 0)
-        if latest_end is None or end > latest_end:
-            latest_end = end
-    if latest_end is None:
-        return None
-    return max(0, round((now_utc.timestamp() - latest_end) / 60))
 
 
 def _parse_local_epoch(s):
