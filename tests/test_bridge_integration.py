@@ -497,6 +497,43 @@ class BridgeTests(unittest.TestCase):
                                  "type": "running", "name": "Synthetic run"}])
         self.assertEqual(checked.call_count, 7)
 
+    def test_todays_food_summary_ignores_replaced_entries_and_parses_ranges(self):
+        b = self.bridge
+        now = datetime.now()
+        yesterday = (now.date() - timedelta(days=1)).isoformat()
+        b._current_request = "update:food1"
+        first = b.append_journal(
+            "Late meal (~780–960 kcal, ~58–70 g protein)"
+        )
+        b._current_request = "update:food2"
+        second = b.append_journal(
+            "Combined day intake: ~1,083–1,340 kcal, ~90–107 g protein"
+        )
+        # Re-dating the second entry to yesterday and superseding the first leaves zero today.
+        b._current_request = "update:food3"
+        moved = b.append_journal(
+            "Corrected yesterday meal: ~1,083–1,340 kcal, ~90–107 g protein",
+            on_date=yesterday,
+            replaces_entry_id=second["entry_id"],
+        )
+        with open(b.JOURNAL_FILE, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({
+                "entry_type": "supersession",
+                "replaces_entry_id": first["entry_id"],
+                "superseded_by": moved["entry_id"],
+                "date": yesterday,
+            }) + "\n")
+        self.assertEqual(b._todays_food_summary(now), (0, 0, 0))
+        self.assertEqual(b._todays_food_log_times(now), [])
+
+        # Decimal grams, comma-formatted calories, and ingredient 'protein powder' mentions.
+        b._current_request = "update:food4"
+        b.append_journal(
+            "Shake: ~40g protein powder (~315 kcal, ~35.6g protein) "
+            "Lunch (~1,200 kcal, ~54.4g protein)"
+        )
+        self.assertEqual(b._todays_food_summary(now), (1, 90, 1515))
+
 
 def day_string():
     return date.today().isoformat()

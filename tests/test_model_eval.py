@@ -59,6 +59,9 @@ class ModelEvalTests(unittest.TestCase):
         command, _ = build_command("gemini-3.7-flash", "medium", "synthetic")
         self.assertIn("--available-tools=", command)
         self.assertNotIn("--deny-tool=*", command)
+        self.assertIn("--sync-session", command)
+        self.assertNotIn("--no-remote", command)
+        self.assertNotIn("--no-remote-export", command)
 
     def test_default_output_root_is_generic(self):
         self.assertEqual(

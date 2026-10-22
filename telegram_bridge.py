@@ -1085,7 +1085,7 @@ def _llm_copilot(prompt, images, timeout=None):
         "--no-ask-user", "--available-tools=",
         "--no-custom-instructions",
         "--disable-builtin-mcps", "--disable-mcp-server", "garmin",
-        "--no-color", "--no-remote", "--no-remote-export",
+        "--no-color", "--sync-session", "off",
         "--reasoning-effort", COPILOT_REASONING_EFFORT, "--context", "default",
     ]
     for att in images:
@@ -2688,17 +2688,8 @@ def _todays_food_log_times(now):
     """Local datetimes of today's journaled food entries. Used to skip a meal nudge
     for a meal that's already been logged (the journal is the bot's own food log)."""
     times = []
-    try:
-        with open(JOURNAL_FILE, "r", encoding="utf-8") as fh:
-            lines = [ln for ln in fh.read().strip().split("\n") if ln]
-    except FileNotFoundError:
-        return times
     today = now.date().isoformat()
-    for ln in lines[-JOURNAL_KEEP:]:
-        try:
-            e = json.loads(ln)
-        except json.JSONDecodeError:
-            continue
+    for e in active_journal_entries()[-JOURNAL_KEEP:]:
         if e.get("date") != today:
             continue
         try:
@@ -2723,40 +2714,42 @@ def _meal_slot_windows():
     return windows
 
 
-_PROTEIN_RE = re.compile(r"(\d+)\s*g\s*(?:of\s+)?protein", re.IGNORECASE)
-_KCAL_RE = re.compile(r"(\d+)\s*k?cal\b", re.IGNORECASE)
+_MACRO_NUM_RE = r"\d+(?:,\d{3})*(?:\.\d+)?"
+_MACRO_SPAN_RE = rf"(?<!\d)(?<!\.)({_MACRO_NUM_RE})(?:\s*(?:[-–—]|to)\s*({_MACRO_NUM_RE}))?"
+_PROTEIN_RE = re.compile(
+    rf"{_MACRO_SPAN_RE}\s*g\s*(?:of\s+)?protein"
+    r"(?!\s*(?:powder|isolate|concentrate|blend|scoop|bar|shake)\b)",
+    re.IGNORECASE,
+)
+_KCAL_RE = re.compile(rf"{_MACRO_SPAN_RE}\s*k?cal\b", re.IGNORECASE)
+
+
+def _macro_midpoint(match):
+    lo = float(match.group(1).replace(",", ""))
+    hi = float(match.group(2).replace(",", "")) if match.group(2) else lo
+    return (lo + hi) / 2.0
 
 
 def _todays_food_summary(now):
-    """(count, protein_g, kcal) from today's journal food entries. protein_g / kcal are
+    """(count, protein_g, kcal) from today's active journal food entries. protein_g / kcal are
     best-effort sums of the '~Xg protein' / '~Y kcal' estimates in the auto-log text (0 if
-    none parseable); count excludes '[coach plan]' notes. Lets a meal nudge show real
-    running totals without calling the model."""
-    count = protein = kcal = 0
-    try:
-        with open(JOURNAL_FILE, "r", encoding="utf-8") as fh:
-            lines = [ln for ln in fh.read().strip().split("\n") if ln]
-    except FileNotFoundError:
-        return (0, 0, 0)
+    none parseable); count excludes '[coach plan]' notes and superseded entries. Lets a meal
+    nudge show real running totals without calling the model."""
+    count = 0
+    protein = kcal = 0.0
     today = now.date().isoformat()
-    for ln in lines[-JOURNAL_KEEP:]:
-        try:
-            e = json.loads(ln)
-        except json.JSONDecodeError:
-            continue
+    for e in active_journal_entries()[-JOURNAL_KEEP:]:
         if e.get("date") != today:
             continue
         txt = e.get("text") or ""
         if txt.lstrip().startswith("[coach plan]"):
             continue
         count += 1
-        pm = _PROTEIN_RE.search(txt)
-        if pm:
-            protein += int(pm.group(1))
-        km = _KCAL_RE.search(txt)
-        if km:
-            kcal += int(km.group(1))
-    return (count, protein, kcal)
+        parens = [p for p in re.findall(r"\([^()]*\)", txt) if _KCAL_RE.search(p)]
+        target = " ".join(parens) if parens else txt
+        protein += sum(_macro_midpoint(m) for m in _PROTEIN_RE.finditer(target))
+        kcal += sum(_macro_midpoint(m) for m in _KCAL_RE.finditer(target))
+    return (count, round(protein), round(kcal))
 
 
 def _meal_nudge_text(slot, base_text, now):
