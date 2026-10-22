@@ -12,7 +12,7 @@ import re
 import sqlite3
 import unicodedata
 from contextlib import contextmanager
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 
@@ -507,6 +507,19 @@ class MemoryStore:
         ).fetchone()
         old = self._record(row) if row else None
         metadata = source_metadata if source_metadata is not None else {}
+        if (source_metadata is None and verified and kind == "preference"
+                and key.startswith(("travel:", "temporary:")) and observed_on):
+            numbers = {word: i for i, word in enumerate(
+                ("one", "two", "three", "four", "five", "six", "seven"), 1)}
+            number = r"(?:[1-7]|one|two|three|four|five|six|seven)"
+            duration = re.search(rf"\bfor ({number})(?:\s*(?:to|-)\s*({number}))?\s+days?\b",
+                                 text, re.IGNORECASE)
+            if duration:
+                value = (duration[2] or duration[1]).lower()
+                days = int(value) if value.isdigit() else numbers[value]
+                metadata = {"valid_until": (date.fromisoformat(observed_on) +
+                                           timedelta(days=days)).isoformat(),
+                            "validity_reason": "Explicit temporary duration: " + duration[0]}
         values = {
             "text": text, "source_text": source_text, "source_type": source_type,
             "observed_on": observed_on, "verified": verified, "status": status,
@@ -666,7 +679,35 @@ class MemoryStore:
                 "AND (? IS NULL OR status=?) ORDER BY updated_at DESC,id DESC",
                 (kind, status, status),
             ).fetchall()
-            return [self._record(row) for row in rows]
+            records = [self._record(row) for row in rows]
+            if status == "active":
+                records = [r for r in records if not self._expired(r)]
+            return records
+
+    @staticmethod
+    def _expired(record):
+        if (record["kind"] != "preference"
+                or not record["key"].startswith(("travel:", "temporary:"))):
+            return False
+        until = record["source_metadata"].get("valid_until")
+        return bool(until and date.fromisoformat(until) < date.today())
+
+    def set_temporary_scope(self, record_id, valid_until, reason):
+        """Audited maintenance: expire a temporary preference, never a health restriction."""
+        until = date.fromisoformat(valid_until).isoformat()
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("A source-based temporary-scope reason is required")
+        with self._connection(write=True) as db:
+            row = db.execute("SELECT * FROM memory_records WHERE id=?", (record_id,)).fetchone()
+            if row is None:
+                raise ValueError("Memory record not found")
+            record = self._record(row)
+            if record["kind"] != "preference" or not record["key"].startswith(("travel:", "temporary:")):
+                raise ValueError("Only temporary/travel preferences can expire automatically")
+            metadata = dict(record["source_metadata"], valid_until=until, validity_reason=reason)
+            return self._upsert(db, record["kind"], record["key"], record["text"],
+                                record["source_text"], record["source_type"], record["observed_on"],
+                                record["verified"], record["status"], metadata)
 
     def revisions(self, kind, key):
         """Return oldest-first complete snapshots, with ``action`` and revision number."""
@@ -706,8 +747,11 @@ class MemoryStore:
         if verified_only and kind != "anchor":
             raise ValueError("verified_only is anchor-only; standing constraints cannot be hidden.")
         records = self.records(kind)
+        expired = sum(self._expired(r) for r in self.records(kind, status=None)
+                      if r["status"] == "active")
         if not records:
-            return ""
+            return (f"{expired} expired temporary preference(s) omitted; historical source retained."
+                    if expired else "")
         excluded = 0
         if verified_only:
             trusted = [record for record in records
@@ -730,6 +774,8 @@ class MemoryStore:
         )
         if kind in ("preference", "health"):
             header += " Retain active restrictions pending explicit correction or resolution."
+        if expired:
+            header += f"\n[{expired} expired temporary preferences omitted; history retained.]"
         if excluded:
             header += (
                 f"\n[{excluded} active anchor records excluded by verified-only filter "

@@ -27,6 +27,11 @@ reflexively accepting or rejecting it. Use a dated outline with any unresolved
 intensity/format question. For a machine/variant/load clarification, emit
 SESSION_PATCH so the saved workout and your instructions agree.
 
+Requests to restore missing training goals must change an actual plan or programme
+proposal, not only receive reassurance that a template exists. Preserve the
+ROTATION_STATE pending session or give its explicit timed deferral. Do not claim
+a rotation/programme was saved via prose: the programme command reviews and saves it.
+
 For food, use the shared Meal estimate / Meal total / Daily progress format:
 per-item kcal and macros, then daily calories AND protein eaten/target/remaining.
 No tables. Log only reported consumption via LOG; use LOG_REPLACES for corrections.

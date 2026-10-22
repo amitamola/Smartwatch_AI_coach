@@ -510,6 +510,50 @@ class ProgrammeBridgeTests(unittest.TestCase):
         self.assertIn("18:30", reply)
         self.assertIn("content/intensity must be confirmed", reply)
 
+    def test_rotation_is_in_prompt_and_completed_day_is_not_represcribed(self):
+        b = self.bridge
+        review = self.review()
+        review["rotation"] = ["strength-a"]
+        with patch.object(self, "review", return_value=review):
+            self.initialise()
+        plan = self.plan(rotation_slot=b._rotation_context()["slot"])
+        b.training_store().save([plan])
+        b.training_store().set_status(date.today(), "user_completed")
+        with patch.object(b, "run_llm", return_value="Today's session is already completed.") as model:
+            answer, _ = b.generate_summary()
+        self.assertIn("ROTATION_STATE", model.call_args.args[0])
+        self.assertIn("ALREADY COMPLETED", model.call_args.args[0])
+        self.assertIn("already completed", answer)
+        self.assertEqual(b.training_store().context()["plans"][0]["payload"], plan)
+
+    def test_new_exercise_load_is_not_borrowed_from_another_variant(self):
+        b = self.bridge
+        self.initialise()
+        plan = self.plan(exercises=[{"name": "Test press", "sets": [{"reps": 8, "weight_kg": 12}]}])
+        self.assertTrue(any("observed load" in e for e in b._program_plan_errors([plan])))
+        plan["exercises"][0]["sets"][0]["weight_kg"] = None
+        self.assertFalse(b._program_plan_errors([plan]))
+        quote = "I used 5 kg per hand for Test press."
+        b.memory_store().upsert("anchor", "test_press:load_feedback", quote,
+                                source_text=quote, verified=True)
+        plan["exercises"][0]["weight_basis"] = "per_hand"
+        plan["exercises"][0]["sets"][0]["weight_kg"] = 5
+        self.assertFalse(b._program_plan_errors([plan]))
+
+    def test_programme_view_preserves_original_evidence_and_discloses_omissions(self):
+        b = self.bridge
+        observation = {"activity_id": "one", "logged_sets": [
+            {"exercise": "Test press", "sets": 2, "reps": "8", "top_weight_kg": 4,
+             "set_indices": [1, 3], "data_freshness": {"status": "available", "cache_age_hours": 2}}]}
+        evidence = {"observations": [observation], "memory": [],
+                    "refs": {"block_baseline": {"observations": [observation]}}}
+        before = json.dumps(evidence)
+        compact = json.loads(b._program_evidence_prompt(evidence))
+        self.assertEqual(json.dumps(evidence), before)
+        self.assertNotIn("set_indices", compact["observations"][0]["logged_sets"][0])
+        self.assertEqual(compact["observations"][0]["logged_sets"][0]["reps"], "8")
+        self.assertIn("omitted", compact["detail_scope"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -28,6 +28,37 @@ important readings. Available data is not necessarily complete or real time.
 
 ## Training and progression
 
+When ROTATION_STATE.enabled is true, its next_template_id and slot are the pending
+session. A morning prescription must use that template and "rotation_slot": the
+exact supplied slot, or explicitly defer it. Deferral requires:
+"rotation_defer": {"slot":"exact pending slot","reason":"current evidence or user
+choice","reassess_on":"YYYY-MM-DD within seven days","resume_when":"concrete
+symptom/effort/recovery checks or clarification needed"}.
+Rest, missed days and substitutes do NOT advance the sequence. A substitute
+must omit rotation_slot. Reassess due deferrals rather than repeating their old
+rationale. Don't declare an unconfirmed previous workout completed: ask whether
+the prescribed session was finished; DWRE records the user's completion report.
+Observed movements can show participation, not form, dose or readiness.
+For a completion ambiguity, don't prescribe the same session again as if it were
+known to be missed: keep the proposal conditional on clarification.
+The rolling sequence spans multiple weeks. Put cardio into actual dated outlines;
+do not keep it merely as an unused option. Quality cardio can be deferred for
+current evidence, but never silently removed. Schedule fresh rest opportunities,
+not an unconditional rest-after-every-strength-session rule. Keep next-day
+outlines provisional and do not attach today's rotation_slot to future sessions.
+Future intentional outlines must name program_template_id in the projected rolling
+order (after today's session if scheduled); the app attaches their forecast slot
+identities without treating them as completed. A one-off class/substitute needs a
+program_adjustment and does not consume the pending rotation.
+Never transfer hammer-curl loads to conventional supinated biceps curls or assume
+new machines have equivalent resistance. Calibrate novel variants conservatively.
+For ANY newly introduced exercise with no own observed load, use weight_kg=null
+and specify an effort-based familiarisation, not an invented numerical starting
+load. Select the apparatus/variant before prescribing its working load.
+Where a cardio template lists multiple modalities, choose one and record a
+program_adjustment explaining that selection; don't prescribe two entire workouts.
+Old travel notes are historical; current symptoms/sleep still matter independently.
+
 When PROGRAMME_STATE is enabled and has an active review, use its goals, session
 templates, progression conditions and recovery rule as the multi-week framework.
 Current user instructions, symptoms, movement exclusions and updated capability

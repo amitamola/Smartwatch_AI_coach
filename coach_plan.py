@@ -103,6 +103,17 @@ def parse_plans(text, preferences=(), today=None, existing_plans=()):
                 raise ValueError("plan needs an objective")
             if not isinstance(plan.get("reason"), str) or not plan["reason"].strip():
                 raise ValueError("plan needs a reason based on the available evidence")
+            if "rotation_slot" in plan and (
+                    not isinstance(plan["rotation_slot"], str)
+                    or not re.fullmatch(r"\d+:\d+", plan["rotation_slot"])):
+                raise ValueError("rotation_slot must be the application-supplied occurrence identifier")
+            if "rotation_defer" in plan:
+                deferred = plan["rotation_defer"]
+                if (not isinstance(deferred, dict)
+                        or any(not isinstance(deferred.get(k), str) or not deferred[k].strip()
+                               for k in ("slot", "reason", "reassess_on", "resume_when"))):
+                    raise ValueError("rotation_defer needs slot, reason, reassess_on and resume_when")
+                date.fromisoformat(deferred["reassess_on"])
             exercises = plan.get("exercises", [])
             if not isinstance(exercises, list):
                 raise ValueError("exercises must be a list")
@@ -217,6 +228,8 @@ def unsupported_claims(text):
         r"(?:clear|(?:be|reach|hit) (?:at )?zero)",
         r"\b(?:[5-7](?:th)?|fifth|sixth|seventh|extra)\s+(?:rolling )?"
         r"(?:session|training day)\s+is\s+(?:fine|safe)\b",
+        r"\b(?:confirms?|confirming|proves?|proving)\s+(?:your )?systemic freshness\b",
+        r"\brest\s+(?:has )?cleared\s+(?:your )?(?:acute )?fatigue\b",
     ]
     problems = []
     for match in re.finditer(pattern + "|" + "|".join(semantic_patterns), text or "", re.IGNORECASE):
