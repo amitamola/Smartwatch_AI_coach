@@ -106,8 +106,11 @@ PROGRAM_REVIEW_TIMEOUT = int(os.environ.get("AGBOT_PROGRAM_REVIEW_TIMEOUT", "180
 PROGRAM_POLICY_VERSION = 3
 
 # Auto-summary window (local time). If no summary has been sent yet today and the
-# current time falls in this window, one is pushed automatically.
+# current time falls in this window, one is pushed automatically. Between AUTO_START
+# and AUTO_SLEEP_WAIT_UNTIL we wait for overnight sleep to sync first.
 AUTO_START = (9, 30)
+AUTO_SLEEP_WAIT_UNTIL = (11, 30)
+AUTO_SLEEP_POLL_SECS = 300
 AUTO_END = (20, 0)
 
 # Daily meal-logging reminders (local time): (slot, hour, minute, message). Each fires
@@ -1682,20 +1685,29 @@ def _nutrition_focused(prompt_file, question):
                           question, re.IGNORECASE))
 
 
+def _trim_nutrition_activity(activity):
+    out = {key: value for key, value in activity.items()
+           if key not in ("logged_sets", "detail_metrics")}
+    dm = activity.get("detail_metrics")
+    if isinstance(dm, dict):
+        lean = {k: dm[k] for k in ("status", "fuel_estimate", "groups") if k in dm}
+        if lean:
+            out["detail_metrics"] = lean
+    return out
+
+
 def _nutrition_context(data, training):
     data = dict(data)
     for field in ("recent_activities_7d", "activities"):
         if field in data:
-            data[field] = [{key: value for key, value in activity.items()
-                            if key not in ("logged_sets", "detail_metrics")}
+            data[field] = [_trim_nutrition_activity(activity)
                            for activity in data[field]]
     for outcome in training["recent_outcomes"]:
-        outcome["payload"] = {key: value for key, value in outcome["payload"].items()
-                              if key not in ("logged_sets", "detail_metrics")}
+        outcome["payload"] = _trim_nutrition_activity(outcome["payload"])
     training["latest_observed_per_movement"] = {}
     training["detail_selection"] = (
         "Nutrition-focused view: exact set timelines/capabilities are omitted, not absent. "
-        "Activity totals, plans, reported day status, active symptoms and preferences remain.")
+        "Activity totals, fuel estimates, plans, reported day status, active symptoms and preferences remain.")
     return data, training
 
 
@@ -1712,9 +1724,11 @@ def _assemble(prompt_file, question=None, include_history=True,
     if data is None:
         data = get_snapshot()
     nutrition_focused = _nutrition_focused(prompt_file, question) and not plan_request_scope(question)
-    if (prompt_file in (SUMMARY_PROMPT_FILE, PERF_PROMPT_FILE)
+    if (prompt_file in (SUMMARY_PROMPT_FILE, PERF_PROMPT_FILE, WEEKLY_PROMPT_FILE, NUTRITION_PROMPT_FILE)
             or re.search(r"\b(?:workout|exercise|training|stamina|running dynamics|"
-                         r"fat burner|fat burned|fuel use|carbohydrate burned)\b",
+                         r"fat burner|fat burned|fuel use|carbohydrate burned|"
+                         r"ride|cycling|bike|run|running|hike|hiking|gym|session|"
+                         r"calories|carbs|fat|recovery|rpe|feel|zone)\b",
                          question or "", re.IGNORECASE)):
         _enrich_activity_context(data, question or "", summary=prompt_file == SUMMARY_PROMPT_FILE)
     for field in ("recent_activities_7d", "activities"):
@@ -1775,6 +1789,15 @@ def _assemble(prompt_file, question=None, include_history=True,
     if notes:
         parts.append("\nNOTES YOU'VE SHARED (durable context the user logged):\n"
                      + notes + "\n")
+    nutr_summary = rolling_nutrition_summary(
+        days=7,
+        today=date.today(),
+        calorie_budget=data.get("calorie_budget") if isinstance(data, dict) else None,
+    )
+    if nutr_summary.get("logged_days_count", 0) > 0:
+        parts.append("\nNUTRITION_SUMMARY_7D (aggregated from active food journal entries; "
+                     "superseded corrections excluded):\n"
+                     + json.dumps(nutr_summary, separators=(",", ":"), default=str) + "\n")
     hist = recent_history_text() if include_history else ""
     fit = None if nutrition_focused else load_fitness_profile()
     if isinstance(fit, dict):
@@ -2667,6 +2690,31 @@ def dispatch(msg):
     _route_text(chat_id, text)
 
 
+_last_sleep_sync_check = 0.0
+
+
+def _auto_summary_sleep_ready(now):
+    """Wait until AUTO_SLEEP_WAIT_UNTIL for overnight sleep to sync before auto-sending
+    the morning brief; after that cutoff, or on any API error, proceed (fail-open)."""
+    global _last_sleep_sync_check
+    if (now.hour, now.minute) >= AUTO_SLEEP_WAIT_UNTIL:
+        return True
+    mono = time.monotonic()
+    if _last_sleep_sync_check and mono - _last_sleep_sync_check < AUTO_SLEEP_POLL_SECS:
+        return False
+    _last_sleep_sync_check = mono
+    try:
+        logged = garmin_coach.sleep_logged_today(now.date())
+    except Exception as exc:  # noqa: BLE001
+        log.warning("sleep_logged_today check failed, proceeding with brief: %s", exc)
+        return True
+    if logged is False:
+        log.info("Auto-summary waiting for overnight sleep sync at %s (cutoff %02d:%02d)",
+                 now.strftime("%H:%M"), AUTO_SLEEP_WAIT_UNTIL[0], AUTO_SLEEP_WAIT_UNTIL[1])
+        return False
+    return True
+
+
 def maybe_auto_summary():
     own = owner()
     if not own:
@@ -2679,6 +2727,8 @@ def maybe_auto_summary():
     now = datetime.now()
     cur = (now.hour, now.minute)
     if cur < AUTO_START or cur >= AUTO_END:
+        return
+    if not _auto_summary_sleep_ready(now):
         return
     log.info("Auto-summary trigger at %s", now.strftime("%H:%M"))
     do_summary(own, auto=True)
@@ -2721,6 +2771,11 @@ _PROTEIN_RE = re.compile(
     r"(?!\s*(?:powder|isolate|concentrate|blend|scoop|bar|shake)\b)",
     re.IGNORECASE,
 )
+_CARBS_RE = re.compile(rf"{_MACRO_SPAN_RE}\s*g\s*(?:of\s+)?carb(?:ohydrate)?s?\b", re.IGNORECASE)
+_FAT_RE = re.compile(
+    rf"(?<!low[- ])(?<!full[- ]){_MACRO_SPAN_RE}\s*g\s*(?:of\s+)?fat\b",
+    re.IGNORECASE,
+)
 _KCAL_RE = re.compile(rf"{_MACRO_SPAN_RE}\s*k?cal\b", re.IGNORECASE)
 
 
@@ -2728,6 +2783,111 @@ def _macro_midpoint(match):
     lo = float(match.group(1).replace(",", ""))
     hi = float(match.group(2).replace(",", "")) if match.group(2) else lo
     return (lo + hi) / 2.0
+
+
+def _parse_entry_macros(txt):
+    parens = [p for p in re.findall(r"\([^()]*\)", txt) if _KCAL_RE.search(p)]
+    target = " ".join(parens) if parens else txt
+    kcal = sum(_macro_midpoint(m) for m in _KCAL_RE.finditer(target))
+    protein = sum(_macro_midpoint(m) for m in _PROTEIN_RE.finditer(target))
+    carbs = sum(_macro_midpoint(m) for m in _CARBS_RE.finditer(target))
+    fat = sum(_macro_midpoint(m) for m in _FAT_RE.finditer(target))
+    return kcal, protein, carbs, fat
+
+
+def _protein_status(protein_g, calorie_budget):
+    if not isinstance(calorie_budget, dict):
+        return None
+    pr = calorie_budget.get("protein_range_g")
+    if isinstance(pr, dict) and isinstance(pr.get("min"), (int, float)) and isinstance(pr.get("max"), (int, float)):
+        if protein_g < pr["min"]:
+            return "below_range"
+        if protein_g > pr["max"]:
+            return "above_range"
+        return "within_range"
+    pt = calorie_budget.get("protein_target_g")
+    if isinstance(pt, (int, float)) and pt > 0:
+        return "met" if protein_g >= pt else "below_target"
+    return None
+
+
+def rolling_nutrition_summary(days=7, today=None, calorie_budget=None):
+    """Aggregate active food journal entries over the trailing `days` window into
+    daily kcal/macro totals, protein target hit-rate, and implied calorie deficit."""
+    d_today = today if isinstance(today, date) else date.fromisoformat(str(today or date.today())[:10])
+    start_iso = (d_today - timedelta(days=max(1, days) - 1)).isoformat()
+    today_iso = d_today.isoformat()
+    by_day = {}
+    for e in active_journal_entries():
+        day = e.get("date")
+        if not isinstance(day, str) or not (start_iso <= day <= today_iso):
+            continue
+        txt = e.get("text") or ""
+        if txt.lstrip().startswith("[coach plan]"):
+            continue
+        kcal, protein, carbs, fat = _parse_entry_macros(txt)
+        bucket = by_day.setdefault(day, {"entries_count": 0, "kcal": 0.0, "protein_g": 0.0,
+                                         "carbs_g": 0.0, "fat_g": 0.0})
+        bucket["entries_count"] += 1
+        bucket["kcal"] += kcal
+        bucket["protein_g"] += protein
+        bucket["carbs_g"] += carbs
+        bucket["fat_g"] += fat
+    maint = calorie_budget.get("maintenance_kcal") if isinstance(calorie_budget, dict) else None
+    target_kcal = calorie_budget.get("target_kcal") if isinstance(calorie_budget, dict) else None
+    rows = []
+    for day in sorted(by_day):
+        b = by_day[day]
+        kcal_r = round(b["kcal"])
+        prot_r = round(b["protein_g"])
+        carbs_r = round(b["carbs_g"])
+        fat_r = round(b["fat_g"])
+        p_status = _protein_status(prot_r, calorie_budget)
+        row = {
+            "date": day,
+            "is_today": day == today_iso,
+            "entries_count": b["entries_count"],
+            "kcal": kcal_r,
+            "protein_g": prot_r,
+            "carbs_g": carbs_r,
+            "fat_g": fat_r,
+        }
+        if isinstance(target_kcal, (int, float)) and kcal_r > 0:
+            row["vs_target_kcal"] = round(kcal_r - target_kcal)
+        if isinstance(maint, (int, float)) and kcal_r > 0:
+            row["implied_deficit_kcal"] = round(maint - kcal_r)
+        if p_status is not None:
+            row["protein_status"] = p_status
+        rows.append(row)
+    completed = [r for r in rows if not r["is_today"] and r["kcal"] > 0]
+    avg_completed = None
+    if completed:
+        n = len(completed)
+        avg_completed = {
+            "kcal": round(sum(r["kcal"] for r in completed) / n),
+            "protein_g": round(sum(r["protein_g"] for r in completed) / n),
+            "carbs_g": round(sum(r["carbs_g"] for r in completed) / n),
+            "fat_g": round(sum(r["fat_g"] for r in completed) / n),
+        }
+        if isinstance(maint, (int, float)):
+            avg_completed["implied_deficit_kcal"] = round(
+                sum(r.get("implied_deficit_kcal", 0) for r in completed) / n
+            )
+    hit_days = sum(1 for r in rows if r.get("protein_status") in ("within_range", "above_range", "met"))
+    today_row = next((r for r in rows if r["is_today"]), None)
+    return {
+        "window_start": start_iso,
+        "window_end": today_iso,
+        "logged_days_count": len(rows),
+        "completed_logged_days_count": len(completed),
+        "protein_goal_hit_days": hit_days,
+        "completed_days_average": avg_completed,
+        "today_so_far": today_row or {"date": today_iso, "is_today": True, "entries_count": 0,
+                                      "kcal": 0, "protein_g": 0, "carbs_g": 0, "fat_g": 0},
+        "days": rows,
+        "note": ("Aggregated from active user-logged meals in the bot journal; unlogged days "
+                 "are omitted (not treated as zero intake)."),
+    }
 
 
 def _todays_food_summary(now):
@@ -2745,10 +2905,9 @@ def _todays_food_summary(now):
         if txt.lstrip().startswith("[coach plan]"):
             continue
         count += 1
-        parens = [p for p in re.findall(r"\([^()]*\)", txt) if _KCAL_RE.search(p)]
-        target = " ".join(parens) if parens else txt
-        protein += sum(_macro_midpoint(m) for m in _PROTEIN_RE.finditer(target))
-        kcal += sum(_macro_midpoint(m) for m in _KCAL_RE.finditer(target))
+        entry_kcal, entry_prot, _c, _f = _parse_entry_macros(txt)
+        protein += entry_prot
+        kcal += entry_kcal
     return (count, round(protein), round(kcal))
 
 

@@ -420,6 +420,53 @@ class MetricTests(unittest.TestCase):
         self.assertEqual(out["details_coverage"]["status"], "error")
         save.assert_not_called()
 
+    def test_acclimation_fitness_age_components_and_activity_extras(self):
+        raw_max = [{"heatAltitudeAcclimation": {
+            "calendarDate": "2026-09-06",
+            "heatAcclimationDate": "2026-09-06",
+            "heatAcclimationPercentage": 45,
+            "previousHeatAcclimationPercentage": 30,
+            "heatTrend": "ACCLIMATIZING",
+            "altitudeAcclimation": 800,
+            "previousAltitudeAcclimation": 750,
+            "altitudeTrend": "ACCLIMATIZED",
+            "currentAltitude": 540,
+        }}]
+        acc = metrics.acclimation_metric(raw_max, TODAY)
+        self.assertEqual(acc["status"], "available")
+        self.assertEqual(acc["heat_acclimation_pct"], 45)
+        self.assertEqual(acc["heat_acclimation_change_pct"], 15.0)
+        self.assertEqual(acc["altitude_acclimation_m"], 800)
+        self.assertEqual(acc["age_days"], 1)
+
+        comps = metrics.fitness_age_components({
+            "bmi": {"value": 24.8, "targetValue": 21.0, "improvementValue": 3.8,
+                    "potentialAge": 26.4, "priority": 1, "stale": False},
+            "vigorousMinutesAvg": {"value": 55.2, "targetValue": 75, "potentialAge": 28.1,
+                                   "priority": 2, "numOfWeeksForIm": 6},
+        })
+        self.assertEqual(comps["bmi"]["target_value"], 21.0)
+        self.assertEqual(comps["bmi"]["potential_fitness_age"], 26.4)
+        self.assertEqual(comps["vigorousMinutesAvg"]["weeks_window"], 6)
+
+        act_row = activity("2026-09-06", "indoor_cycling", aid=99, duration=1800)
+        act_row.update(
+            calories=330.0, bmrCalories=40.0,
+            hrTimeInZone_1=60.0, hrTimeInZone_4=600.0, hrTimeInZone_5=300.0,
+            recoveryHeartRate=31, directWorkoutFeel=100, directWorkoutRpe=80,
+            aerobicTrainingEffectMessage="HIGHLY_IMPROVING_VO2_MAX_16",
+        )
+        trimmed = coach._trim_activity(act_row)
+        self.assertEqual(trimmed["bmr_calories"], 40)
+        self.assertEqual(trimmed["active_calories"], 290)
+        self.assertEqual(trimmed["hr_zones_min"], {"z1": 1.0, "z4": 10.0, "z5": 5.0})
+        self.assertEqual(trimmed["recovery_hr_bpm"], 31)
+        self.assertEqual(trimmed["workout_rpe"], 80)
+
+        am = metrics.activity_metrics({"summaryDTO": {"recoveryHeartRate": 31}})
+        self.assertEqual(am["groups"]["recovery"]["values"]["recoveryHeartRate"]["value"], 31)
+        self.assertEqual(am["groups"]["recovery"]["values"]["recoveryHeartRate"]["unit"], "bpm")
+
 
 class CoverageTests(unittest.TestCase):
     def test_programme_history_fetches_older_sessions_with_a_bounded_set_budget(self):

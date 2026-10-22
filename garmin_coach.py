@@ -164,8 +164,25 @@ def _trim_activity(a):
         "avg_power": a.get("avgPower"),
     }
     # Extra per-activity signals; dropped when absent so strength/cardio rows stay lean.
+    cal = a.get("calories")
+    bmr_cal = a.get("bmrCalories")
+    active_cal = (_round(cal - bmr_cal)
+                  if metrics.number(cal) and metrics.number(bmr_cal) and cal >= bmr_cal else None)
+    hr_zones = {
+        f"z{i}": round(sec / 60.0, 1)
+        for i in range(1, 6)
+        if metrics.number(sec := a.get(f"hrTimeInZone_{i}")) and sec > 0
+    } or None
     extras = {
         "training_effect_label": a.get("trainingEffectLabel"),
+        "aerobic_te_message": a.get("aerobicTrainingEffectMessage"),
+        "anaerobic_te_message": a.get("anaerobicTrainingEffectMessage"),
+        "bmr_calories": _round(bmr_cal),
+        "active_calories": active_cal,
+        "hr_zones_min": hr_zones,
+        "recovery_hr_bpm": a.get("recoveryHeartRate"),
+        "workout_feel": a.get("directWorkoutFeel"),
+        "workout_rpe": a.get("directWorkoutRpe"),
         "bb_cost": a.get("differenceBodyBattery"),
         "sweat_loss_ml": _round(a.get("waterEstimated")),
         "moderate_intensity_min": a.get("moderateIntensityMinutes"),
@@ -587,11 +604,18 @@ def build_snapshot(d_today=None):
             "recovery_time_h": round(rt_min / 60, 1) if isinstance(rt_min, (int, float)) else None,
             "recovery_change": r0.get("recoveryTimeChangePhrase"),
             "sleep_score_factor": r0.get("sleepScoreFactorPercent"),
+            "sleep_score_factor_feedback": r0.get("sleepScoreFactorFeedback"),
             "recovery_time_factor": r0.get("recoveryTimeFactorPercent"),
+            "recovery_time_factor_feedback": r0.get("recoveryTimeFactorFeedback"),
             "hrv_factor": r0.get("hrvFactorPercent"),
+            "hrv_factor_feedback": r0.get("hrvFactorFeedback"),
             "acwr_factor": r0.get("acwrFactorPercent"),
+            "acwr_factor_feedback": r0.get("acwrFactorFeedback"),
             "stress_history_factor": r0.get("stressHistoryFactorPercent"),
+            "stress_history_factor_feedback": r0.get("stressHistoryFactorFeedback"),
             "sleep_history_factor": r0.get("sleepHistoryFactorPercent"),
+            "sleep_history_factor_feedback": r0.get("sleepHistoryFactorFeedback"),
+            "valid_sleep": r0.get("validSleep"),
             "acute_load": r0.get("acuteLoad"),
         }
 
@@ -1191,6 +1215,20 @@ def trained_today(min_duration_s=None):
     return any(_is_training_activity(a) for a in acts)
 
 
+def sleep_logged_today(d_today=None):
+    """True if today's overnight sleep is finalized, False if still unlogged, None on API error."""
+    d = d_today or datetime.now(_local_zone()).date()
+    try:
+        g = client()
+    except Exception:  # noqa: BLE001
+        return None
+    dto, _raw = sleep_dto(g, d)
+    if dto is None:
+        return None
+    secs = dto.get("sleepTimeSeconds")
+    return bool(secs) and secs >= MIN_SLEEP_SECONDS
+
+
 def hydration_today(d_today=None):
     """Lightweight fetch of today's hydration as (logged_ml, goal_ml). Returns
     (None, None) on any login/API error or missing field. Used by the bridge's
@@ -1468,11 +1506,21 @@ def fitness_profile(d_today=None, g=None, refresh=False):
     if isinstance(fa, dict) and "__error__" not in fa:
         f_age = fa.get("fitnessAge")
         ach = fa.get("achievableFitnessAge")
-        prof["fitness_age"] = {
+        prev_fa = fa.get("previousFitnessAge")
+        comps = metrics.fitness_age_components(fa.get("components"))
+        prof["fitness_age"] = {k: v for k, v in {
             "chronological": fa.get("chronologicalAge"),
             "fitness_age": round(f_age, 1) if isinstance(f_age, (int, float)) else None,
             "achievable": round(ach, 1) if isinstance(ach, (int, float)) else None,
-        }
+            "previous_fitness_age": round(prev_fa, 1) if isinstance(prev_fa, (int, float)) else None,
+            "last_updated": (str(fa.get("lastUpdated") or "")[:10] or None),
+            "components": comps,
+        }.items() if v is not None}
+
+    prof["acclimation"] = _cached_metric(
+        "acclimation",
+        lambda: metrics.acclimation_metric(safe(lambda: g.get_max_metrics(today)), d_today),
+        refresh=refresh, context=today)
 
     rp = safe(lambda: g.get_race_predictions())
     if isinstance(rp, dict) and "__error__" not in rp:

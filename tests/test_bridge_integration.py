@@ -529,10 +529,55 @@ class BridgeTests(unittest.TestCase):
         # Decimal grams, comma-formatted calories, and ingredient 'protein powder' mentions.
         b._current_request = "update:food4"
         b.append_journal(
-            "Shake: ~40g protein powder (~315 kcal, ~35.6g protein) "
-            "Lunch (~1,200 kcal, ~54.4g protein)"
+            "Shake: ~40g protein powder (~315 kcal, ~35.6g protein, ~30g carbs, ~5g fat) "
+            "Lunch (~1,200 kcal, ~54.4g protein, ~110g carbs, ~35g fat)"
         )
         self.assertEqual(b._todays_food_summary(now), (1, 90, 1515))
+
+        roll = b.rolling_nutrition_summary(
+            days=7, today=now.date(),
+            calorie_budget={"maintenance_kcal": 2500, "target_kcal": 2100,
+                            "protein_range_g": {"min": 120, "max": 140}},
+        )
+        self.assertEqual(roll["logged_days_count"], 2)
+        self.assertEqual(roll["completed_logged_days_count"], 1)
+        self.assertEqual(roll["today_so_far"]["protein_g"], 90)
+        self.assertEqual(roll["today_so_far"]["protein_status"], "below_range")
+        self.assertEqual(roll["completed_days_average"]["kcal"], 1212)
+
+    def test_nutrition_context_retains_lean_fuel_estimate(self):
+        b = self.bridge
+        activity = {
+            "activity_id": 1,
+            "start": date.today().isoformat() + " 10:00:00",
+            "calories": 300,
+            "logged_sets": [{"exercise": "Synthetic press", "sets": 1}],
+            "detail_metrics": {
+                "status": "available",
+                "fuel_estimate": {"status": "available", "fat_g": 6.0, "carbohydrate_g": 70.0},
+                "groups": {"fuel_energy": {"status": "available"}},
+                "detail_descriptors": [{"key": "omitted"}],
+            },
+        }
+        data, _training = b._nutrition_context(
+            {"recent_activities_7d": [activity]}, b.training_store().context()
+        )
+        row = data["recent_activities_7d"][0]
+        self.assertNotIn("logged_sets", row)
+        self.assertEqual(row["detail_metrics"]["fuel_estimate"]["carbohydrate_g"], 70.0)
+        self.assertNotIn("detail_descriptors", row["detail_metrics"])
+
+    def test_auto_summary_waits_for_sleep_sync_until_cutoff(self):
+        b = self.bridge
+        b._last_sleep_sync_check = 0.0
+        early = datetime.now().replace(hour=9, minute=35, second=0, microsecond=0)
+        cutoff = datetime.now().replace(hour=11, minute=30, second=0, microsecond=0)
+        with patch.object(b.garmin_coach, "sleep_logged_today", return_value=False):
+            self.assertFalse(b._auto_summary_sleep_ready(early))
+            self.assertTrue(b._auto_summary_sleep_ready(cutoff))
+        b._last_sleep_sync_check = 0.0
+        with patch.object(b.garmin_coach, "sleep_logged_today", return_value=True):
+            self.assertTrue(b._auto_summary_sleep_ready(early))
 
 
 def day_string():
