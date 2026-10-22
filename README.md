@@ -20,7 +20,8 @@ Device scores and model recommendations are estimates, not diagnoses.
   treated as evidence that you completed it.
 - Garmin workout detail and performance metrics, with explicit availability,
   timestamps and coverage. See [metric coverage](docs/metrics.md).
-- Exercise, movement, meal and hydration reminders with context-sensitive guards.
+- Exercise, meal and hydration reminders with context-sensitive guards.
+  Sedentary/movement notifications are not sent; activity metrics remain available.
 - Durable Telegram inbox/outbox, retry state and stage timings. Polling and message
   delivery continue while the serial coaching worker generates a response.
 
@@ -233,6 +234,13 @@ availability contract. Invalid configuration fails visibly rather than silently
 discarding preferences. Personal policies and state must stay outside the repo.
 
 ## Persistence and limits
+
+An agreed daily protein range can be configured privately with both
+`AGBOT_PROTEIN_MIN_G` and `AGBOT_PROTEIN_MAX_G` (grams/day). It overrides automatic
+weight-based protein estimates, including when Garmin biometrics are missing,
+without changing calorie targets. Being within the range meets the goal; the
+upper endpoint is not a compulsory minimum. Invalid or incomplete ranges raise
+an explicit configuration error rather than reverting to the previous estimate.
 
 - First startup imports legacy preference/health/anchor JSONL idempotently without
   rewriting originals. Imported narratives are labelled unverified.
