@@ -177,6 +177,30 @@ class BridgeTests(unittest.TestCase):
         state = json.loads(Path(b.EXERCISE_STATE_FILE).read_text())
         self.assertTrue(state["coach_rest"])
         self.assertEqual(b.training_store().context()["plans"][0]["payload"]["kind"], "rest")
+        with patch.object(b, "owner", return_value="123"), \
+                patch.object(b, "send_message") as send:
+            b.maybe_exercise_checkins()
+            send.assert_not_called()
+
+        # A recovery/optional-walk update the same day must preserve coach_rest and stay quiet.
+        recovery_plan = {
+            "date": date.today().isoformat(),
+            "kind": "recovery",
+            "objective": "Optional easy walk while resting from strength",
+            "reason": "Low readiness; keep pending strength deferred.",
+            "exercises": [{"name": "Easy walk", "blocks": [
+                {"role": "work", "duration_seconds": 600, "effort": "Easy conversational pace"}
+            ]}],
+        }
+        recovery_reply = "Take an easy walk only if you feel like it.\n[[SESSION_PLAN: " + json.dumps(recovery_plan) + "]]"
+        with patch.object(b, "run_llm", return_value=recovery_reply):
+            b._generate_checked("Can I walk?", require_plan=True)
+        state2 = json.loads(Path(b.EXERCISE_STATE_FILE).read_text())
+        self.assertTrue(state2["coach_rest"])
+        with patch.object(b, "owner", return_value="123"), \
+                patch.object(b, "send_message") as send:
+            b.maybe_exercise_checkins()
+            send.assert_not_called()
 
     def test_repeated_sequences_are_referenced_without_losing_source_detail(self):
         b = self.bridge

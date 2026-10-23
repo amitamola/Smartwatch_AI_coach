@@ -1967,7 +1967,7 @@ def _generate_checked(prompt, source_text="", images=None, require_plan=False, s
         RotationStore(os.path.join(STATE, "coach.sqlite3")).save_deferrals(plans)
         for plan in plans:
             if plan["date"] == date.today().isoformat():
-                _set_coach_rest(plan["kind"] == "rest")
+                _set_coach_rest(_is_rest_or_recovery_plan(plan))
     clean = _MODEL_LOG_RECEIPT_RE.sub("", clean)
     replacements = _LOG_REPLACES_RE.findall(clean)
     clean = _LOG_REPLACES_RE.sub("", clean)
@@ -3107,10 +3107,16 @@ def _set_exercise_status(status):
     _save_exercise_state(st)
 
 
+def _is_rest_or_recovery_plan(plan):
+    if not isinstance(plan, dict):
+        return False
+    return plan.get("kind") in ("rest", "recovery") or bool(plan.get("rotation_defer"))
+
+
 def _set_coach_rest(flag):
-    """Record whether TODAY's morning brief prescribed a genuine rest/recovery day, so the
-    adherence check-ins go rest-aware instead of nagging. Cleared if a later brief the same
-    day prescribes a workout."""
+    """Record whether TODAY's plan prescribed rest/recovery (or deferred the pending session),
+    so exercise-adherence check-ins stay quiet for the day. Cleared if a later plan the same
+    day prescribes an active workout."""
     st = _load_exercise_state()
     if flag:
         st["coach_rest"] = True
@@ -3118,6 +3124,21 @@ def _set_coach_rest(flag):
         st.pop("coach_rest", None)
         st.pop("rest_note_sent", None)
     _save_exercise_state(st)
+
+
+def _coach_prescribed_rest_today(st=None):
+    st = _load_exercise_state() if st is None else st
+    if st.get("coach_rest"):
+        return True
+    today_iso = date.today().isoformat()
+    try:
+        plans = training_store().context().get("plans") or []
+    except Exception:  # noqa: BLE001
+        plans = []
+    for row in plans:
+        if row.get("date") == today_iso:
+            return _is_rest_or_recovery_plan(row.get("payload"))
+    return False
 
 
 def exercise_checkin_slots_due(now, asked, catchup_min=EXERCISE_CHECKIN_CATCHUP_MIN):
@@ -3162,22 +3183,12 @@ def maybe_exercise_checkins():
     st = _load_exercise_state()
     if st.get("status") in ("done", "skip", "stated"):
         return  # resolved for today (finished, opted out, or they've told me their plan)
+    # When the coach itself prescribed rest / recovery / rotation deferral today, stay
+    # completely quiet - never nudge about logging or completing a workout.
+    if _coach_prescribed_rest_today(st):
+        return
     now = datetime.now()
     asked = list(st.get("asked") or [])
-    # The coach itself prescribed rest today -> send ONE gentle rest-aware note (not the
-    # 'did you exercise?' nag), then stay quiet for the rest of the day.
-    if st.get("coach_rest"):
-        if st.get("rest_note_sent"):
-            return
-        due = exercise_checkin_slots_due(now, asked)
-        if not due:
-            return  # first check-in hour not reached yet
-        if any(should for _s, _h, should in due):
-            log.info("Exercise rest-day note at %s", now.strftime("%H:%M"))
-            send_message(own, _exercise_rest_message())
-        st["rest_note_sent"] = True
-        _save_exercise_state(st)
-        return
     changed = False
     for slot, hh, should in exercise_checkin_slots_due(now, asked):
         if should:
