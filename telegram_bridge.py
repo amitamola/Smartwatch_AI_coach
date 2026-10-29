@@ -685,6 +685,10 @@ def recent_journal_text():
 def active_health_text():
     """Injuries/illness the user reported and hasn't marked recovered - injected into EVERY
     prompt so no recommendation ignores them, and they don't scroll out of chat."""
+    try:
+        memory_store().expire_transient_doms(today=date.today(), max_age_days=5)
+    except Exception:  # noqa: BLE001
+        pass
     return memory_store().render("health")
 
 
@@ -1899,10 +1903,21 @@ def _present_reply(text):
     return "\n".join(lines)
 
 
+def _last_bot_message():
+    history = load_history()
+    for turn in reversed(history):
+        if turn.get("role") == "agbot" and turn.get("text"):
+            return turn["text"]
+    return ""
+
+
 def _generate_checked(prompt, source_text="", images=None, require_plan=False, show_schedule=False):
     """Persist source-backed facts and validate proposals before returning an answer."""
+    prev_bot = _last_bot_message() if source_text else ""
+    auto_resolved = (memory_store().resolve_supported_health(source_text, prompt_context=prev_bot)
+                     if source_text else [])
     text = run_llm(prompt, images=images)
-    receipts = []
+    receipts = list(auto_resolved)
     pending_memory_errors = []
     for attempt in range(2):
         if not text:
@@ -1910,7 +1925,13 @@ def _generate_checked(prompt, source_text="", images=None, require_plan=False, s
         # User-sourced facts stand independently of whether the proposed workout is valid.
         # Apply them first so a newly stated exclusion guards this very response.
         candidate, changes, memory_errors = memory_store().process_markers(
-            text, source_text=source_text, source_type="user")
+            text, source_text=source_text, source_type="user", prompt_context=prev_bot)
+        if auto_resolved:
+            resolved_keys = {r["key"] for r in auto_resolved}
+            memory_errors = [
+                e for e in memory_errors
+                if not ("Resolution quote must explicitly clear" in e and resolved_keys)
+            ]
         receipts.extend(changes)
         if memory_errors:
             pending_memory_errors = memory_errors

@@ -959,6 +959,32 @@ class MemoryTests(unittest.TestCase):
         self.assertFalse(errors)
         self.assertEqual(receipts[0]["status"], "resolved")
 
+        # Preposition 'in', missing 'now', and contextual reply to a bot question.
+        self.store.upsert("health", "low_back", "Lower back stiffness.")
+        in_quote = "I have no pain in my lower back."
+        marker = self.marker(kind="health", key="low_back", source_quote=in_quote, action="resolve")
+        _, receipts, errors = self.store.process_markers(marker, in_quote)
+        self.assertFalse(errors)
+        self.assertEqual(receipts[0]["status"], "resolved")
+
+        self.store.upsert("health", "low_back", "Lower back stiffness.")
+        ctx_quote = "All fine, no discomfort."
+        marker = self.marker(kind="health", key="low_back", source_quote=ctx_quote, action="resolve")
+        _, receipts, errors = self.store.process_markers(
+            marker, ctx_quote, prompt_context="How is your lower back today?"
+        )
+        self.assertFalse(errors)
+        self.assertEqual(receipts[0]["status"], "resolved")
+
+        # Transient DOMS (>5 days old) auto-expires while acute pain stays active.
+        self.store.upsert("health", "symptom:doms", "Body is slightly sore after gym.",
+                          observed_on="2026-01-01")
+        self.store.upsert("health", "knee", "Sharp knee pain when squatting.",
+                          observed_on="2026-01-01")
+        expired = self.store.expire_transient_doms(today=date(2026, 1, 10), max_age_days=5)
+        self.assertEqual([r["key"] for r in expired], ["symptom:doms"])
+        self.assertEqual([r["key"] for r in self.store.records("health")], ["knee"])
+
     def test_partial_negated_conditional_or_unrelated_fine_now_is_not_clear(self):
         self.store.upsert("health", "thoracic", "Synthetic thoracic symptom.")
         for quote in (

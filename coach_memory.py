@@ -310,7 +310,7 @@ def _family_avoidance_supported(key, evidence):
     )
 
 
-def _resolution_supported(record, quote):
+def _resolution_supported(record, quote, prompt_context=""):
     """Require a named, affirmative resolution clause, not just any matching quote."""
     clauses = re.split(r"[.!?;\n]+|,\s*|\b(?:but|yet|and)\b", quote.casefold())
     if "?" in quote:
@@ -347,7 +347,7 @@ def _resolution_supported(record, quote):
             if re.search(negation, " ".join(_words(clause))):
                 continue
             if re.search(
-                r"\b(?:during|after|while|when|with|only|at rest|on|for|in|"
+                r"\b(?:during|after|while|when|with|only|at rest|on|for|"
                 r"through|throughout|until|whenever|most|sometimes|usually|often|"
                 r"occasionally|temporarily|almost|mostly|"
                 r"was|were|had|used to|previously|before|yesterday|ago|last)\b",
@@ -355,16 +355,17 @@ def _resolution_supported(record, quote):
             ):
                 continue
             recovery = re.search(
-                r"\b(?:resolved|recovered|healed|gone|cleared|pain[- ]free)\b"
-                r"|\b(?:no|without)\s+(?:more\s+)?(?:pain|symptoms?|discomfort|soreness)\b"
-                r"|\bno longer\s+(?:hurts?|painful|sore)\b",
+                r"\b(?:resolved|recovered|healed|gone|cleared|pain[- ]free|symptom[- ]free)\b"
+                r"|\b(?:no|without|zero|0)\s+(?:more\s+|further\s+)?"
+                r"(?:pain|symptoms?|discomfort|soreness|issues?|stiffness)\b"
+                r"|\bno longer\s+(?:hurts?|painful|sore|stiff)\b",
                 clause,
             )
             if not recovery:
                 fine_now = re.fullmatch(
                     r"(?:(?:yes|yeah)\s+)?(?:my |the )?(.+?)(?: area| symptoms?)? "
                     r"(?:is|are|feels?|feel) (?:(?:all|completely|totally|fully)\s+)?"
-                    r"(?:fine|good|alright|all right) now",
+                    r"(?:fine|good|normal|alright|all right|okay|ok)(?:\s+(?:now|today|again))?",
                     " ".join(_words(clause)),
                 )
                 recovery = fine_now and any(
@@ -374,6 +375,10 @@ def _resolution_supported(record, quote):
             if not recovery:
                 continue
             mentioned = _regions(clause)
+            if not mentioned and actual and prompt_context and not _regions(quote):
+                context_regions = _regions(prompt_context)
+                if actual <= context_regions:
+                    mentioned = set(actual)
             clause_words = set(_words(clause))
             leaf_words = set(_words(record["key"].split(":")[-1]))
             specific_leaf = leaf_words - {"symptom", "symptoms", "muscle", "general", "body"}
@@ -943,7 +948,53 @@ class MemoryStore:
             raise
         return {"imported": imported, "skipped": skipped, "files": files}
 
-    def process_markers(self, text, source_text, source_type="user"):
+    def resolve_supported_health(self, source_text, prompt_context=""):
+        """Deterministically resolve any active health records explicitly cleared by source_text."""
+        if not isinstance(source_text, str) or not source_text.strip():
+            return []
+        prompt_context = prompt_context if isinstance(prompt_context, str) else ""
+        resolved = []
+        with self._connection(write=True) as db:
+            rows = db.execute(
+                "SELECT * FROM memory_records WHERE kind='health' AND status='active' ORDER BY id"
+            ).fetchall()
+            for row in rows:
+                record = self._record(row)
+                if _resolution_supported(record, source_text, prompt_context):
+                    resolved.append(self._resolve_record(db, record, source_text))
+        return resolved
+
+    def expire_transient_doms(self, today=None, max_age_days=5):
+        """Auto-resolve transient post-workout DOMS/stiffness records older than max_age_days."""
+        today = today or date.today()
+        transient_re = re.compile(r"\b(?:doms|sore|soreness|stiff|stiffness)\b", re.IGNORECASE)
+        acute_re = re.compile(
+            r"\b(?:pain|painful|hurts?|hurting|tear|torn|sprain|strain|tendon\w*|"
+            r"sharp|shooting|radiat\w*|numb\w*|tingl\w*|injur\w*|swoll\w*|swell\w*)\b",
+            re.IGNORECASE,
+        )
+        expired = []
+        with self._connection(write=True) as db:
+            rows = db.execute(
+                "SELECT * FROM memory_records WHERE kind='health' AND status='active' ORDER BY id"
+            ).fetchall()
+            for row in rows:
+                record = self._record(row)
+                try:
+                    obs = date.fromisoformat(str(record["observed_on"])[:10])
+                except ValueError:
+                    continue
+                if (today - obs).days <= max_age_days:
+                    continue
+                txt = record["text"] or ""
+                if transient_re.search(txt) and not acute_re.search(txt):
+                    expired.append(self._resolve_record(
+                        db, record,
+                        f"Auto-expired transient soreness/stiffness after {(today - obs).days} days."
+                    ))
+        return expired
+
+    def process_markers(self, text, source_text, source_type="user", prompt_context=""):
         """Strip MEMORY markers and return ``(cleaned_text, receipts, errors)``.
 
         Allowed JSON fields: kind, key, text, source_quote, action, observed_on.
@@ -1031,7 +1082,8 @@ class MemoryStore:
                         if row is None:
                             raise ValueError("MEMORY resolution key does not exist.")
                         record = self._record(row)
-                        if not _resolution_supported(record, evidence):
+                        if not (_resolution_supported(record, evidence, prompt_context)
+                                or _resolution_supported(record, source_text, prompt_context)):
                             raise ValueError(
                                 "Resolution quote must explicitly clear this named fact or body area."
                             )
