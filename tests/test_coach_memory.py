@@ -940,7 +940,7 @@ class MemoryTests(unittest.TestCase):
     def test_named_fine_or_alright_now_is_explicit_health_clear(self):
         self.store.upsert("health", "low_back", "Synthetic lumbar symptom.")
         for area in ("T4", "T-4", "thoracic"):
-            for state in ("fine", "alright", "all right"):
+            for state in ("fine", "all fine", "alright", "all right"):
                 with self.subTest(area=area, state=state):
                     self.store.upsert("health", "thoracic", "Synthetic thoracic symptom.")
                     quote = f"My {area} is {state} now."
@@ -950,6 +950,14 @@ class MemoryTests(unittest.TestCase):
                     self.assertFalse(errors)
                     self.assertEqual(receipts[0]["status"], "resolved")
                     self.assertEqual(self.store.records("health")[0]["key"], "low_back")
+
+        self.store.upsert("health", "symptom:muscle_soreness", "Body is slightly sore all over.")
+        soreness_quote = "Yes all-over soreness is fully cleared and warm-up felt normal"
+        marker = self.marker(kind="health", key="symptom:muscle_soreness",
+                             source_quote="all-over soreness is fully cleared", action="resolve")
+        _, receipts, errors = self.store.process_markers(marker, soreness_quote)
+        self.assertFalse(errors)
+        self.assertEqual(receipts[0]["status"], "resolved")
 
     def test_partial_negated_conditional_or_unrelated_fine_now_is_not_clear(self):
         self.store.upsert("health", "thoracic", "Synthetic thoracic symptom.")

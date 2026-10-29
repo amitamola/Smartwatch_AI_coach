@@ -79,6 +79,30 @@ class RotationTests(unittest.TestCase):
         self.assertEqual(self.store.context(context, TODAY)["slot"], "1:0")
         self.assertEqual(self.context()["slot"], "1:1")
 
+    def test_multi_exercise_template_tolerates_garmin_qualifier_and_single_accessory_label(self):
+        full_plan = self.plan(exercises=[
+            {"name": "Wide Stance Goblet Squat", "role": "anchor"},
+            {"name": "Dumbbell Bench Press", "role": "anchor"},
+            {"name": "Seated Cable Row", "role": "anchor"},
+            {"name": "Dumbbell Reverse Curl", "role": "accessory"},
+            {"name": "Standing Calf Raise", "role": "accessory"},
+            {"name": "Reverse Crunch", "role": "skill"},
+        ])
+        self.training.save([full_plan])
+        activity = {
+            "activity_id": "full-c", "start": TODAY.isoformat(), "type": "strength_training",
+            "logged_sets": [
+                {"exercise": "Wide Stance Goblet Squat", "sets": 2},
+                {"exercise": "Dumbbell Bench Press", "sets": 2},
+                {"exercise": "Seated Cable Row", "sets": 2},
+                {"exercise": "Dumbbell Biceps Curl", "sets": 2},
+                {"exercise": "Weighted Standing Calf Raise", "sets": 2},
+                {"exercise": "Reverse Crunch On A Bench", "sets": 1},
+            ],
+        }
+        self.training.record_activities([activity])
+        self.assertEqual(self.context()["slot"], "1:1")
+
     def test_cardio_modality_is_not_interval_completion(self):
         self.training.save([self.plan()])
         self.training.set_status(TODAY, "user_completed")

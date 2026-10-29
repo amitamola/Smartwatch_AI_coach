@@ -103,15 +103,26 @@ class RotationStore:
                        (encoded, (today or date.today()).isoformat(), position, programme["revision"]))
 
     @staticmethod
+    def _movement_matched(planned, actual_names):
+        if planned in actual_names:
+            return True
+        tokens = set(planned.split())
+        if len(tokens) >= 2:
+            return any(tokens <= set(act.split()) for act in actual_names)
+        return False
+
+    @staticmethod
     def _completion_evidence(plan, day, outcomes, reported):
-        """Require a linked user completion or all named movements in one observation."""
+        """Require a linked user completion or sufficient movement coverage in one observation."""
         if reported and reported.get("plan_revision_at_report") == plan["revision"]:
             return {"type": "user_reported_session_completion", "date": day}
         payload = plan["payload"]
         if payload.get("delivery") == "instructor_led":
             return None
-        names = {canonical_exercise(m["name"]) for m in payload.get("exercises", [])
-                 if m.get("role") not in ("warmup", "cooldown")}
+        main_moves = [m for m in payload.get("exercises", [])
+                      if m.get("role") not in ("warmup", "cooldown")]
+        names = {canonical_exercise(m["name"]) for m in main_moves}
+        anchors = {canonical_exercise(m["name"]) for m in main_moves if m.get("role") == "anchor"}
         for outcome in outcomes:
             activity = outcome["payload"]
             if outcome["date"] != day or outcome.get("classification") != "intentional_training":
@@ -119,7 +130,9 @@ class RotationStore:
             if payload["kind"] == "strength" and len(names) >= 2:
                 actual = {canonical_exercise(m.get("exercise", "")) for m in activity.get("logged_sets", [])
                           if isinstance(m.get("sets"), int) and m["sets"] > 0}
-                if names <= actual:
+                matched = {n for n in names if RotationStore._movement_matched(n, actual)}
+                required = len(names) if len(names) < 4 else max(3, len(names) - 1)
+                if len(matched) >= required and anchors <= matched:
                     return {"type": "observed_session_movements", "activity_id": outcome["activity_id"],
                             "caveat": "Movement participation, not proof of prescribed dose, form or effort."}
             # Quality intensity/interval execution cannot be inferred from modality or HR.

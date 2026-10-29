@@ -250,11 +250,11 @@ def _positive_health_report(evidence):
         r"|\bno longer\s+(?:hurts?|painful|sore)\b"
         r"|\bpain free\b"
         r"|\b" + _SYMPTOM + r"\s+(?:(?:is|are|has|have|now|all|completely|fully|been)\s+)*"
-        r"(?:gone|resolved|healed|recovered)\b",
+        r"(?:gone|resolved|healed|recovered|cleared)\b",
         "", words,
     )
     positive = re.search(
-        r"\b" + _POSITIVE_STATE + r"\b|\b(?:resolved|healed|recovered|tolerated)\b",
+        r"\b" + _POSITIVE_STATE + r"\b|\b(?:resolved|healed|recovered|cleared|tolerated)\b",
         words,
     ) or without_symptoms != words
     return bool(positive and not re.search(r"\b" + _SYMPTOM + r"\b", without_symptoms))
@@ -355,15 +355,16 @@ def _resolution_supported(record, quote):
             ):
                 continue
             recovery = re.search(
-                r"\b(?:resolved|recovered|healed|gone|pain[- ]free)\b"
+                r"\b(?:resolved|recovered|healed|gone|cleared|pain[- ]free)\b"
                 r"|\b(?:no|without)\s+(?:more\s+)?(?:pain|symptoms?|discomfort|soreness)\b"
                 r"|\bno longer\s+(?:hurts?|painful|sore)\b",
                 clause,
             )
             if not recovery:
                 fine_now = re.fullmatch(
-                    r"(?:my |the )?(.+?)(?: area| symptoms?)? "
-                    r"(?:is|are|feels?|feel) (?:fine|alright|all right) now",
+                    r"(?:(?:yes|yeah)\s+)?(?:my |the )?(.+?)(?: area| symptoms?)? "
+                    r"(?:is|are|feels?|feel) (?:(?:all|completely|totally|fully)\s+)?"
+                    r"(?:fine|good|alright|all right) now",
                     " ".join(_words(clause)),
                 )
                 recovery = fine_now and any(
@@ -373,9 +374,13 @@ def _resolution_supported(record, quote):
             if not recovery:
                 continue
             mentioned = _regions(clause)
+            clause_words = set(_words(clause))
+            leaf_words = set(_words(record["key"].split(":")[-1]))
+            specific_leaf = leaf_words - {"symptom", "symptoms", "muscle", "general", "body"}
             if actual:
                 cleared.update(mentioned)
-            elif set(_words(record["key"])) <= set(_words(clause)):
+            elif (set(_words(record["key"])) <= clause_words
+                  or (specific_leaf and specific_leaf <= clause_words)):
                 return True
         return bool(actual and actual <= cleared)
     target = set(_words(record["key"].split(":")[-1]))
