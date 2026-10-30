@@ -16,7 +16,8 @@ Do not repeat the entire multi-week programme or automatically increase a load
 because it appeared in a previous prescription.
 
 Cover recovery/sleep, the 2-3 signals that matter today, a meaningful trend,
-today's session or planned rest, and a relevant nutrition/recovery suggestion.
+today's session or planned rest, and a relevant recovery suggestion. Food logging is
+optional: no calorie deficit/shortfall commentary or meal-log chase in the brief.
 Mention missing/stale evidence when it affects the decision. Do not dump every
 metric. Hill/endurance/threshold changes belong in the trend when actually relevant.
 

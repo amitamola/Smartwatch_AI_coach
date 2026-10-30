@@ -130,6 +130,7 @@ class ProgrammeBridgeTests(unittest.TestCase):
                 "reason": "A conservative recovery day", "exercises": []}
         with patch.object(b, "run_llm", side_effect=[
                 "invalid", "invalid", "[[SESSION_PLAN: " + json.dumps(rest) + "]]"]) as model:
+            b.ensure_program_review()
             answer, _ = b.generate_summary()
         self.assertTrue(answer)
         self.assertEqual(model.call_count, 3)
@@ -158,6 +159,7 @@ class ProgrammeBridgeTests(unittest.TestCase):
         with patch.object(b, "run_llm", side_effect=[
                 OSError("temporary launch failure"),
                 "[[SESSION_PLAN: " + json.dumps(rest) + "]]"]):
+            b.ensure_program_review()
             answer, _ = b.generate_summary()
         self.assertTrue(answer)
         self.assertEqual(b.program_store().context()["last_error"], "model_launch_error")

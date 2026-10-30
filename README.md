@@ -250,10 +250,19 @@ an explicit configuration error rather than reverting to the previous estimate.
   from travel schedules. Historical quotes remain available without being current.
   Capability retrieval is entity-aware; recent chat remains a bounded selection,
   not a guarantee that every sentence from seven days is in every prompt.
-- Food replies show per-item estimates, meal totals and daily calorie/protein
-  progress. Corrections can supersede an existing journal entry rather than add
-  another meal; originals remain in the append-only audit. Estimates are not
-  measured intake, and unconfigured targets remain unknown.
+- Food logging is optional by default (`AGBOT_NUTRITION_OPTIONAL=true`).
+  Missing logs do not imply inadequate intake and never drive training changes.
+  Meal nudges require explicit `AGBOT_MEAL_REMINDERS=true`. Structured, source-linked
+  meal items have application-computed totals, nullable estimates and explicit
+  coverage; partial days do not produce deficit claims. Corrections supersede
+  entries without destroying originals. Legacy ambiguous estimates stay unknown.
+- Detailed self-directed workouts include ordered preparation, main work and
+  cool-down phases upfront. `starting workout` and `cooldown` show the saved card.
+  `DWRE yesterday` or a dated DWRE links delayed completion to its intended day;
+  debrief syncing/delivery remains pending independently of that completion.
+- `pause reminders` / `resume reminders` controls optional check-ins.
+  `AGBOT_QUIET_START_HOUR` / `AGBOT_QUIET_END_HOUR` default to 22/8.
+  An explicit `AGBOT_TIMEZONE` IANA zone applies before Garmin profile sync.
 - Replies use phone-friendly headings and lists. Markdown tables are converted to
   labeled cards, and long replies preserve their formatting across Telegram messages.
 - Structured `SESSION_PLAN` proposals are checked against supported explicit
@@ -267,6 +276,11 @@ an explicit configuration error rather than reverting to the previous estimate.
   Repeated workout payloads are referenced within the prompt instead of duplicating
   entire set timelines. Nutrition-focused replies omit irrelevant set detail while
   keeping activity totals, symptoms, preferences and planned/reported training state.
+  Exact repeated structures/text use explicit `prompt_reference` links; measured
+  sets can use column/row encoding without changing their values. Active constraints
+  and future commitments remain. `AGBOT_PROMPT_MAX_CHARS` defaults to 200000 after
+  compaction and rejects oversized requests rather than silently dropping safety facts.
+  Athlete timezone is cached from Garmin; `AGBOT_TIMEZONE` explicitly overrides it.
 - Transport acknowledges receipt after durable storage and retries generation
   failures with a finite limit. Failed requests are retained and a notice is queued.
 - Outgoing messages are retained for retry; a summary is marked sent only after
@@ -306,7 +320,8 @@ For an existing Windows scheduled task, commit the reviewed code and deploy:
 
 ```powershell
 .\scripts\deploy.ps1 -DataDir $private `
-  -PythonExe "$PWD\.venv\Scripts\python.exe" -TaskName "AgBot-TelegramBridge"
+  -PythonExe "$PWD\.venv\Scripts\python.exe" -TaskName "AgBot-TelegramBridge" `
+  -AcknowledgeAdditiveMigrations
 ```
 
 Deployment archives the selected commit into a versioned release, runs its offline
@@ -317,6 +332,17 @@ and private backup for recovery; schema/data rollback requires the matching back
 An optional private `-BeforeStartScript` can perform an idempotent migration after
 the stopped-state backup. It receives `DataDir`, `ReleaseDir` and `PythonExe`; keep
 legacy data intact. Profile and `.env` changes from that hook are restored on failure.
+The migration acknowledgment attests backward-compatible additive schema changes;
+it is not automatic migration validation. Deployment drains admission before
+cutover where supported; old releases without `/drain` use an explicitly warned
+legacy idle/process check. New releases must pass component readiness as well as
+the release-SHA check. Health probes do not reconcile coaching state.
+Readable older schemas do not imply equivalent behavior after rollback: older
+releases do not enforce phase roles or invalidated future-plan semantics. Review
+those records before resuming coaching on an older release; never blindly restore
+a database over newly acknowledged messages.
+Raw meal/memory history is not automatically purged. Operational logs rotate with
+redaction; any broader retention/deletion policy requires a separate user decision.
 
 Deployment runs the full suite, so install `requirements-dev.txt` (which includes
 `requirements.lock`) in the selected interpreter first. Optional voice/video

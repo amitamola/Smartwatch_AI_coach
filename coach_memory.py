@@ -15,6 +15,8 @@ from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
+import coach_clock
+
 
 log = logging.getLogger(__name__)
 KINDS = frozenset(("preference", "anchor", "health"))
@@ -55,7 +57,7 @@ def normalize_key(key):
 
 
 def _now():
-    return datetime.now(timezone.utc).isoformat(timespec="microseconds")
+    return coach_clock.now().astimezone(timezone.utc).isoformat(timespec="microseconds")
 
 
 def _check_kind(kind):
@@ -70,7 +72,7 @@ def _check_status(status):
 
 def _observed_date(value, default_today=True):
     if value is None:
-        return date.today().isoformat() if default_today else ""
+        return coach_clock.today().isoformat() if default_today else ""
     if isinstance(value, datetime):
         return value.date().isoformat()
     if isinstance(value, date):
@@ -78,6 +80,19 @@ def _observed_date(value, default_today=True):
     if not isinstance(value, str):
         raise ValueError("observed_on must be an ISO date.")
     return date.fromisoformat(value).isoformat()
+
+
+def _unanchored_temporary_start(text):
+    """A duration does not anchor a dated/future commitment to its report date."""
+    return bool(re.search(
+        r"\b(?:will|next|tomorrow|starting|from|after|"
+        r"january|february|march|april|june|july|august|september|"
+        r"october|november|december|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b"
+        r"|\bmay\s+\d|\b\d{4}-\d{2}-\d{2}\b"
+        r"|\b\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?\b"
+        r"|\bin\s+(?:\d+|one|two|three|four|five|six|seven)\s+(?:days?|weeks?|months?|years?)\b",
+        text, re.IGNORECASE,
+    ))
 
 
 # Versioning is namespaced: transport and training stores can share this database.
@@ -211,7 +226,7 @@ _SYMPTOM = (
 )
 _POSITIVE_STATE = (
     r"(?:fine|all good|good|great|well|normal|smoothly|alright|all right|okay|ok|"
-    r"comfortable|better|pain free)"
+    r"comfortable|better|pain ?free)"
 )
 
 
@@ -238,17 +253,19 @@ def _positive_health_report(evidence):
     # Ambiguous or mixed testimony stays intact rather than masking a restriction.
     if re.search(r"\b(?:except|unless|if|only)\b", words) or _negated_health_positive(words):
         return False
+    if _historical_symptom_clear(evidence):
+        return True
     area = "(?:" + "|".join(re.escape(alias) for aliases in _REGIONS.values()
                           for alias in aliases) + ")"
     without_symptoms = re.sub(
         r"\b(?:no|without|not experiencing|not having|"
         r"(?:don t|didn t|did not|do not)\s+(?:have|feel|experience))\s+"
-        r"(?:(?:any|more|further)\s+)?(?:" + area + r"\s+)?"
+        r"(?:(?:any|more|further)\s+)?(?:(?:(?:left|right)\s+)?" + area + r"\s+)?"
         + _SYMPTOM + r"(?:\s+(?:or|and)\s+" + _SYMPTOM + r")*\b"
         r"|\b(?:doesn t|didn t|does not|did not|do not|don t)\s+hurt\b"
         r"|\bnot\s+(?:painful|sore)\b"
         r"|\bno longer\s+(?:hurts?|painful|sore)\b"
-        r"|\bpain free\b"
+        r"|\bpain ?free\b"
         r"|\b" + _SYMPTOM + r"\s+(?:(?:is|are|has|have|now|all|completely|fully|been)\s+)*"
         r"(?:gone|resolved|healed|recovered|cleared)\b",
         "", words,
@@ -310,6 +327,37 @@ def _family_avoidance_supported(key, evidence):
     )
 
 
+def _historical_symptom_clear(clause):
+    """Recognize a bounded past-symptom/current-clear sentence, not partial recovery."""
+    area = "(?:" + "|".join(re.escape(alias) for aliases in _REGIONS.values()
+                          for alias in aliases) + ")"
+    location = r"(?:(?:in|on)\s+)?(?:(?:my|the)\s+)?(?:(?:left|right)\s+)?" + area
+    past = r"(?:last (?:week|month|year)|yesterday|(?:a few|\d+) days ago)"
+    return bool(re.fullmatch(
+        r"(?:(?:the|my)\s+)?(?:(?:(?:left|right)\s+)?" + area + r"\s+)?"
+        + _SYMPTOM + r"\s+(?:that\s+)?i had"
+        r"(?:\s+" + location + r")?(?:\s+" + past + r")?"
+        r"\s+(?:is|has been)\s+(?:(?:now|fully|completely)\s+)?"
+        r"(?:cleared|gone|resolved)(?:\s+(?:now|today|for good))?",
+        " ".join(_words(clause)),
+    ))
+
+
+def _question_region(prompt_context):
+    """Bind a pronoun only to one body entity in an actual, unambiguous question."""
+    questions = [sentence for sentence in re.findall(r"[^.!?\n]*\?", prompt_context)
+                 if _regions(sentence) or re.search(r"\bback\b", sentence, re.IGNORECASE)]
+    if len(questions) != 1:
+        return set()
+    regions = _regions(questions[0])
+    # Bare "back" is intentionally not an anatomical alias, but must still make
+    # "knee or back?" ambiguous rather than silently selecting the knee.
+    generic_back = re.search(r"\bback\b", questions[0], re.IGNORECASE)
+    if generic_back and not any(r.endswith(("low_back", "thoracic")) for r in regions):
+        return set()
+    return regions if len(regions) == 1 else set()
+
+
 def _resolution_supported(record, quote, prompt_context=""):
     """Require a named, affirmative resolution clause, not just any matching quote."""
     clauses = re.split(r"[.!?;\n]+|,\s*|\b(?:but|yet|and)\b", quote.casefold())
@@ -338,7 +386,9 @@ def _resolution_supported(record, quote, prompt_context=""):
                 r"\b(?:only|during|after|while|when|at rest|usually|sometimes)\b", clause,
             ):
                 return False
-            if re.search(r"\b" + _SYMPTOM + r"\b", clause) and not _positive_health_report(clause):
+            if (re.search(r"\b" + _SYMPTOM + r"\b", clause)
+                    and not _positive_health_report(clause)
+                    and not _historical_symptom_clear(clause)):
                 # A plainly historical symptom clause may precede a current clear.
                 if not re.search(r"\b(?:used to|previously|last year)\b", clause):
                     return False
@@ -346,17 +396,25 @@ def _resolution_supported(record, quote, prompt_context=""):
         for clause in clauses:
             if re.search(negation, " ".join(_words(clause))):
                 continue
+            historical_clear = _historical_symptom_clear(clause)
+            scope = " ".join(_words(clause))
+            area = "(?:" + "|".join(re.escape(alias) for aliases in _REGIONS.values()
+                                  for alias in aliases) + ")"
+            scope = re.sub(r"\bon\s+(?:(?:my|the)\s+)?(?:(?:left|right)\s+)?"
+                           + area + r"\b", "", scope)
+            scope = re.sub(r"\bfor good$", "", scope)
             if re.search(
                 r"\b(?:during|after|while|when|with|only|at rest|on|for|"
                 r"through|throughout|until|whenever|most|sometimes|usually|often|"
                 r"occasionally|temporarily|almost|mostly|"
                 r"was|were|had|used to|previously|before|yesterday|ago|last)\b",
-                clause,
-            ):
+                scope,
+            ) and not historical_clear:
                 continue
-            recovery = re.search(
-                r"\b(?:resolved|recovered|healed|gone|cleared|pain[- ]free|symptom[- ]free)\b"
+            recovery = historical_clear or re.search(
+                r"\b(?:resolved|recovered|healed|gone|cleared|pain[- ]?free|symptom[- ]free)\b"
                 r"|\b(?:no|without|zero|0)\s+(?:more\s+|further\s+)?"
+                r"(?:(?:(?:left|right)\s+)?" + area + r"\s+)?"
                 r"(?:pain|symptoms?|discomfort|soreness|issues?|stiffness)\b"
                 r"|\bno longer\s+(?:hurts?|painful|sore|stiff)\b",
                 clause,
@@ -364,7 +422,8 @@ def _resolution_supported(record, quote, prompt_context=""):
             if not recovery:
                 fine_now = re.fullmatch(
                     r"(?:(?:yes|yeah)\s+)?(?:my |the )?(.+?)(?: area| symptoms?)? "
-                    r"(?:is|are|feels?|feel) (?:(?:all|completely|totally|fully)\s+)?"
+                    r"(?:is feeling|are feeling|is|are|feels?|feel) "
+                    r"(?:(?:all|completely|totally|fully)\s+)?"
                     r"(?:fine|good|normal|alright|all right|okay|ok)(?:\s+(?:now|today|again))?",
                     " ".join(_words(clause)),
                 )
@@ -372,20 +431,22 @@ def _resolution_supported(record, quote, prompt_context=""):
                     fine_now[1] in (alias, "left " + alias, "right " + alias)
                     for aliases in _REGIONS.values() for alias in aliases
                 )
+                if fine_now and fine_now[1] == "it" and _question_region(prompt_context):
+                    recovery = True
             if not recovery:
                 continue
             mentioned = _regions(clause)
             if not mentioned and actual and prompt_context and not _regions(quote):
-                context_regions = _regions(prompt_context)
-                if actual <= context_regions:
+                context_regions = _question_region(prompt_context)
+                if actual == context_regions:
                     mentioned = set(actual)
             clause_words = set(_words(clause))
             leaf_words = set(_words(record["key"].split(":")[-1]))
             specific_leaf = leaf_words - {"symptom", "symptoms", "muscle", "general", "body"}
             if actual:
                 cleared.update(mentioned)
-            elif (set(_words(record["key"])) <= clause_words
-                  or (specific_leaf and specific_leaf <= clause_words)):
+            elif not mentioned and (set(_words(record["key"])) <= clause_words
+                                    or (specific_leaf and specific_leaf <= clause_words)):
                 return True
         return bool(actual and actual <= cleared)
     target = set(_words(record["key"].split(":")[-1]))
@@ -524,7 +585,9 @@ class MemoryStore:
             number = r"(?:[1-7]|one|two|three|four|five|six|seven)"
             duration = re.search(rf"\bfor ({number})(?:\s*(?:to|-)\s*({number}))?\s+days?\b",
                                  text, re.IGNORECASE)
-            if duration:
+            # Duration alone cannot establish when a future trip starts. Keep
+            # the full commitment until its source-based interval is known.
+            if duration and not _unanchored_temporary_start(text):
                 value = (duration[2] or duration[1]).lower()
                 days = int(value) if value.isdigit() else numbers[value]
                 metadata = {"valid_until": (date.fromisoformat(observed_on) +
@@ -699,8 +762,11 @@ class MemoryStore:
         if (record["kind"] != "preference"
                 or not record["key"].startswith(("travel:", "temporary:"))):
             return False
+        if (str(record["source_metadata"].get("validity_reason", "")).startswith(
+                "Explicit temporary duration:") and _unanchored_temporary_start(record["text"])):
+            return False
         until = record["source_metadata"].get("valid_until")
-        return bool(until and date.fromisoformat(until) < date.today())
+        return bool(until and date.fromisoformat(until) < coach_clock.today())
 
     def set_temporary_scope(self, record_id, valid_until, reason):
         """Audited maintenance: expire a temporary preference, never a health restriction."""
@@ -756,7 +822,9 @@ class MemoryStore:
             raise ValueError("verified_only must be a boolean.")
         if verified_only and kind != "anchor":
             raise ValueError("verified_only is anchor-only; standing constraints cannot be hidden.")
-        records = self.records(kind)
+        records = ([record for record in self.health_context()
+                    if record["context_constraint_active"]] if kind == "health"
+                   else self.records(kind))
         expired = sum(self._expired(r) for r in self.records(kind, status=None)
                       if r["status"] == "active")
         if not records:
@@ -795,6 +863,10 @@ class MemoryStore:
         for record in records:
             provenance = ("user-reported" if record["verified"] else
                           "UNVERIFIED " + record["source_type"])
+            if kind == "health":
+                provenance += " | " + record["context_state"]
+                if record["status"] == "resolved":
+                    provenance += " | stored resolved is NOT confirmed recovery"
             lines.append(
                 f"- [{record['key']} | {record['date'] or 'date unknown'} | "
                 f"{provenance} | revision {record['revision']}] {record['text']}"
@@ -822,13 +894,20 @@ class MemoryStore:
         omitted = len(lines) - len(selected)
         return "\n".join([header] + selected + ([omission(omitted)] if omitted else []))
 
-    def _resolve_record(self, db, record, source_text):
+    def _resolve_record(self, db, record, source_text, prompt_context=""):
         if record["status"] == "resolved":
             return self._receipt(record, "unchanged", saved=False)
+        metadata = dict(record["source_metadata"])
+        if record["kind"] == "health" and _resolution_supported(record, source_text, prompt_context):
+            metadata["resolution"] = {
+                "source_type": "user", "source_quote": source_text,
+                "prompt_context": prompt_context, "basis": "explicit_user_report",
+            }
         db.execute(
             """UPDATE memory_records SET status='resolved', revision=revision+1,
-            updated_at=?,resolved_at=?,resolution_source_text=? WHERE id=?""",
-            (_now(), _now(), source_text, record["id"]),
+            updated_at=?,resolved_at=?,resolution_source_text=?,source_metadata=? WHERE id=?""",
+            (_now(), _now(), source_text, json.dumps(metadata, ensure_ascii=False, sort_keys=True),
+             record["id"]),
         )
         resolved = self._record(db.execute(
             "SELECT * FROM memory_records WHERE id=?", (record["id"],)
@@ -961,38 +1040,59 @@ class MemoryStore:
             for row in rows:
                 record = self._record(row)
                 if _resolution_supported(record, source_text, prompt_context):
-                    resolved.append(self._resolve_record(db, record, source_text))
+                    resolved.append(self._resolve_record(db, record, source_text, prompt_context))
         return resolved
 
     def expire_transient_doms(self, today=None, max_age_days=5):
-        """Auto-resolve transient post-workout DOMS/stiffness records older than max_age_days."""
-        today = today or date.today()
-        transient_re = re.compile(r"\b(?:doms|sore|soreness|stiff|stiffness)\b", re.IGNORECASE)
-        acute_re = re.compile(
-            r"\b(?:pain|painful|hurts?|hurting|tear|torn|sprain|strain|tendon\w*|"
-            r"sharp|shooting|radiat\w*|numb\w*|tingl\w*|injur\w*|swoll\w*|swell\w*)\b",
-            re.IGNORECASE,
-        )
-        expired = []
-        with self._connection(write=True) as db:
-            rows = db.execute(
-                "SELECT * FROM memory_records WHERE kind='health' AND status='active' ORDER BY id"
-            ).fetchall()
-            for row in rows:
-                record = self._record(row)
-                try:
-                    obs = date.fromisoformat(str(record["observed_on"])[:10])
-                except ValueError:
-                    continue
-                if (today - obs).days <= max_age_days:
-                    continue
-                txt = record["text"] or ""
-                if transient_re.search(txt) and not acute_re.search(txt):
-                    expired.append(self._resolve_record(
-                        db, record,
-                        f"Auto-expired transient soreness/stiffness after {(today - obs).days} days."
-                    ))
-        return expired
+        """Compatibility no-op: age is not recovery. Use ``health_context`` to flag staleness."""
+        return []
+
+    def health_context(self, today=None, max_age_days=5, include_resolved=True):
+        """Read-only health provenance and reconfirmation labels; never expires a symptom.
+
+        ``context_constraint_active`` retains active constraints AND legacy
+        unconfirmed retirements. ``resolution_state`` distinguishes explicit
+        source-backed recovery from administrative retirement and age expiry.
+        No legacy status is repaired or promoted to user testimony on a read.
+        """
+        today = date.fromisoformat(_observed_date(today))
+        if type(max_age_days) is not int or max_age_days < 0:
+            raise ValueError("max_age_days must be a nonnegative integer.")
+        if not isinstance(include_resolved, bool):
+            raise ValueError("include_resolved must be a boolean.")
+        records = self.records("health", status=None if include_resolved else "active")
+        for record in records:
+            metadata = record["source_metadata"]
+            resolution = metadata.get("resolution") or {}
+            source = record.get("resolution_source_text") or ""
+            if record["status"] == "active":
+                state = "active"
+            elif metadata.get("reclassification"):
+                state = "administratively_reclassified"
+            elif source.startswith("Auto-expired transient soreness/stiffness after "):
+                state = "legacy_age_expired_unconfirmed"
+            elif source and _resolution_supported(
+                    record, source,
+                    resolution.get("prompt_context", "") if isinstance(resolution, dict) else ""):
+                state = "source_supported_user_report"
+            else:
+                state = "unconfirmed_resolution"
+            constrained = state not in {"source_supported_user_report", "administratively_reclassified"}
+            try:
+                age = (today - date.fromisoformat(record["observed_on"])).days
+            except (TypeError, ValueError):
+                age = None
+            stale = age is None or age < 0 or age > max_age_days or (
+                record["status"] == "resolved" and constrained)
+            record.update(
+                resolution_state=state, observation_age_days=age,
+                context_constraint_active=constrained,
+                needs_reconfirmation=constrained and stale,
+                context_state=("stale / needs-reconfirmation; constraint retained"
+                               if constrained and stale else
+                               "active constraint" if constrained else state),
+            )
+        return records
 
     def process_markers(self, text, source_text, source_type="user", prompt_context=""):
         """Strip MEMORY markers and return ``(cleaned_text, receipts, errors)``.
@@ -1087,7 +1187,7 @@ class MemoryStore:
                             raise ValueError(
                                 "Resolution quote must explicitly clear this named fact or body area."
                             )
-                        receipt = self._resolve_record(db, record, source_text)
+                        receipt = self._resolve_record(db, record, source_text, prompt_context)
                 receipts.append(receipt)
             except (ValueError, TypeError) as exc:
                 errors.append(str(exc))

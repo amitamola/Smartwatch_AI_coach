@@ -28,7 +28,9 @@ DEFAULT_OUTPUT_ROOT = Path(
         str(Path.home() / ".copilot" / "session-state" / "model-evaluation"),
     )
 )
-DEFAULT_MODELS = ("gemini-3.7-flash", "gemini-3.8-flash", "claude-sonnet-5")
+DEFAULT_MODELS = tuple(filter(None, (
+    value.strip() for value in os.environ.get(
+        "AGBOT_MODEL_EVAL_MODELS", os.environ.get("AGBOT_MODEL", "auto")).split(","))))
 DEFAULT_REASONING_EFFORT = os.environ.get("AGBOT_REASONING_EFFORT", "medium")
 DEFAULT_TIMEOUT_SECONDS = int(os.environ.get("AGBOT_MODEL_EVAL_TIMEOUT", "600"))
 DEFAULT_PROBE_TIMEOUT_SECONDS = int(os.environ.get("AGBOT_MODEL_EVAL_PROBE_TIMEOUT", "90"))
@@ -267,7 +269,7 @@ def build_command(
         "--context",
         "default",
     ])
-    if model:
+    if model and model != "auto":
         command.extend(["--model", model])
     for att in attachments or []:
         if att:
@@ -322,11 +324,15 @@ def run_copilot(
             ok=False,
             returncode=None,
             duration_seconds=duration,
-            stdout=exc.stdout or "",
-            stderr=(exc.stderr or "") + f"\nTIMEOUT after {timeout}s",
+            stdout=output_text(exc.stdout),
+            stderr=output_text(exc.stderr) + f"\nTIMEOUT after {timeout}s",
             command=command,
             attachments=attachments or [],
         )
+
+
+def output_text(value: str | bytes | None) -> str:
+    return value.decode("utf-8", errors="replace") if isinstance(value, bytes) else (value or "")
 
 
 def probe_model(model: str, effort: str, cwd: Path, timeout: int) -> RunRecord:
@@ -619,8 +625,8 @@ def probe_exact_deny_tool_flag(cwd: Path, effort: str = "medium") -> dict[str, A
             "ok": False,
             "returncode": None,
             "duration_seconds": round(time.perf_counter() - start, 3),
-            "stdout": exc.stdout or "",
-            "stderr": (exc.stderr or "") + "\nTIMEOUT after 30s",
+            "stdout": output_text(exc.stdout),
+            "stderr": output_text(exc.stderr) + "\nTIMEOUT after 30s",
         }
 
 
@@ -668,7 +674,10 @@ def run_realistic_case(model: str, case: RealisticCaseSpec, workdir: Path, effor
         )
         run.run_kind = case.case_id
         run.index = index
-        if case.validator == "case_a":
+        if not run.ok or run.returncode != 0:
+            checks = {"overall": False, "execution_error": run.stderr or
+                      f"process exited with {run.returncode}"}
+        elif case.validator == "case_a":
             checks = validate_case_a_output(
                 run.stdout,
                 today_iso=case.metadata["today"],
@@ -697,7 +706,7 @@ def run_realistic_case(model: str, case: RealisticCaseSpec, workdir: Path, effor
 
 
 def evaluate_realistic_models(models: list[str], workdir: Path, effort: str, repeats: int,
-                              timeout: int) -> dict[str, Any]:
+                              timeout: int, current_model: str | None = None) -> dict[str, Any]:
     today_iso = datetime.now().date().isoformat()
     cases = build_realistic_cases(workdir, today_iso)
     for case in cases:
@@ -707,7 +716,7 @@ def evaluate_realistic_models(models: list[str], workdir: Path, effort: str, rep
     artifacts_root = workdir / "artifacts"
     for model in models:
         probe = probe_model(model, effort, workdir, timeout=30)
-        if not probe.ok:
+        if not probe.ok or probe.returncode != 0:
             results.append({
                 "model": model,
                 "supported": False,
@@ -722,7 +731,8 @@ def evaluate_realistic_models(models: list[str], workdir: Path, effort: str, rep
             run_realistic_case(model, case, workdir, effort, repeats, timeout, artifacts_root)
             for case in cases
         ]
-        all_runs = [run for case in case_results for run in case["runs"] if run.get("ok")]
+        all_runs = [run for case in case_results for run in case["runs"]
+                    if run.get("ok") and run.get("returncode") == 0]
         results.append({
             "model": model,
             "supported": True,
@@ -735,8 +745,10 @@ def evaluate_realistic_models(models: list[str], workdir: Path, effort: str, rep
             ),
             "median_latency_seconds": statistics.median([r["duration_seconds"] for r in all_runs]) if all_runs else None,
             "notes": None,
+            "completion_rate": (len(all_runs) / sum(len(case["runs"]) for case in case_results)
+                                if any(case["runs"] for case in case_results) else 0.0),
         })
-    recommendation = recommend_realistic(results)
+    recommendation = recommend_realistic(results, current_model)
     return {
         "mode": "realistic",
         "today": today_iso,
@@ -758,48 +770,9 @@ def evaluate_realistic_models(models: list[str], workdir: Path, effort: str, rep
     }
 
 
-def recommend_realistic(results: list[dict[str, Any]]) -> dict[str, Any]:
-    lookup = {item["model"]: item for item in results}
-    current = lookup.get("gemini-3.7-flash")
-    upgraded = lookup.get("gemini-3.8-flash")
-    sonnet = lookup.get("claude-sonnet-5")
-    recommendation = {
-        "switch": False,
-        "message": "No clear upgrade from gemini-3.7-flash yet.",
-        "basis": {},
-    }
-    if current:
-        recommendation["basis"]["gemini-3.7-flash"] = {
-            "pass_rate": current.get("overall_pass_rate"),
-            "median_latency_seconds": current.get("median_latency_seconds"),
-            "supported": current.get("supported"),
-        }
-    if upgraded:
-        recommendation["basis"]["gemini-3.8-flash"] = {
-            "pass_rate": upgraded.get("overall_pass_rate"),
-            "median_latency_seconds": upgraded.get("median_latency_seconds"),
-            "supported": upgraded.get("supported"),
-        }
-    if sonnet:
-        recommendation["basis"]["claude-sonnet-5"] = {
-            "pass_rate": sonnet.get("overall_pass_rate"),
-            "median_latency_seconds": sonnet.get("median_latency_seconds"),
-            "supported": sonnet.get("supported"),
-        }
-    if not current or not upgraded or not current.get("supported") or not upgraded.get("supported"):
-        recommendation["message"] = "Could not compare Gemini models because one probe failed."
-        return recommendation
-
-    current_pass = current.get("overall_pass_rate") or 0.0
-    upgraded_pass = upgraded.get("overall_pass_rate") or 0.0
-    current_latency = current.get("median_latency_seconds") or float("inf")
-    upgraded_latency = upgraded.get("median_latency_seconds") or float("inf")
-    if upgraded_pass >= current_pass and upgraded_latency <= current_latency * 1.1 and upgraded_pass > 0.0:
-        recommendation["switch"] = True
-        recommendation["message"] = "Gemini 3.8 Flash looks equivalent or slightly better in this sample."
-    else:
-        recommendation["message"] = "Gemini 3.8 Flash did not clear the conservative switch threshold."
-    return recommendation
+def recommend_realistic(results: list[dict[str, Any]],
+                        current_model: str | None = None) -> dict[str, Any]:
+    return _recommend(results, current_model, "overall_pass_rate", 0.0, 1.1)
 
 
 def render_realistic_summary(result: dict[str, Any]) -> str:
@@ -928,7 +901,7 @@ def evaluate_model(model: str, cases: list[EvalCase], prompt: str, workdir: Path
                    effort: str, repeats: int, probe_timeout: int, run_timeout: int) -> dict[str, Any]:
     probe = probe_model(model, effort, workdir, probe_timeout)
     runs: list[RunRecord] = [probe]
-    if not probe.ok:
+    if not probe.ok or probe.returncode != 0:
         return {
             "model": model,
             "supported": False,
@@ -948,18 +921,24 @@ def evaluate_model(model: str, cases: list[EvalCase], prompt: str, workdir: Path
         run = run_copilot(model, effort, prompt, workdir, run_timeout)
         run.run_kind = "evaluation"
         run.index = index
-        parsed, case_results, score, parse_error = score_response(run.stdout, cases)
+        if run.ok and run.returncode == 0:
+            parsed, case_results, score, parse_error = score_response(run.stdout, cases)
+        else:
+            parsed, case_results, score, parse_error = (
+                None, [], None, run.stderr or f"process exited with {run.returncode}")
         run.parsed = parsed
         run.case_results = case_results
         run.score = score
         run.parse_error = parse_error
         runs.append(run)
         evaluated_runs.append(run.__dict__)
-        if score is not None:
+        if score is not None and parse_error is None:
             scores.append(score)
 
     latencies = [run["duration_seconds"] for run in evaluated_runs if run["ok"]]
-    valid_json_runs = [run for run in evaluated_runs if run["parsed"] is not None and run["score"] is not None]
+    valid_json_runs = [run for run in evaluated_runs if run["ok"] and run["returncode"] == 0
+                       and run["parsed"] is not None and run["score"] is not None
+                       and run["parse_error"] is None]
     return {
         "model": model,
         "supported": True,
@@ -969,6 +948,7 @@ def evaluate_model(model: str, cases: list[EvalCase], prompt: str, workdir: Path
         "median_score": statistics.median(scores) if scores else None,
         "median_latency_seconds": statistics.median(latencies) if latencies else None,
         "parse_success_rate": (len(valid_json_runs) / len(evaluated_runs)) if evaluated_runs else 0.0,
+        "completion_rate": (len(valid_json_runs) / len(evaluated_runs)) if evaluated_runs else 0.0,
         "case_summary": case_summary(cases, evaluated_runs),
         "error": None,
     }
@@ -997,45 +977,44 @@ def case_summary(cases: list[EvalCase], runs: list[dict[str, Any]]) -> list[dict
     return summary
 
 
-def recommend(results: list[dict[str, Any]]) -> dict[str, Any]:
+def recommend(results: list[dict[str, Any]],
+              current_model: str | None = None) -> dict[str, Any]:
+    return _recommend(results, current_model, "median_score", 0.15, 1.2)
+
+
+def _recommend(results, current_model, score_key, minimum_gain, latency_factor):
     lookup = {item["model"]: item for item in results}
-    current = lookup.get("gemini-3.7-flash")
-    upgraded = lookup.get("gemini-3.8-flash")
-    claude = lookup.get("claude-sonnet-5")
+    current_model = current_model or (results[0]["model"] if results else None)
+    current = lookup.get(current_model)
     recommendation = {
         "switch": False,
-        "message": "No clear evidence to switch from gemini-3.7-flash yet.",
-        "basis": {},
+        "message": "No candidate cleared the conservative switch threshold.",
+        "current_model": current_model,
+        "selected_model": current_model,
+        "basis": {item["model"]: {
+            "score": item.get(score_key), "supported": item.get("supported"),
+            "completion_rate": item.get("completion_rate"),
+            "median_latency_seconds": item.get("median_latency_seconds")}
+            for item in results},
     }
-    if not current or not upgraded or not current.get("supported") or not upgraded.get("supported"):
-        recommendation["message"] = "Could not compare the Gemini models because one probe failed."
+    def eligible(item):
+        return (item and item.get("supported") and item.get(score_key) is not None
+                and item.get("median_latency_seconds") is not None
+                and item.get("completion_rate", item.get("parse_success_rate", 0)) == 1.0)
+
+    if not eligible(current):
+        recommendation["message"] = "Current model lacks a complete successful benchmark."
         return recommendation
-
-    current_score = current.get("median_score") or 0.0
-    upgraded_score = upgraded.get("median_score") or 0.0
-    current_latency = current.get("median_latency_seconds") or float("inf")
-    upgraded_latency = upgraded.get("median_latency_seconds") or float("inf")
-
-    recommendation["basis"] = {
-        "current_model": current["model"],
-        "current_median_score": current_score,
-        "current_median_latency_seconds": current_latency,
-        "upgraded_model": upgraded["model"],
-        "upgraded_median_score": upgraded_score,
-        "upgraded_median_latency_seconds": upgraded_latency,
-    }
-    if upgraded_score - current_score >= 0.15 and upgraded_latency <= current_latency * 1.2:
+    candidates = [item for item in results if item["model"] != current_model and eligible(item)
+                  and item[score_key] > 0
+                  and item[score_key] - current[score_key] >= minimum_gain
+                  and item["median_latency_seconds"] <= current["median_latency_seconds"] * latency_factor]
+    if candidates:
+        winner = min(candidates, key=lambda item: (-item[score_key],
+                                                  item["median_latency_seconds"], item["model"]))
         recommendation["switch"] = True
-        recommendation["message"] = (
-            "Gemini 3.8 Flash is the clearest upgrade in this sample and is not materially slower."
-        )
-    else:
-        recommendation["message"] = (
-            "Gemini 3.8 Flash did not clear the conservative switch threshold over Gemini 3.7 Flash."
-        )
-    if claude and claude.get("supported"):
-        recommendation["basis"]["claude_median_score"] = claude.get("median_score")
-        recommendation["basis"]["claude_median_latency_seconds"] = claude.get("median_latency_seconds")
+        recommendation["selected_model"] = winner["model"]
+        recommendation["message"] = f"{winner['model']} cleared the threshold in this synthetic sample."
     return recommendation
 
 
@@ -1080,7 +1059,7 @@ def render_summary(results: list[dict[str, Any]], prompt_path: Path, manifest: d
                 ]
             )
 
-    rec = recommend(results)
+    rec = recommend(results, manifest.get("current_model"))
     parts = [
         "# Model evaluation summary",
         "",
@@ -1122,14 +1101,21 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--suite", choices=("standard", "realistic"), default="standard",
                         help="Which synthetic benchmark suite to run.")
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_ROOT), help="Private results root.")
-    parser.add_argument("--models", nargs="*", default=list(DEFAULT_MODELS),
-                        help="Models to probe; defaults to current, upgrade, and optional Claude.")
+    parser.add_argument("--models", nargs="+", default=list(DEFAULT_MODELS),
+                        help="Candidates; defaults to AGBOT_MODEL_EVAL_MODELS or AGBOT_MODEL/auto.")
+    parser.add_argument("--current-model", default=os.environ.get("AGBOT_MODEL"),
+                        help="Comparison baseline; defaults to the first candidate.")
     parser.add_argument("--repeats", type=int, default=DEFAULT_REPEATS, help="Evaluation runs per supported model.")
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT_SECONDS, help="Evaluation timeout in seconds.")
     parser.add_argument("--probe-timeout", type=int, default=DEFAULT_PROBE_TIMEOUT_SECONDS,
                         help="Probe timeout in seconds.")
     parser.add_argument("--reasoning-effort", default=DEFAULT_REASONING_EFFORT)
     args = parser.parse_args(argv)
+    if not args.models or min(args.repeats, args.timeout, args.probe_timeout) < 1:
+        parser.error("Provide candidates and positive repeats/timeouts.")
+    args.current_model = args.current_model or args.models[0]
+    if args.current_model not in args.models:
+        parser.error("--current-model must be included in --models.")
 
     output_root = Path(args.output_dir)
     run_dir = output_root / datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -1146,6 +1132,7 @@ def main(argv: list[str] | None = None) -> int:
             "output_root": str(output_root),
             "run_dir": str(run_dir),
             "models": list(args.models),
+            "current_model": args.current_model,
             "repeats": args.repeats,
             "reasoning_effort": args.reasoning_effort,
             "timeout_seconds": args.timeout,
@@ -1171,7 +1158,7 @@ def main(argv: list[str] | None = None) -> int:
         summary = {
             "manifest": manifest,
             "results": results,
-            "recommendation": recommend(results),
+            "recommendation": recommend(results, args.current_model),
         }
         write_json(run_dir / "summary.json", summary)
         md = render_summary(results, prompt_path, manifest)
@@ -1179,17 +1166,19 @@ def main(argv: list[str] | None = None) -> int:
         print(md)
         print()
         print(f"Results written to: {run_dir}")
-        any_supported = any(item["supported"] for item in results)
-        return 0 if any_supported else 1
+        completed = all(item["supported"] and item.get("completion_rate") == 1.0
+                        for item in results)
+        return 0 if completed else 1
 
     realistic = evaluate_realistic_models(list(args.models), run_dir, args.reasoning_effort,
-                                          args.repeats, args.timeout)
+                                          args.repeats, args.timeout, args.current_model)
     manifest = {
         "suite": "realistic",
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "output_root": str(output_root),
         "run_dir": str(run_dir),
         "models": list(args.models),
+        "current_model": args.current_model,
         "repeats": args.repeats,
         "reasoning_effort": args.reasoning_effort,
         "timeout_seconds": args.timeout,
@@ -1205,8 +1194,9 @@ def main(argv: list[str] | None = None) -> int:
     print(md)
     print()
     print(f"Results written to: {run_dir}")
-    any_supported = any(item["supported"] for item in realistic["models"])
-    return 0 if any_supported else 1
+    completed = all(item["supported"] and item.get("completion_rate") == 1.0
+                    for item in realistic["models"])
+    return 0 if completed else 1
 
 
 if __name__ == "__main__":

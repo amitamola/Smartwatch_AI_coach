@@ -7,7 +7,7 @@ import unittest
 import uuid
 from contextlib import closing
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -131,6 +131,92 @@ class MemoryTests(unittest.TestCase):
         self.assertIn("2000-01-01", self.store.render("health"))
         with self.assertRaises(MemoryBudgetError):
             self.store.render("health", max_chars=20)
+
+    def test_stale_chronic_stiffness_is_reconfirmation_not_recovery_or_a_write(self):
+        quote = "My lower back has chronic stiffness every morning."
+        original = self.store.upsert("health", "low_back", quote, source_text=quote,
+                                     verified=True, observed_on="2020-01-01")
+        before = self.db_path.read_bytes()
+        self.assertEqual(self.store.expire_transient_doms(date(2026, 1, 10)), [])
+        context = self.store.health_context(today="2026-01-10")
+        self.assertEqual(context[0]["status"], "active")
+        self.assertTrue(context[0]["needs_reconfirmation"])
+        self.assertTrue(context[0]["context_constraint_active"])
+        self.assertEqual(context[0]["resolution_state"], "active")
+        self.assertIn("needs-reconfirmation", self.store.render("health"))
+        self.assertIn(quote, self.store.render("health"))
+        self.assertEqual(context[0]["source_text"], quote)
+        self.assertEqual(context[0]["revision"], original["revision"])
+        self.assertEqual(self.db_path.read_bytes(), before)
+
+    def test_default_observation_and_staleness_use_shared_athlete_day(self):
+        instant = datetime(2026, 5, 20, 0, 15, tzinfo=timezone(timedelta(hours=5, minutes=30)))
+        with patch("coach_memory.coach_clock.now", return_value=instant), \
+                patch("coach_memory.coach_clock.today", return_value=instant.date()):
+            record = self.store.upsert("health", "knee", "Knee stiffness.")
+            self.assertEqual(record["observed_on"], "2026-05-20")
+            self.assertTrue(record["created_at"].startswith("2026-05-19T18:45:00"))
+            self.assertEqual(self.store.health_context()[0]["observation_age_days"], 0)
+            self.assertFalse(self.store.health_context()[0]["needs_reconfirmation"])
+
+    def test_legacy_age_expiry_is_not_rendered_as_user_confirmed_recovery(self):
+        original = self.store.upsert("health", "low_back", "Lower back stiffness.",
+                                     observed_on="2020-01-01")
+        with closing(sqlite3.connect(self.db_path)) as db, db:
+            db.execute("UPDATE memory_records SET status='resolved',resolution_source_text=? WHERE id=?",
+                       ("Auto-expired transient soreness/stiffness after 8 days.", original["id"]))
+        before = self.db_path.read_bytes()
+        record = self.store.health_context()[0]
+        self.assertEqual(record["status"], "resolved")
+        self.assertEqual(record["resolution_state"], "legacy_age_expired_unconfirmed")
+        self.assertTrue(record["context_constraint_active"])
+        self.assertTrue(record["needs_reconfirmation"])
+        self.assertIn("NOT confirmed recovery", self.store.render("health"))
+        self.assertIn(original["text"], self.store.render("health"))
+        self.assertEqual(self.store.records("health"), [])
+        self.assertEqual(self.db_path.read_bytes(), before)
+
+    def test_future_location_equipment_and_optional_nutrition_preferences_survive(self):
+        for key, quote in (
+            ("travel:location", "From 2030-07-12 I will be in Synthetic Town for three days."),
+            ("equipment:home", "From 2030-07-12 I will only have dumbbells at home."),
+            ("event:2030_07_13", "On 2030-07-13 I have a fictional race."),
+            ("travel:ambiguous_date", "I am in Synthetic Town on 12/07/2030 for three days."),
+            ("nutrition:logging", "Food logging is optional; do not base workout advice on incomplete intake."),
+        ):
+            _, receipts, errors = self.store.process_markers(
+                self.marker(kind="preference", key=key, text=quote, source_quote=quote,
+                            observed_on="2020-01-01"), quote)
+            self.assertFalse(errors)
+            self.assertNotIn("valid_until", receipts[0]["source_metadata"])
+            self.assertIn(quote, self.store.render("preference"))
+        earlier = self.store.records("preference")
+        correction = "Plans changed: from 2030-07-12 I will have a full gym at home."
+        revised = self.store.upsert("preference", "equipment:home", correction,
+                                    source_text=correction, verified=True, observed_on="2026-01-02")
+        self.assertEqual(revised["revision"], 2)
+        self.assertEqual(len(self.store.records("preference")), len(earlier))
+        rendered = self.store.render("preference")
+        self.assertIn(correction, rendered)
+        self.assertNotIn("will only have dumbbells", rendered)
+        self.assertEqual(len(self.store.revisions("preference", "equipment:home")), 2)
+        self.assertIn("Synthetic Town", rendered)
+        self.assertIn("fictional race", rendered)
+
+    def test_legacy_inferred_duration_cannot_hide_a_future_dated_trip(self):
+        quote = "From 2030-07-12 I will be in Synthetic Town for three days."
+        original = self.store.upsert("preference", "travel:location", quote,
+                                     source_text=quote, verified=True, observed_on="2020-01-01")
+        with closing(sqlite3.connect(self.db_path)) as db, db:
+            db.execute("UPDATE memory_records SET source_metadata=? WHERE id=?",
+                       (json.dumps({"valid_until": "2020-01-04",
+                                    "validity_reason": "Explicit temporary duration: for three days"}),
+                        original["id"]))
+        before = self.db_path.read_bytes()
+        self.assertIn(quote, self.store.render("preference"))
+        self.assertEqual(self.store.records("preference")[0]["text"], quote)
+        self.assertEqual(self.store.records("preference")[0]["revision"], 1)
+        self.assertEqual(self.db_path.read_bytes(), before)
 
     def test_older_queried_anchor_not_evicted_by_many_unrelated_entities(self):
         self.store.upsert("anchor", "moon cycle", "Moon cycle output was 17 fictional units.",
@@ -413,6 +499,10 @@ class MemoryTests(unittest.TestCase):
         self.assertFalse(retired["source_metadata"]["reclassification"]["clinical_resolution"])
         self.assertEqual(retired["source_metadata"]["reclassification"]["record_id"], anchor["id"])
         self.assertEqual([r["id"] for r in self.store.records("health")], [other["id"]])
+        context = {r["id"]: r for r in self.store.health_context()}
+        self.assertEqual(context[original["id"]]["resolution_state"], "administratively_reclassified")
+        self.assertFalse(context[original["id"]]["context_constraint_active"])
+        self.assertNotIn(quote, self.store.render("health"))
         self.assertEqual(len(self.store.records("preference")), 1)
         self.assertEqual([r["action"] for r in self.store.revisions("health", "low_back")],
                          ["created", "reclassified"])
@@ -976,14 +1066,90 @@ class MemoryTests(unittest.TestCase):
         self.assertFalse(errors)
         self.assertEqual(receipts[0]["status"], "resolved")
 
-        # Transient DOMS (>5 days old) auto-expires while acute pain stays active.
+        # Age cannot clear either soreness or acute pain.
         self.store.upsert("health", "symptom:doms", "Body is slightly sore after gym.",
                           observed_on="2026-01-01")
         self.store.upsert("health", "knee", "Sharp knee pain when squatting.",
                           observed_on="2026-01-01")
         expired = self.store.expire_transient_doms(today=date(2026, 1, 10), max_age_days=5)
-        self.assertEqual([r["key"] for r in expired], ["symptom:doms"])
-        self.assertEqual([r["key"] for r in self.store.records("health")], ["knee"])
+        self.assertEqual(expired, [])
+        self.assertEqual({r["key"] for r in self.store.records("health")}, {"knee", "symptom:doms"})
+
+    def test_contextual_clear_requires_one_question_entity_not_entire_bot_text(self):
+        self.store.upsert("health", "low_back", "Lower back pain.")
+        self.store.upsert("health", "knee", "Knee pain.")
+        for prompt in (
+            "How are your knee and lower back today?",
+            "How is your knee? And how is your lower back?",
+            "Your knee and lower back need monitoring. Any change?",
+            "How is your knee or back today?",
+            "How is your knee? How is your back?",
+            "Monitor your lower back.",
+        ):
+            with self.subTest(prompt=prompt):
+                self.assertEqual(self.store.resolve_supported_health("it painfree", prompt), [])
+        prompt = "Your knee and lower back both need monitoring. How is your knee today?"
+        resolved = self.store.resolve_supported_health("it painfree", prompt)
+        self.assertEqual([r["key"] for r in resolved], ["knee"])
+        self.assertEqual([r["key"] for r in self.store.records("health")], ["low_back"])
+        context = {r["key"]: r for r in self.store.health_context()}
+        self.assertEqual(context["knee"]["resolution_state"], "source_supported_user_report")
+        self.assertEqual(context["knee"]["source_metadata"]["resolution"]["source_quote"], "it painfree")
+        self.assertEqual(context["knee"]["source_metadata"]["resolution"]["prompt_context"], prompt)
+        self.assertNotIn("Knee pain.", self.store.render("health"))
+
+    def test_natural_explicit_clears_keep_source_quote_and_anatomical_scope(self):
+        for key, quote, prompt in (
+            ("knee", "No knee pain today.", ""),
+            ("low_back", "No pain on my lower back.", ""),
+            ("low_back", "My lower back pain is gone for good.", ""),
+            ("low_back", "The soreness I had in my lower back last week is cleared.", ""),
+            ("low_back", "My lower back soreness I had last week is cleared.", ""),
+            ("low_back", "My lower back is feeling fine now.", ""),
+            ("low_back", "The pain is gone for good.", "How is your lower back?"),
+            ("low_back", "It is feeling fine now.", "How is your lower back?"),
+            ("left_knee", "No left knee pain today.", ""),
+            ("symptom:muscle_soreness", "The soreness I had last week is cleared.", ""),
+        ):
+            with self.subTest(quote=quote):
+                original = self.store.upsert("health", key, "Synthetic symptom.")
+                resolved = self.store.resolve_supported_health(quote, prompt)
+                self.assertEqual([r["id"] for r in resolved], [original["id"]])
+                self.assertEqual(resolved[0]["resolution_source_text"], quote)
+                self.assertEqual(resolved[0]["source_text"], original["source_text"])
+                self.assertEqual(resolved[0]["source_metadata"]["resolution"]["source_quote"], quote)
+
+    def test_natural_clears_do_not_strip_partial_conditional_or_opposite_symptoms(self):
+        self.store.upsert("health", "low_back", "Lower back stiffness.")
+        for quote in (
+            "No pain on my lower back while walking.",
+            "My lower back pain is gone for now.",
+            "My lower back pain is mostly gone.",
+            "My lower back is feeling fine now at rest.",
+            "My lower back is feeling fine now, but still stiff when moving.",
+            "The soreness I had in my lower back last week is mostly cleared.",
+            "The soreness I had in my lower back last week is cleared only at rest.",
+            "My lower back pain is gone for good except when lifting.",
+            "No lower back pain today, but the stiffness persists.",
+            "If my lower back pain is gone, I will exercise.",
+        ):
+            with self.subTest(quote=quote):
+                self.assertEqual(self.store.resolve_supported_health(quote), [])
+        self.store.upsert("health", "knee", "Knee pain.")
+        resolved = self.store.resolve_supported_health(
+            "No knee pain today, but my lower back still hurts.")
+        self.assertEqual([r["key"] for r in resolved], ["knee"])
+        self.assertEqual([r["key"] for r in self.store.records("health")], ["low_back"])
+
+    def test_one_side_or_region_clear_does_not_clear_opposite_or_general_soreness(self):
+        for key, text in (("left_knee", "Left knee pain."), ("right_knee", "Right knee pain."),
+                          ("symptom:muscle_soreness", "Soreness all over my body.")):
+            self.store.upsert("health", key, text)
+        resolved = self.store.resolve_supported_health(
+            "My left knee soreness is cleared, but my right knee still hurts.")
+        self.assertEqual([r["key"] for r in resolved], ["left_knee"])
+        self.assertEqual({r["key"] for r in self.store.records("health")},
+                         {"right_knee", "symptom:muscle_soreness"})
 
     def test_partial_negated_conditional_or_unrelated_fine_now_is_not_clear(self):
         self.store.upsert("health", "thoracic", "Synthetic thoracic symptom.")

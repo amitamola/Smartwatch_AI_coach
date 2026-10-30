@@ -1,13 +1,15 @@
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
+from unittest.mock import patch
 
-from coach_runtime import RuntimeStore, SnapshotCache
+from coach_runtime import ArtifactConflictError, RuntimeStore, SnapshotCache
 
 
 class RuntimeTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
+        self.temp = tempfile.TemporaryDirectory(dir=Path.cwd())
         self.addCleanup(self.temp.cleanup)
         self.store = RuntimeStore(Path(self.temp.name) / "runtime.db")
 
@@ -85,12 +87,88 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(self.store.due_messages(now=40), [])
 
     def test_backoff_does_not_let_later_chunks_overtake(self):
-        self.store.enqueue("first", 1, {"text": "first part"}, now=0)
-        self.store.enqueue("second", 1, {"text": "second part"}, now=1)
+        self.store.enqueue("first", 1, {"text": "first part"}, now=0, group_id="response")
+        self.store.enqueue("second", 1, {"text": "second part"}, now=1, group_id="response")
+        self.store.enqueue("other", 1, {"text": "independent"}, now=2, group_id="other")
         self.store.delivery_failed("first", "rate limited", retry_after=30, now=1)
-        self.assertEqual(self.store.due_messages(now=10), [])
+        self.assertEqual([r["id"] for r in self.store.due_messages(now=10)], ["other"])
+        self.store.delivered("other", 3)
         self.assertEqual([r["id"] for r in self.store.due_messages(now=32)],
                          ["first", "second"])
+        self.store.delivered("first", 1)
+        self.assertEqual([r["id"] for r in self.store.due_messages(now=32)], ["second"])
+
+    def test_terminal_failure_cancels_bundle_and_retains_records(self):
+        for key in ("first", "second"):
+            self.store.enqueue(key, 1, {"text": key}, now=0, group_id="bundle")
+        self.assertEqual(self.store.delivery_failed("first", "blocked", permanent=True), "failed")
+        self.store.enqueue("late", 1, {"text": "late"}, group_id="bundle")
+        self.store.delivered("first", 99)
+        self.assertEqual(self.store.counts()["outbox"], {"failed": 1, "cancelled": 2})
+        self.assertEqual(self.store.due_messages(now=10000), [])
+
+    def test_transient_failures_are_bounded_and_no_default_expiration(self):
+        self.store.enqueue("request", 1, {"text": "user result"}, now=0)
+        self.assertEqual(self.store.delivery_failed("request", "offline", max_attempts=2, now=0),
+                         "pending")
+        self.assertEqual(self.store.due_messages(now=10**9)[0]["id"], "request")
+        self.assertEqual(self.store.delivery_failed("request", "offline", max_attempts=2, now=20),
+                         "failed")
+
+    def test_expiry_applies_to_entire_scheduled_bundle_only(self):
+        self.store.enqueue("schedule1", 1, {}, now=0, group_id="scheduled", expires_at=20)
+        self.store.enqueue("schedule2", 1, {}, now=0, group_id="scheduled")
+        self.store.enqueue("request", 1, {}, now=0)
+        self.assertEqual(self.store.queue_health(now=30)["outbox"]["pending"]["count"], 3)
+        self.assertEqual([r["id"] for r in self.store.due_messages(now=30)], ["request"])
+        self.assertEqual(self.store.counts()["outbox"]["expired"], 2)
+
+    def test_artifacts_survive_restart_and_conflicting_replay_is_rejected(self):
+        value = {"input": {"source": "synthetic"}, "events": [1, 2]}
+        saved = self.store.save_artifact("request:input", value)
+        saved["events"].append(3)
+        reopened = RuntimeStore(self.store.path)
+        self.assertEqual(reopened.get_artifact("request:input"), value)
+        self.assertEqual(reopened.save_artifact("request:input", value), value)
+        with self.assertRaises(ArtifactConflictError):
+            reopened.save_artifact("request:input", {"events": [3]})
+        self.assertEqual(reopened.get_artifact("request:input"), value)
+        self.assertIsNone(reopened.get_artifact("missing"))
+        with self.assertRaises(ValueError):
+            reopened.save_artifact("nan", {"value": float("nan")})
+
+    def test_sent_chunk_deadline_expires_remaining_scheduled_chunks(self):
+        self.store.enqueue("first", 1, {}, now=0, group_id="scheduled", expires_at=20)
+        self.store.enqueue("second", 1, {}, now=0, group_id="scheduled")
+        self.store.delivered("first", 1)
+        self.assertEqual(self.store.due_messages(now=30), [])
+        self.assertEqual(self.store.counts()["outbox"], {"sent": 1, "expired": 1})
+
+    def test_edited_update_keeps_source_identity_and_processing_order(self):
+        original = self.update(1)
+        original["message"]["message_id"] = 20
+        edited = {"update_id": 2, "edited_message": {
+            **original["message"], "edit_date": 150, "text": "corrected"}}
+        self.store.ingest([original, edited], now=0)
+        first = self.store.claim(now=0)
+        self.assertIsNone(self.store.claim(now=0))
+        self.store.finish(first["id"])
+        second = self.store.claim(now=0)
+        self.assertEqual(second["payload"]["updates"], [edited])
+        self.assertEqual(second["payload"]["messages"][0]["message_id"], 20)
+
+    def test_migration_of_old_outbox_is_additive(self):
+        import sqlite3
+        path = Path(self.temp.name) / "old.db"
+        with closing(sqlite3.connect(path)) as db:
+            db.execute("CREATE TABLE outbox (id TEXT PRIMARY KEY,chat_id TEXT,payload TEXT,"
+                       "status TEXT,attempts INTEGER,available_at REAL,created_at REAL,"
+                       "telegram_message_id TEXT,last_error TEXT)")
+            db.execute("INSERT INTO outbox VALUES ('old','1','{}','pending',0,0,0,NULL,NULL)")
+            db.commit()
+        migrated = RuntimeStore(path)
+        self.assertEqual(migrated.due_messages(now=1)[0]["id"], "old")
+        self.assertIsNone(migrated.due_messages(now=1)[0]["expires_at"])
 
     def test_cache_does_not_hide_errors_or_mutate_shared_snapshot(self):
         calls = []
@@ -104,6 +182,34 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         cache.loader = lambda: {"__error__": "offline"}
         self.assertIn("__error__", cache.get(force=True))
+
+    def test_stale_snapshot_requires_opt_in_and_keeps_original_provenance(self):
+        cache = SnapshotCache(lambda: {"sensor": [1]}, ttl_seconds=1)
+        with patch("coach_runtime.time.time", return_value=100):
+            fresh = cache.get()
+        cache.invalidate()
+        cache.loader = lambda: {"__error__": "offline"}
+        with patch("coach_runtime.time.time", return_value=200):
+            self.assertIn("__error__", cache.get())
+            stale = cache.get(allow_stale=True)
+        self.assertEqual(stale["sensor"], [1])
+        self.assertTrue(stale["snapshot_cache"]["stale"])
+        self.assertEqual(stale["snapshot_cache"]["age_seconds"], 100)
+        self.assertEqual(stale["snapshot_cache"]["loaded_at"], fresh["snapshot_cache"]["loaded_at"])
+        self.assertEqual(stale["snapshot_cache"]["load_error"], "offline")
+        cache.loader = lambda: {"sensor": [2]}
+        self.assertFalse(cache.get()["snapshot_cache"]["stale"])
+
+    def test_snapshot_io_errors_are_opt_in_but_programming_errors_propagate(self):
+        cache = SnapshotCache(lambda: {"sensor": 1})
+        cache.get()
+        with patch.object(cache, "loader", side_effect=OSError("offline")):
+            with self.assertRaises(OSError):
+                cache.get(force=True)
+            self.assertTrue(cache.get(force=True, allow_stale=True)["snapshot_cache"]["stale"])
+        with patch.object(cache, "loader", side_effect=ValueError("broken parser")):
+            with self.assertRaises(ValueError):
+                cache.get(force=True, allow_stale=True)
 
 
 if __name__ == "__main__":

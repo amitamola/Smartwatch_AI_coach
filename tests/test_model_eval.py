@@ -1,6 +1,9 @@
+import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from scripts.evaluate_models import (
     DEFAULT_OUTPUT_ROOT,
@@ -12,6 +15,14 @@ from scripts.evaluate_models import (
     evaluate_model,
     score_response,
     synthetic_cases,
+    RunRecord,
+    RealisticCaseSpec,
+    run_copilot,
+    run_realistic_case,
+    probe_exact_deny_tool_flag,
+    recommend,
+    recommend_realistic,
+    main,
 )
 
 
@@ -119,7 +130,7 @@ class ModelEvalTests(unittest.TestCase):
         self.assertTrue(checks["number_checks"]["calories_240"])
 
     def test_png_image_writer_creates_artifact(self):
-        with tempfile.TemporaryDirectory() as folder:
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as folder:
             path = Path(folder) / "image.png"
             write_png_text_image(path, "Synthetic", ["FAT BURNER", "12 G"])
             self.assertTrue(path.exists())
@@ -149,6 +160,67 @@ class ModelEvalTests(unittest.TestCase):
         self.assertIsNotNone(parsed)
         self.assertEqual(score, 1 / len(cases))
         self.assertEqual(results[6]["case_id"], "source_quote_plan_actual")
+
+    def record(self, ok=True, stdout="", returncode=0):
+        return RunRecord("synthetic", "probe", 0, ok, returncode, 1.0, stdout, "", [])
+
+    def test_nonzero_exit_cannot_score_perfect_json(self):
+        cases = synthetic_cases()
+        stdout = json.dumps({"cases": [{"case_id": c.case_id, "label": c.expected_label,
+                                       "rationale": "synthetic"} for c in cases]})
+        with patch("scripts.evaluate_models.probe_model", return_value=self.record()), \
+             patch("scripts.evaluate_models.run_copilot",
+                   return_value=self.record(False, stdout, 1)):
+            result = evaluate_model("synthetic", cases, "", Path.cwd(), "medium", 1, 1, 1)
+        self.assertIsNone(result["median_score"])
+        self.assertEqual(result["completion_rate"], 0)
+        self.assertEqual(result["parse_success_rate"], 0)
+        self.assertFalse(any(c["correct_runs"] for c in result["case_summary"]))
+
+    def test_nonzero_realistic_run_never_passes(self):
+        case = RealisticCaseSpec("synthetic", "Synthetic", "", (), "case_b", {})
+        output = "12 g, 23 min, 240 calories; fuel use, not body-fat loss; do not subtract twice."
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as folder, \
+             patch("scripts.evaluate_models.run_copilot",
+                   return_value=self.record(False, output, 1)), \
+             patch("scripts.evaluate_models.validate_case_b_output") as validator:
+            result = run_realistic_case("synthetic", case, Path(folder), "medium", 1, 1, Path(folder))
+        validator.assert_not_called()
+        self.assertEqual(result["pass_rate"], 0)
+        self.assertFalse(result["runs"][0]["checks"]["overall"])
+
+    def test_timeout_bytes_are_decoded_for_both_probe_paths(self):
+        error = subprocess.TimeoutExpired("synthetic", 1, output=b"partial \xff", stderr=b"offline")
+        with patch("scripts.evaluate_models.subprocess.run", side_effect=error):
+            run = run_copilot("synthetic", "medium", "", Path.cwd(), 1)
+            probe = probe_exact_deny_tool_flag(Path.cwd())
+        self.assertFalse(run.ok)
+        self.assertIsInstance(run.stdout, str)
+        self.assertIn("TIMEOUT", run.stderr)
+        self.assertIsInstance(probe["stdout"], str)
+        self.assertIn("TIMEOUT", probe["stderr"])
+        json.dumps(probe)
+
+    def test_recommendations_use_configured_candidates_and_complete_runs(self):
+        results = [{"model": name, "supported": True, "completion_rate": completion,
+                    "median_score": score, "overall_pass_rate": score,
+                    "median_latency_seconds": latency}
+                   for name, score, latency, completion in (
+                       ("baseline", .5, 10, 1), ("candidate", .9, 9, 1),
+                       ("broken", 1, 1, .5))]
+        self.assertEqual(recommend(results, "baseline")["selected_model"], "candidate")
+        self.assertEqual(recommend_realistic(results, "baseline")["selected_model"], "candidate")
+        self.assertFalse(recommend(results, "missing")["switch"])
+        self.assertFalse(recommend(results, "broken")["switch"])
+
+    def test_cli_returns_failure_when_probe_succeeds_but_evaluation_fails(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as folder, \
+             patch("scripts.evaluate_models.probe_model", return_value=self.record()), \
+             patch("scripts.evaluate_models.run_copilot", return_value=self.record(False, "{}", 1)), \
+             patch("builtins.print"):
+            result = main(["--output-dir", folder, "--models", "synthetic",
+                           "--current-model", "synthetic", "--repeats", "1"])
+        self.assertEqual(result, 1)
 
 
 if __name__ == "__main__":

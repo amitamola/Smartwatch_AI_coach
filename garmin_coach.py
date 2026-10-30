@@ -27,6 +27,8 @@ from zoneinfo import ZoneInfo
 
 from garminconnect import Garmin
 import garmin_metrics as metrics
+import coach_clock
+from coach_trends import weight_trend as summarize_weight_trend
 
 STATE_DIR = os.path.join(os.environ.get("AGBOT_DATA_DIR", os.path.dirname(os.path.abspath(__file__))), "state")
 BRIEF_STATE = os.path.join(STATE_DIR, "last_brief_date.txt")
@@ -52,16 +54,12 @@ def _set_local_tz(name):
     global _LOCAL_TZ_NAME
     if name:
         _LOCAL_TZ_NAME = name
+        coach_clock.configure(name)
 
 
 def _local_zone():
-    """The user's local timezone (Garmin profile) when known and loadable, else host local."""
-    if _LOCAL_TZ_NAME:
-        try:
-            return ZoneInfo(_LOCAL_TZ_NAME)
-        except Exception:  # noqa: BLE001 - missing tzdata / bad name -> host local
-            pass
-    return datetime.now().astimezone().tzinfo
+    """Use the same explicit/cached athlete timezone as planning and reminders."""
+    return coach_clock.zone()
 
 
 def _atomic_write(path, text):
@@ -120,7 +118,7 @@ def is_sleep_logged(g, d):
 
 # ---------------------------------------------------------------- should-brief
 def cmd_should_brief(args):
-    today = date.today()
+    today = coach_clock.today()
     already = ""
     if os.path.exists(BRIEF_STATE):
         with open(BRIEF_STATE, "r", encoding="utf-8") as fh:
@@ -141,8 +139,8 @@ def cmd_should_brief(args):
 
 
 def cmd_mark_sent(args):
-    _atomic_write(BRIEF_STATE, iso(date.today()))
-    print(f"marked {iso(date.today())}")
+    _atomic_write(BRIEF_STATE, iso(coach_clock.today()))
+    print(f"marked {iso(coach_clock.today())}")
     return 0
 
 
@@ -230,7 +228,7 @@ def _epoch_ms_local(ms):
     if isinstance(ms, bool) or not isinstance(ms, (int, float)):
         return None
     try:
-        return datetime.utcfromtimestamp(ms / 1000).isoformat(timespec="minutes")
+        return datetime.fromtimestamp(ms / 1000, timezone.utc).isoformat(timespec="minutes")
     except Exception:  # noqa: BLE001
         return None
 
@@ -320,7 +318,7 @@ def _training_rhythm(g, d_today, activities=None, coverage=None):
 
 def program_history(d_today=None, days=28, max_set_fetches=8, g=None):
     """Bounded programme lookback, including workouts predating the local bot store."""
-    d_today = d_today or date.today()
+    d_today = d_today or coach_clock.today()
     if isinstance(days, bool) or not isinstance(days, int) or not 1 <= days <= 90:
         raise ValueError("Programme history days must be between 1 and 90.")
     if (isinstance(max_set_fetches, bool) or not isinstance(max_set_fetches, int)
@@ -455,7 +453,7 @@ def configured_protein_range():
 def build_snapshot(d_today=None):
     protein_range = configured_protein_range()
     if d_today is None:
-        d_today = date.today()
+        d_today = coach_clock.today()
     elif isinstance(d_today, str):
         d_today = date.fromisoformat(d_today)
     d_yest = d_today - timedelta(days=1)
@@ -772,67 +770,8 @@ def build_snapshot(d_today=None):
                 "bone_mass_g": last.get("boneMass"),
             }
 
-    # Weight TREND (fat-loss progress signal) - built from the SAME 30-day body-comp pull
-    # above, so no extra API call. Oldest->newest series (kg) + net change + direction, so
-    # the daily brief can actually track PROGRESS, not just report a single weigh-in.
-    weight_trend = None
-    if isinstance(weight, dict):
-        _pts = []
-        for w in sorted((weight.get("dateWeightList") or []),
-                        key=lambda e: e.get("calendarDate") or ""):
-            _g = w.get("weight")
-            if not isinstance(_g, (int, float)):
-                continue
-            _pts.append({
-                "date": w.get("calendarDate"),
-                "weight_kg": round(_g / 1000.0, 1),
-                "body_fat_pct": w.get("bodyFat"),
-            })
-        if _pts:
-            _pts = _pts[-14:]  # last ~2 weeks is the meaningful daily-brief window
-            _latest, _earliest = _pts[-1], _pts[0]
-
-            def _closest_before(days):
-                try:
-                    target = date.fromisoformat(_latest["date"][:10]) - timedelta(days=days)
-                except (ValueError, TypeError):
-                    return None
-                best, best_gap = None, None
-                for _p in _pts[:-1]:
-                    try:
-                        _pd = date.fromisoformat((_p["date"] or "")[:10])
-                    except ValueError:
-                        continue
-                    _gap = abs((_pd - target).days)
-                    if best_gap is None or _gap < best_gap:
-                        best, best_gap = _p, _gap
-                return best if (best is not None and best_gap is not None and best_gap <= 4) else None
-
-            def _chg(ref):
-                if ref and isinstance(ref.get("weight_kg"), (int, float)):
-                    return round(_latest["weight_kg"] - ref["weight_kg"], 1)
-                return None
-
-            _net = _chg(_earliest) if _earliest is not _latest else None
-            _c7 = _chg(_closest_before(7))
-            _dir = None
-            if isinstance(_net, (int, float)):
-                _dir = "down" if _net <= -0.3 else ("up" if _net >= 0.3 else "flat")
-            try:
-                _span = (date.fromisoformat(_latest["date"][:10])
-                         - date.fromisoformat(_earliest["date"][:10])).days
-            except (ValueError, TypeError):
-                _span = None
-            weight_trend = {
-                "series": _pts,
-                "count": len(_pts),
-                "latest_kg": _latest["weight_kg"],
-                "latest_date": _latest["date"],
-                "change_last_7d_kg": _c7,
-                "net_change_kg": _net,
-                "span_days": _span,
-                "direction": _dir,
-            }
+    weight_trend = (summarize_weight_trend(weight.get("dateWeightList") or [], today=d_today)
+                    if isinstance(weight, dict) else None)
 
     # ---- Whole-day wellness (get_user_summary is Garmin's richest single call) ----
     usumm = safe(lambda: g.get_user_summary(iso(d_today)))
@@ -933,7 +872,7 @@ def build_snapshot(d_today=None):
                 _ts, _lvl = _pt[0], _pt[1]
                 if not isinstance(_ts, (int, float)) or not isinstance(_lvl, (int, float)) or _lvl < 0:
                     continue  # skip -1/-2 no-reading sentinels
-                _hr = datetime.utcfromtimestamp((_ts + _off_ms) / 1000).hour
+                _hr = datetime.fromtimestamp((_ts + _off_ms) / 1000, timezone.utc).hour
                 _buckets.setdefault(_hr, []).append(_lvl)
             if _buckets:
                 wellness["stress_curve_hourly"] = {
@@ -945,7 +884,7 @@ def build_snapshot(d_today=None):
             try:
                 _st = datetime.fromisoformat(sync.replace("Z", ""))
                 last_sync_gmt = _st.isoformat(timespec="minutes")
-                last_sync_age_min = round((datetime.utcnow() - _st).total_seconds() / 60)
+                last_sync_age_min = round((datetime.now(timezone.utc) - _st).total_seconds() / 60)
             except Exception:  # noqa: BLE001
                 last_sync_gmt = sync[:16]
 
@@ -982,7 +921,7 @@ def build_snapshot(d_today=None):
     if bb_series_ts:
         _bb_ts = datetime.fromtimestamp(bb_series_ts / 1000)
         bb_current_as_of = _bb_ts.isoformat(timespec="minutes")
-        bb_current_age_min = round((datetime.now() - _bb_ts).total_seconds() / 60)
+        bb_current_age_min = round((coach_clock.now() - _bb_ts).total_seconds() / 60)
 
     # ---- Static-ish profile config: timezone (for correct time-of-day reasoning), habitual
     # sleep window, and training-day preferences. From settings + user profile (userData). ----
@@ -1152,7 +1091,7 @@ def build_snapshot(d_today=None):
     weekly_trends = weekly_trends or None
 
     snapshot = {
-        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "generated_at": coach_clock.now().isoformat(timespec="seconds"),
         "athlete": full_name,
         "sleep_date": iso(d_today),
         "activity_date": iso(d_yest),
@@ -1201,7 +1140,7 @@ def latest_activity():
 
 
 def trained_today(min_duration_s=None):
-    """Compatibility boolean using classify_activity; errors/unknown return False.
+    """True/False only with supporting observations/coverage; unknown returns None.
 
     min_duration_s is retained for call compatibility, not an all-sports threshold.
     Coverage-aware callers should consume snapshot.training_rhythm.trained_today.
@@ -1209,10 +1148,12 @@ def trained_today(min_duration_s=None):
     try:
         g = client()
     except Exception:  # noqa: BLE001
-        return False
+        return None
     today = datetime.now(_local_zone()).date()
     acts, _coverage = _activity_history(g, today, today, max_pages=2)
-    return any(_is_training_activity(a) for a in acts)
+    if any(_is_training_activity(a) for a in acts):
+        return True
+    return False if _coverage.get("complete") else None
 
 
 def sleep_logged_today(d_today=None):
@@ -1233,7 +1174,7 @@ def hydration_today(d_today=None):
     """Lightweight fetch of today's hydration as (logged_ml, goal_ml). Returns
     (None, None) on any login/API error or missing field. Used by the bridge's
     hydration nudges to skip a reminder when the user is already on pace."""
-    d = d_today or date.today()
+    d = d_today or coach_clock.today()
     try:
         g = client()
     except Exception:  # noqa: BLE001
@@ -1258,7 +1199,7 @@ def _parse_local_epoch(s):
         return None
 
 
-def session_block(gap_secs=3600, lookback=15):
+def session_block(gap_secs=3600, lookback=15, target_day=None):
     """The trailing cluster of just-finished activities that together form ONE workout
     session. The user logs each part of a session as a separate Garmin activity (a cardio
     warm-up, the Strength block, a run, a Pilates/stretch cool-down); this walks the most
@@ -1276,10 +1217,14 @@ def session_block(gap_secs=3600, lookback=15):
     if not isinstance(acts, list) or not acts:
         return []
     rows = []
+    target_day = target_day or datetime.now(_local_zone()).date()
+    target_day = date.fromisoformat(str(target_day)[:10])
     for a in acts:
         t = _trim_activity(a)
         st = _parse_local_epoch(t.get("start"))
         if st is None:
+            continue
+        if datetime.fromtimestamp(st, _local_zone()).date() != target_day:
             continue
         dur = t.get("duration_s")
         end = st + (dur if isinstance(dur, (int, float)) else 0)
@@ -1361,7 +1306,7 @@ def build_weekly(days=7, d_today=None):
     """Per-day trends over the last `days` days plus weight series, the week's
     activities and latest training status. Heavier than build_snapshot, on demand."""
     if d_today is None:
-        d_today = date.today()
+        d_today = coach_clock.today()
     elif isinstance(d_today, str):
         d_today = date.fromisoformat(d_today)
     try:
@@ -1370,7 +1315,7 @@ def build_weekly(days=7, d_today=None):
         return {"__error__": f"login failed: {exc}"}
     start = d_today - timedelta(days=days)
     out = {
-        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "generated_at": coach_clock.now().isoformat(timespec="seconds"),
         "range": iso(start) + " .. " + iso(d_today),
         "days": [],
     }
@@ -1491,7 +1436,7 @@ def fitness_profile(d_today=None, g=None, refresh=False):
     VO2max, lactate-threshold HR, cycling FTP, weekly intensity minutes.
     Meant to be cached ~daily by the bot, not fetched on every message."""
     if d_today is None:
-        d_today = date.today()
+        d_today = coach_clock.today()
     elif isinstance(d_today, str):
         d_today = date.fromisoformat(d_today)
     try:
@@ -1500,7 +1445,7 @@ def fitness_profile(d_today=None, g=None, refresh=False):
         return {"__error__": f"login failed: {exc}"}
     today = iso(d_today)
     week = iso(d_today - timedelta(days=7))
-    prof = {"schema_version": 2, "generated_at": datetime.now().isoformat(timespec="seconds")}
+    prof = {"schema_version": 2, "generated_at": coach_clock.now().isoformat(timespec="seconds")}
 
     fa = safe(lambda: g.get_fitnessage_data(today))
     if isinstance(fa, dict) and "__error__" not in fa:
@@ -1702,7 +1647,7 @@ def _within_days(start_local, days):
         d = date.fromisoformat(str(start_local)[:10])
     except ValueError:
         return True
-    return 0 <= (date.today() - d).days <= days
+    return 0 <= (coach_clock.today() - d).days <= days
 
 
 def _set_source_values(summaries):

@@ -7,6 +7,7 @@ import uuid
 from contextlib import closing
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 from coach_program import (
     ProgramStore, build_review_evidence, parse_program_review, render_program,
@@ -135,10 +136,12 @@ class ReviewEvidenceTests(unittest.TestCase):
             activity("b", exercise="Romanian Deadlift With Dumbbells"),
             activity("c", TODAY - timedelta(days=1), exercise="Barbell Romanian Deadlift"),
             activity("d", exercise="Synthetic row"),
+            activity("e", TODAY - timedelta(days=1), exercise="DB RDL"),
         ])
-        summary = source["comparable_sessions"]["romanian deadlift"]
+        summary = source["comparable_sessions"]["dumbbell romanian deadlift"]
         self.assertEqual(summary["count"], 2)
         self.assertEqual(len(summary["refs"]), 3)
+        self.assertEqual(source["comparable_sessions"]["barbell romanian deadlift"]["count"], 1)
         self.assertEqual(source["intentional_training_days"]["count"], 2)
         self.assertEqual(source["comparable_sessions"]["synthetic row"]["count"], 1)
 
@@ -209,6 +212,66 @@ class ReviewEvidenceTests(unittest.TestCase):
         self.assertNotIn("avg_hr", first)
         self.assertEqual(second["metric_units"]["avg_pace"], "unspecified")
         self.assertEqual(third["metric_units"]["avg_pace"], "min/mile")
+
+    def test_session_feedback_hr_and_zones_retain_raw_values_scope_and_provenance(self):
+        source = evidence(outcomes=[activity(
+            workout_rpe=80, workout_feel=3, recovery_hr_bpm=31,
+            hr_zones_min={"z1": 1.0, "z4": 10.0, "z5": 5.0})])
+        row = source["observations"][0]
+        self.assertEqual(row["workout_rpe"], 80)
+        self.assertEqual(row["workout_feel"], 3)
+        self.assertEqual(row["recovery_hr_bpm"], 31)
+        self.assertEqual(row["hr_zones_min"], {"z1": 1.0, "z4": 10.0, "z5": 5.0})
+        for key in ("workout_rpe", "workout_feel", "recovery_hr_bpm", "hr_zones_min"):
+            metadata = row["session_metric_provenance"][key]
+            self.assertEqual(metadata["ref"], "activity:one")
+            self.assertEqual(metadata["date"], TODAY.isoformat())
+            self.assertEqual(metadata["scope"], "session")
+            self.assertFalse(metadata["exercise_specific_capability"])
+            self.assertTrue(metadata["source_field"])
+            self.assertTrue(metadata["source_type"])
+        self.assertIn("unspecified", row["session_metric_provenance"]["workout_rpe"]["scale"])
+        self.assertIn("bpm", row["metric_units"]["recovery_hr_bpm"])
+        self.assertIn("min", row["metric_units"]["hr_zones_min"])
+        supplied_scale = evidence(outcomes=[activity(
+            workout_rpe=0, workout_rpe_scale="Synthetic session scale 0..10",
+            workout_feel=None)])
+        self.assertEqual(supplied_scale["observations"][0]["workout_rpe"], 0)
+        self.assertEqual(supplied_scale["observations"][0]["session_metric_provenance"]
+                         ["workout_rpe"]["scale"], "Synthetic session scale 0..10")
+        self.assertIsNone(supplied_scale["observations"][0]["workout_feel"])
+        self.assertNotIn("recovery_hr_bpm", supplied_scale["observations"][0])
+
+    def test_future_preferences_remain_context_not_current_availability_or_capability(self):
+        future = (TODAY + timedelta(days=30)).isoformat()
+        location = memory(2, "From 2026-06-19 I will train at a fictional hotel.",
+                          kind="preference", key="travel:location", observed_on=future)
+        equipment = memory(3, "From 2026-06-19 I will only have dumbbells.",
+                           kind="preference", key="equipment:travel")
+        schedule = memory(4, "I can train two days per week.",
+                          kind="preference", key="schedule", observed_on=future)
+        source = evidence(memories=[location, equipment, schedule,
+                                    memory(5, observed_on=future),
+                                    memory(6, "Knee stiffness.", kind="health", key="knee",
+                                           observed_on=future)])
+        self.assertEqual({row["id"] for row in source["memory"]}, {2, 3, 4, 6})
+        self.assertTrue(source["memory"][0]["future_dated"])
+        self.assertFalse(source["refs"]["memory:2"]["within_window"])
+        self.assertEqual(source["weekly_training_days"], 4)
+        self.assertEqual(source["memory"][0]["source_text"], location["source_text"])
+        self.assertEqual(source["memory"][1]["text"], equipment["text"])
+        self.assertNotIn("memory:5", source["refs"])
+        self.assertFalse(source["refs"]["memory:6"]["within_window"])
+
+    def test_unconfirmed_legacy_health_context_is_retained_without_claiming_recovery(self):
+        legacy = memory(2, "Lower back stiffness.", kind="health", key="low_back",
+                        status="resolved", context_constraint_active=True,
+                        resolution_state="legacy_age_expired_unconfirmed",
+                        needs_reconfirmation=True)
+        source = evidence(memories=[legacy])
+        self.assertEqual(source["memory"][0]["status"], "resolved")
+        self.assertTrue(source["memory"][0]["context_constraint_active"])
+        self.assertEqual(source["memory"][0]["resolution_state"], "legacy_age_expired_unconfirmed")
 
     def test_explicit_profile_availability_and_unknown_cases(self):
         for text, expected in [
@@ -283,6 +346,46 @@ class ReviewValidationTests(unittest.TestCase):
         self.assertEqual(clean, "Review summary")
         self.assertEqual(result, programme())
         self.assertEqual(errors, [])
+
+    def test_session_rpe_cannot_replace_exercise_anchor_or_two_session_gate(self):
+        review = programme()
+        decision = review["decisions"][0]
+        decision["action"] = "progress"
+        decision["evidence_refs"] = ["activity:one", "activity:two"]
+        rows = [activity("one", TODAY - timedelta(days=3), workout_rpe=20, workout_feel=5),
+                activity("two", TODAY - timedelta(days=1), workout_rpe=20, workout_feel=5)]
+        self.assertRejected(review, "recent verified user capability",
+                            sources=evidence(outcomes=rows, memories=[]))
+        decision["evidence_refs"] = ["activity:one", "memory:1"]
+        self.assertRejected(review, "two distinct", sources=evidence(outcomes=rows[:1]))
+
+    def test_preparation_and_cooldown_roles_are_explicit_not_anchor_capability(self):
+        review = programme()
+        for role, name in (("warmup", "Synthetic preparation"), ("cooldown", "Synthetic recovery")):
+            review["session_templates"][0]["exercises"].append({
+                "name": name, "role": role,
+                "progression_rule": "Hold only while effort and symptoms remain acceptable.",
+            })
+            review["decisions"].append({
+                "exercise": name, "action": "introduce",
+                "reason": "Offer a separate preparation or recovery option.",
+                "evidence_refs": ["profile"],
+            })
+        _, result, errors = parse(review)
+        self.assertFalse(errors)
+        self.assertEqual([move["role"] for move in result["session_templates"][0]["exercises"]],
+                         ["anchor", "warmup", "cooldown"])
+        review["session_templates"][0]["exercises"][-1]["progression_rule"] = "Increase automatically."
+        self.assertRejected(review, "explicit stop_rule")
+
+    def test_warmup_only_exercise_does_not_satisfy_required_programme_coverage(self):
+        source = evidence()
+        source["training_policy"] = {"required_exercises": ["Synthetic press"]}
+        review = programme(rotation=["strength-a"])
+        for role in ("warmup", "cooldown"):
+            with self.subTest(role=role):
+                review["session_templates"][0]["exercises"][0]["role"] = role
+                self.assertRejected(review, "required exercise", sources=source)
 
     def test_absent_multiple_malformed_and_unsafe_markers_are_atomic(self):
         marker = "[[TRAINING_PROGRAM: " + json.dumps(programme()) + "]]"
@@ -629,6 +732,53 @@ class ProgramStoreTests(unittest.TestCase):
     def event_count(self):
         with closing(sqlite3.connect(self.path)) as db:
             return db.execute("SELECT COUNT(*) FROM training_program_reviews").fetchone()[0]
+
+    def test_peek_is_read_only_and_does_not_start_or_reset_feedback_clock(self):
+        self.save()
+        before = self.path.read_bytes()
+        peek = self.store.peek_context(TODAY, fingerprint="feedback-b")
+        self.assertEqual(peek["feedback_detected_on"], TODAY.isoformat())
+        self.assertEqual(peek["dirty_fingerprint"], "feedback-b")
+        persisted = self.store.peek_context(TODAY)
+        self.assertIsNone(persisted["feedback_detected_on"])
+        self.assertEqual(persisted["dirty_fingerprint"], "feedback-a")
+        self.assertEqual(self.path.read_bytes(), before)
+        actual_day = TODAY + timedelta(days=2)
+        written = self.store.context(actual_day, fingerprint="feedback-b")
+        self.assertEqual(written["feedback_detected_on"], actual_day.isoformat())
+        before = self.path.read_bytes()
+        reverted = self.store.peek_context(actual_day, fingerprint="feedback-a")
+        self.assertIsNone(reverted["feedback_detected_on"])
+        persisted = self.store.peek_context(actual_day + timedelta(days=1))
+        self.assertEqual(persisted["feedback_detected_on"], actual_day.isoformat())
+        self.assertEqual(persisted["due_reason"], "feedback_changed")
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_default_programme_dates_and_retry_day_use_shared_athlete_clock(self):
+        instant = datetime(2026, 5, 20, 0, 15, tzinfo=timezone(timedelta(hours=5, minutes=30)))
+        with patch("coach_program.coach_clock.now", return_value=instant), \
+                patch("coach_program.coach_clock.today", return_value=instant.date()):
+            record = self.store.save_review(programme(), self.sources, "feedback-a")
+            self.assertEqual(record["reviewed_on"], "2026-05-20")
+            self.assertEqual(self.store.peek_context()["next_review_date"], "2026-05-27")
+            self.store.record_failure("Synthetic retry.")
+            retry = self.store.peek_context()
+            self.assertEqual(retry["next_review_date"], "2026-05-20")
+            self.assertFalse(retry["review_due"])
+            self.assertTrue(retry["retry_after"].startswith("2026-05-19T19:15:00"))
+
+    def test_peek_never_performs_reconciliation_even_with_write_rejecting_trigger(self):
+        self.save()
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute("CREATE TRIGGER reject_health_write BEFORE UPDATE ON training_program_state "
+                       "BEGIN SELECT RAISE(ABORT, 'unexpected health write'); END")
+        before = self.path.read_bytes()
+        result = self.store.peek_context(TODAY, fingerprint="different")
+        self.assertEqual(result["active"]["revision"], 1)
+        self.assertFalse(result["review_due"])
+        self.assertEqual(self.path.read_bytes(), before)
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.store.context(TODAY, fingerprint="different")
 
     def test_policy_review_request_survives_restart_and_failure_then_clears(self):
         self.save()
