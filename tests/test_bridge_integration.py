@@ -908,6 +908,57 @@ class BridgeTests(unittest.TestCase):
             self.assertEqual(b._rotation_context()["slot"], "1:1")
             self.assertEqual(b._rotation_context()["next_template_id"], "full-body-a")
 
+    def test_confirming_pending_session_after_rest_today_requires_pulling_tomorrow_forward(self):
+        b = self.bridge
+        yesterday = (date.today() - timedelta(days=1)).isoformat()
+        today = date.today().isoformat()
+        tomorrow = (date.today() + timedelta(days=1)).isoformat()
+        sunday = (date.today() + timedelta(days=2)).isoformat()
+        programme = {
+            "revision": 1,
+            "review": {
+                "goal": "Recomposition",
+                "weekly_training_days": 5,
+                "recovery_rule": "Keep recovery days",
+                "rotation": ["outdoor-run", "full-body-a"],
+                "session_templates": [
+                    {"id": "outdoor-run", "kind": "cardio",
+                     "exercises": [{"name": "Running", "blocks": [{"duration_seconds": 900}]}]},
+                    {"id": "full-body-a", "kind": "strength",
+                     "exercises": [{"name": "Test press", "sets": [{"reps": 8, "weight_kg": None}]}]},
+                ],
+                "decisions": [],
+            },
+        }
+        with patch.object(b, "PROGRAM_ENABLED", True), \
+                patch.object(b.program_store(), "peek_context", return_value={"active": programme}):
+            b.RotationStore(self.state / "coach.sqlite3").configure(programme, date.today() - timedelta(days=2))
+            b.training_store().save([
+                {"date": yesterday, "kind": "cardio", "program_template_id": "outdoor-run",
+                 "rotation_slot": "1:0", "objective": "Run", "reason": "Scheduled", "exercises": []},
+                {"date": today, "kind": "rest", "objective": "Rest today",
+                 "reason": "Recover after run", "exercises": [],
+                 "rotation_defer": {"slot": "1:0", "reason": "Clarify yesterday's run",
+                                    "reassess_on": tomorrow, "resume_when": "Confirm run"}},
+                {"date": tomorrow, "kind": "rest", "detail_level": "outline",
+                 "objective": "Retain pending run until clarified",
+                 "reason": "Clarification needed", "exercises": [],
+                 "rotation_defer": {"slot": "1:0", "reason": "Clarification needed",
+                                    "reassess_on": sunday, "resume_when": "Confirm run"}},
+            ])
+            report = [{"date": yesterday, "status": "user_completed",
+                       "source_quote": "Yes yesterday's run was that session"}]
+            stale_sunday_rest = [{"date": sunday, "detail_level": "outline", "kind": "rest",
+                                  "objective": "Recovery", "reason": "Do not repeat run"}]
+            self.assertTrue(any("Pull full-body-a forward" in err
+                                for err in b._program_plan_errors(stale_sunday_rest, reports=report)))
+            pulled_tomorrow = [{"date": tomorrow, "detail_level": "outline", "kind": "strength",
+                                "program_template_id": "full-body-a",
+                                "objective": "Provisional Full-body A",
+                                "reason": "Run confirmed and rested today; resume tomorrow",
+                                "exercises": []}]
+            self.assertEqual(b._program_plan_errors(pulled_tomorrow, reports=report), [])
+
 
 def day_string():
     return date.today().isoformat()

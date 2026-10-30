@@ -385,7 +385,18 @@ def project_rotation(plans, context, today=None):
         if plan["kind"] in ("rest", "recovery"):
             plan.pop("rotation_slot", None)
             if isinstance(plan.get("rotation_defer"), dict):
-                plan["rotation_defer"]["slot"] = f"{epoch}:{position + offset}"
+                old_slot = str(plan["rotation_defer"].get("slot", ""))
+                parts = old_slot.split(":")
+                if (len(parts) == 2 and all(p.isdigit() for p in parts)
+                        and int(parts[0]) == epoch and int(parts[1]) < position + offset
+                        and plan["date"] not in incoming_dates):
+                    plan.pop("rotation_defer", None)
+                    plan["projection_status"] = "needs_replanning"
+                    plan["projection_reason"] = (
+                        f"Deferred slot {old_slot} is now completed; replan {plan['date']} "
+                        f"for {context['upcoming'][offset % len(context['upcoming'])]}.")
+                else:
+                    plan["rotation_defer"]["slot"] = f"{epoch}:{position + offset}"
             continue
         expected = context["upcoming"][offset % len(context["upcoming"])]
         if plan.get("program_template_id") == expected:

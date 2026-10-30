@@ -1673,7 +1673,7 @@ def _plan_load_errors(plans):
 
 def _program_plan_errors(plans, reports=()):
     errors = _plan_load_errors(plans) if plans else []
-    if not plans or not PROGRAM_ENABLED:
+    if not PROGRAM_ENABLED or (not plans and not reports):
         return errors
     active = program_store().peek_context().get("active")
     if not active:
@@ -1683,6 +1683,7 @@ def _program_plan_errors(plans, reports=()):
     pre_rotation = _rotation_context() if reports else None
     rotation = _rotation_context(reports=reports)
     today_iso = coach_clock.today().isoformat()
+    tomorrow_iso = (coach_clock.today() + timedelta(days=1)).isoformat()
     if rotation.get("enabled"):
         for plan in plans:
             if plan.get("date") != today_iso or plan.get("kind") not in ("rest", "recovery"):
@@ -1696,12 +1697,33 @@ def _program_plan_errors(plans, reports=()):
                 plan["rotation_defer"] = {
                     "slot": rotation["slot"],
                     "reason": plan["reason"],
-                    "reassess_on": (coach_clock.today() + timedelta(days=1)).isoformat(),
+                    "reassess_on": tomorrow_iso,
                     "resume_when": plan["objective"],
                 }
             elif (isinstance(defer, dict) and pre_rotation and pre_rotation.get("enabled")
                     and defer.get("slot") == pre_rotation.get("slot")):
                 defer["slot"] = rotation["slot"]
+        if (pre_rotation and pre_rotation.get("enabled")
+                and pre_rotation.get("slot") != rotation.get("slot")):
+            resolved_slot = pre_rotation["slot"]
+            existing_by_day = {r["date"]: r["payload"] for r in training_store().context()["plans"]}
+            incoming_by_day = {p["date"]: p for p in plans}
+            combined = {**existing_by_day, **incoming_by_day}
+            today_kind = combined.get(today_iso, {}).get("kind")
+            tomorrow_old = existing_by_day.get(tomorrow_iso, {})
+            tomorrow_defer_slot = (tomorrow_old.get("rotation_defer") or {}).get("slot")
+            if (today_kind in ("rest", "recovery")
+                    and tomorrow_defer_slot == resolved_slot
+                    and tomorrow_iso not in rotation.get("committed_future_dates", [])
+                    and incoming_by_day.get(tomorrow_iso, {}).get("program_template_id")
+                    != rotation["next_template_id"]):
+                errors.append(
+                    f"Slot {resolved_slot} is now confirmed complete and today ({today_iso}) "
+                    f"is already a rest day: do not leave {tomorrow_iso} as a stale "
+                    f"clarification rest day. Pull {rotation['next_template_id']} forward to "
+                    f"{tomorrow_iso} and shift the following provisional outlines accordingly.")
+    if not plans:
+        return errors
     errors.extend(rotation_plan_errors(plans, rotation))
     for plan in plans:
         if (plan["kind"] == "rest" or (plan.get("detail_level") == "outline"

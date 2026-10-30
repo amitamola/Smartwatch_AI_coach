@@ -44,7 +44,11 @@ rationale. Don't declare an unconfirmed previous workout completed: ask whether
 the prescribed session was finished; DWRE records the user's completion report.
 Observed movements can show participation, not form, dose or readiness.
 For a completion ambiguity, don't prescribe the same session again as if it were
-known to be missed: keep the proposal conditional on clarification.
+known to be missed: keep the proposal conditional on clarification. When the user
+later confirms that session was completed and today is already a rest/recovery
+day, do not leave tomorrow or other placeholder clarification/conditional days as
+extra rest days: pull the next rotation template forward to tomorrow (unless the
+user requested tomorrow off) and shift subsequent provisional outlines forward.
 The rolling sequence spans multiple weeks. Put cardio into actual dated outlines;
 do not keep it merely as an unused option. Quality cardio can be deferred for
 current evidence, but never silently removed. Schedule fresh rest opportunities,

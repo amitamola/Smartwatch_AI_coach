@@ -357,6 +357,20 @@ class RotationTests(unittest.TestCase):
         self.assertEqual(projected[0]["rotation_defer"]["slot"], "2:0")
         self.assertEqual(projected[0]["rotation_defer"]["reason"], "Synthetic future rest")
 
+    def test_completed_slot_invalidates_stale_future_deferral_for_that_slot(self):
+        tomorrow = TODAY + timedelta(days=1)
+        rest = self.plan(tomorrow, kind="rest", exercises=[], rotation_defer={
+            "slot": "1:0", "reason": "Waiting to clarify whether push was completed",
+            "reassess_on": tomorrow.isoformat(), "resume_when": "Confirm push completion"})
+        rest.pop("rotation_slot")
+        rest.pop("program_template_id")
+        self.training.save([self.plan(TODAY), rest])
+        self.training.set_status(TODAY, "user_completed")
+        projected, errors = project_rotation([], self.context(), TODAY)
+        self.assertFalse(errors)
+        self.assertEqual(projected[0]["projection_status"], "needs_replanning")
+        self.assertNotIn("rotation_defer", projected[0])
+
     def test_removed_template_forecast_is_retained_and_explicitly_invalidated(self):
         tomorrow = TODAY + timedelta(days=1)
         self.training.save([self.plan(tomorrow, program_template_id="removed",
