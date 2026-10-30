@@ -276,7 +276,10 @@ def parse_plans(text, preferences=(), today=None, existing_plans=(), require_pha
             if not isinstance(plan.get("objective"), str) or not plan["objective"].strip():
                 raise ValueError("plan needs an objective")
             if not isinstance(plan.get("reason"), str) or not plan["reason"].strip():
-                raise ValueError("plan needs a reason based on the available evidence")
+                if day > today and plan.get("kind") == "rest":
+                    plan["reason"] = plan["objective"]
+                else:
+                    raise ValueError("plan needs a reason based on the available evidence")
             if "rotation_slot" in plan and (
                     not isinstance(plan["rotation_slot"], str)
                     or not re.fullmatch(r"\d+:\d+", plan["rotation_slot"])):

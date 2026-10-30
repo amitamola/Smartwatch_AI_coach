@@ -157,6 +157,35 @@ class RotationStore:
         """Read-only rotation view. Call reconcile explicitly after ingesting evidence."""
         return self._context(training, today, reconcile=False)
 
+    def preview(self, training, reports=(), today=None):
+        """Simulate rotation state after candidate user reports without mutating SQLite."""
+        if not reports:
+            return self.context(training, today)
+        staged = copy.deepcopy(training)
+        plans_by_day = {p["date"]: p for p in staged.get("plans", [])}
+        by_day = {r["date"]: dict(r) for r in staged.get("user_reported_day_status", [])}
+        for report in reports:
+            day = report["date"]
+            status = report["status"]
+            plan = plans_by_day.get(day)
+            if plan is not None:
+                plan["status"] = status
+            payload = plan["payload"] if plan else None
+            by_day[day] = {
+                "date": day,
+                "status": status,
+                "plan_kind_at_report": payload.get("kind") if payload else None,
+                "plan_revision_at_report": plan.get("revision") if plan else None,
+                "prescription_id_at_report": (
+                    plan.get("prescription_id") or prescription_identity(payload)
+                ) if payload else None,
+                "rotation_slot_at_report": payload.get("rotation_slot") if payload else None,
+                "completion_source": report.get("source_quote"),
+                "completion_session_id": None,
+            }
+        staged["user_reported_day_status"] = list(by_day.values())
+        return self._context(staged, today, reconcile=False, simulate=True)
+
     def reconcile(self, training, today=None):
         """Persist newly supported participation, idempotently; return the resulting view."""
         return self._context(training, today, reconcile=True)
@@ -183,7 +212,7 @@ class RotationStore:
             })
         return candidates
 
-    def _context(self, training, today=None, reconcile=False):
+    def _context(self, training, today=None, reconcile=False, simulate=False):
         today = today or coach_clock.today()
         with self.connection() as db:
             if reconcile:
@@ -199,6 +228,7 @@ class RotationStore:
             unmatched = []
             cardio_candidates = []
             awaiting_reconciliation = []
+            simulated_completed = []
             for plan in plans:
                 day = plan["date"]
                 if not row["started_on"] <= day <= today.isoformat():
@@ -218,6 +248,13 @@ class RotationStore:
                     row["position"] += 1
                     db.execute("UPDATE training_rotation SET position=? WHERE id=?",
                                (row["position"], row["id"]))
+                elif evidence and simulate:
+                    simulated_completed.append({
+                        "slot": self._slot(row),
+                        "completed_on": day,
+                        "template_id": sequence[row["position"] % len(sequence)],
+                    })
+                    row["position"] += 1
                 elif evidence:
                     awaiting_reconciliation.append({"date": day, "slot": self._slot(row),
                                                     "evidence": evidence})
@@ -230,7 +267,7 @@ class RotationStore:
             slot = self._slot(row)
             defer = db.execute("SELECT payload FROM training_rotation_deferrals WHERE slot=? "
                                "ORDER BY plan_date DESC LIMIT 1", (slot,)).fetchone()
-            completed = [dict(r) for r in db.execute(
+            completed = list(reversed(simulated_completed)) + [dict(r) for r in db.execute(
                 "SELECT slot,completed_on,template_id FROM training_rotation_completions "
                 "ORDER BY completed_on DESC, rowid DESC LIMIT 24")]
         latest = {}
@@ -348,7 +385,18 @@ def project_rotation(plans, context, today=None):
         if plan["kind"] in ("rest", "recovery"):
             plan.pop("rotation_slot", None)
             if isinstance(plan.get("rotation_defer"), dict):
-                plan["rotation_defer"]["slot"] = f"{epoch}:{position + offset}"
+                old_slot = str(plan["rotation_defer"].get("slot", ""))
+                parts = old_slot.split(":")
+                if (len(parts) == 2 and all(p.isdigit() for p in parts)
+                        and int(parts[0]) == epoch and int(parts[1]) < position + offset
+                        and plan["date"] not in incoming_dates):
+                    plan.pop("rotation_defer", None)
+                    plan["projection_status"] = "needs_replanning"
+                    plan["projection_reason"] = (
+                        f"Deferred slot {old_slot} is now completed; replan {plan['date']} "
+                        f"for {context['upcoming'][offset % len(context['upcoming'])]}.")
+                else:
+                    plan["rotation_defer"]["slot"] = f"{epoch}:{position + offset}"
             continue
         expected = context["upcoming"][offset % len(context["upcoming"])]
         if plan.get("program_template_id") == expected:
