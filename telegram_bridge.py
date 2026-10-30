@@ -1334,7 +1334,7 @@ def _training_policy():
     return load_training_policy(os.path.join(os.path.dirname(STATE), "training_policy.json"))
 
 
-def _rotation_context(reconcile=False):
+def _rotation_context(reconcile=False, reports=()):
     if not PROGRAM_ENABLED:
         return {"enabled": False}
     programme = program_store().peek_context().get("active")
@@ -1344,6 +1344,8 @@ def _rotation_context(reconcile=False):
     training = _program_training_context()
     if reconcile:
         store.reconcile(training, coach_clock.today())
+    if reports and not reconcile:
+        return store.preview(training, reports=reports, today=coach_clock.today())
     return store.context(training)
 
 
@@ -1669,7 +1671,7 @@ def _plan_load_errors(plans):
     return errors
 
 
-def _program_plan_errors(plans):
+def _program_plan_errors(plans, reports=()):
     errors = _plan_load_errors(plans) if plans else []
     if not plans or not PROGRAM_ENABLED:
         return errors
@@ -1678,7 +1680,29 @@ def _program_plan_errors(plans):
         return errors
     review = active["review"]
     templates = {item["id"]: item for item in review["session_templates"]}
-    errors.extend(rotation_plan_errors(plans, _rotation_context()))
+    pre_rotation = _rotation_context() if reports else None
+    rotation = _rotation_context(reports=reports)
+    today_iso = coach_clock.today().isoformat()
+    if rotation.get("enabled"):
+        for plan in plans:
+            if plan.get("date") != today_iso or plan.get("kind") not in ("rest", "recovery"):
+                continue
+            if plan.get("rotation_slot"):
+                continue
+            defer = plan.get("rotation_defer")
+            if (defer is None
+                    and isinstance(plan.get("reason"), str) and plan["reason"].strip()
+                    and isinstance(plan.get("objective"), str) and plan["objective"].strip()):
+                plan["rotation_defer"] = {
+                    "slot": rotation["slot"],
+                    "reason": plan["reason"],
+                    "reassess_on": (coach_clock.today() + timedelta(days=1)).isoformat(),
+                    "resume_when": plan["objective"],
+                }
+            elif (isinstance(defer, dict) and pre_rotation and pre_rotation.get("enabled")
+                    and defer.get("slot") == pre_rotation.get("slot")):
+                defer["slot"] = rotation["slot"]
+    errors.extend(rotation_plan_errors(plans, rotation))
     for plan in plans:
         if (plan["kind"] == "rest" or (plan.get("detail_level") == "outline"
                                       and plan["date"] > coach_clock.today().isoformat())):
@@ -2137,28 +2161,66 @@ def _last_bot_message():
 
 
 _TRAINING_REPORT_RE = re.compile(r"\[\[TRAINING_REPORT:\s*(.*?)\]\]", re.I | re.S)
+_COMPLETION_VERB_RE = re.compile(
+    r"\b(?:"
+    r"done|finished|completed|complete|fulfilled|covered"
+    r"|(?:did|done)\s+(?:that|it|the|my|this|yesterday'?s|today'?s|all)\b"
+    r"|(?:was|is|were|counts\s+as)\s+(?:that|the|my|indeed)\s+"
+    r"(?:planned\s+|pending\s+|prescribed\s+)?(?:session|workout|run|running|ride|riding|bike|biking|cycling|exercise|training)\b"
+    r"|ran|rode|cycled|biked|walked|swam|rowed|lifted|trained|worked\s+out|exercised"
+    r")\b",
+    re.I,
+)
+_EXERCISE_CONTEXT_RE = re.compile(
+    r"\b(?:exercise|exercising|workout|working\s+out|session|run|running|ran|jog|jogging|"
+    r"ride|riding|rode|bike|biking|cycled|cycling|walk|walking|swim|swimming|row|rowing|"
+    r"lift|lifting|lifted|gym|treadmill|strength|cardio|training|trained|full[- ]body)\b",
+    re.I,
+)
 
 
-def _training_reports(text, source):
+def _training_reports(text, source, prev_bot=""):
     reports, errors = [], []
     for raw in _TRAINING_REPORT_RE.findall(text):
         try:
             item = json.loads(raw)
             quote = item["source_quote"]
-            if not isinstance(quote, str) or not quote or quote not in source:
+            if not isinstance(quote, str) or not quote.strip() or quote not in source:
                 raise ValueError("A training report requires the current user's exact quote.")
             if coach_clock.today() < date.fromisoformat(item["date"]):
                 raise ValueError("A future workout cannot be marked complete or skipped.")
             clause = re.split(r"[.!?;\n]", source[:source.find(quote)])[-1] + quote
-            if re.search(r"\b(?:if|would|might|could|should|tomorrow)\b|\?", clause, re.I):
-                raise ValueError("Hypothetical training is not a completion/skip report.")
             if item["status"] == "user_completed":
-                if (re.search(r"\b(?:not|never|didn't|haven't|isn't)\b", clause, re.I)
-                        or not re.search(r"\b(?:done|finished|completed)\b", quote, re.I)
-                        or not re.search(r"\b(?:exercise|workout|session|run|ride|training)\b", quote, re.I)):
+                match = _COMPLETION_VERB_RE.search(quote)
+                if not match:
+                    raise ValueError("Completion requires affirmative exercise-specific evidence.")
+                end = len(clause) - len(quote) + match.end()
+                tail = re.split(
+                    r"\b(?:after|before|because|since|when|while|although|though|and|but|so)\b|[,;]",
+                    clause[end:], maxsplit=1)[0]
+                governed = clause[:end] + tail
+                if (re.search(r"\b(?:if|whether|would|might|could|should|will|going\s+to|"
+                              r"plan\s+to|planning\s+to|want\s+to|trying\s+to|tomorrow)\b|\?",
+                              governed, re.I)
+                        or re.match(r"\s*(?:did|have|had|was|were|am|are|is|can|could|should|would)\s+(?:i|we)\b",
+                                    governed, re.I)):
+                    raise ValueError("Hypothetical training is not a completion/skip report.")
+                has_context_prompt = bool(
+                    re.search(r"\b(?:did|done|finished|completed)\s+(?:that|it)\b", quote, re.I)
+                    and re.search(
+                        r"\b(?:clarify|confirm|whether)\b.*\b(?:session|workout|run|ride|exercise|training)\b",
+                        prev_bot or "", re.I | re.S))
+                if (re.search(r"\b(?:not|never|no|didn't|did\s+not|haven't|have\s+not|hasn't|"
+                              r"wasn't|was\s+not|isn't|is\s+not|won't|will\s+not|can't|cannot|couldn't)\b",
+                              governed, re.I)
+                        or not (_EXERCISE_CONTEXT_RE.search(quote) or has_context_prompt)):
                     raise ValueError("Completion requires affirmative exercise-specific evidence.")
             elif item["status"] == "user_skipped":
-                if not re.search(r"\b(?:skip|skipping|rest day|not exercising|no workout)\b", quote, re.I):
+                if re.search(r"\b(?:if|whether|would|might|could|should|tomorrow)\b|\?", clause, re.I):
+                    raise ValueError("Hypothetical training is not a completion/skip report.")
+                if not re.search(r"\b(?:skip|skipping|skipped|rest\s+day|not\s+exercising|"
+                                 r"no\s+workout|no\s+exercise|taking\s+today\s+off|"
+                                 r"taking\s+the\s+day\s+off|resting\s+today)\b", quote, re.I):
                     raise ValueError("Skipping requires an explicit user choice.")
             else:
                 raise ValueError("Unknown training report status.")
@@ -2201,7 +2263,7 @@ def _generate_checked(prompt, source_text="", images=None, require_plan=False, s
         clean, meals, food_days, food_errors = parse_food(
             clean, source_text, reported_on=_MSG_SENT_AT.date() if _MSG_SENT_AT else None)
         errors.extend(food_errors)
-        clean, reports, report_errors = _training_reports(clean, source_text)
+        clean, reports, report_errors = _training_reports(clean, source_text, prev_bot=prev_bot)
         errors.extend(report_errors)
         if meals and plans and not require_plan:
             errors.append("Logging food must not create an unsolicited workout revision.")
@@ -2211,7 +2273,7 @@ def _generate_checked(prompt, source_text="", images=None, require_plan=False, s
                 if re.search(r"\b(?:calorie|calories|food log|intake|protein shortfall|underfuel)", reason, re.I):
                     errors.append("Nutrition tracking must not determine training changes. "
                                   "Use independent symptoms, observed effort, availability and goals.")
-        errors.extend(_program_plan_errors(plans))
+        errors.extend(_program_plan_errors(plans, reports=reports))
         if (not source_text and plans and _rotation_context().get("completed_today")
                 and any(p["date"] == coach_clock.today().isoformat() for p in plans)):
             errors.append("Today's rotation session is already completed; automatic advice must "
@@ -2249,28 +2311,30 @@ def _generate_checked(prompt, source_text="", images=None, require_plan=False, s
                        "medical finding. Do not invent recovery reasons. Put the calendar "
                        "only in SESSION_PLAN; the application renders it.",
                        images=images)
-    if plans:
-        plans, projection_errors = project_rotation(plans, _rotation_context())
-        if projection_errors:
-            raise ValueError("Rotation changed before plan save: " + "; ".join(projection_errors))
-        training_store().save(plans, source="model_proposal_in_response_to_user" if source_text
-                              else "scheduled_coaching_proposal",
-                              request_id=_current_request, source_text=source_text)
-        RotationStore(os.path.join(STATE, "coach.sqlite3")).save_deferrals(plans)
-        for plan in plans:
-            if plan["date"] == coach_clock.today().isoformat():
-                if _is_rest_or_recovery_plan(plan) or plan.get("rotation_slot"):
-                    _set_coach_rest(_is_rest_or_recovery_plan(plan))
     for report in reports:
         training_store().set_status(report["date"], report["status"],
                                     source=report["source_quote"])
         if report["date"] == coach_clock.today().isoformat():
             _set_exercise_status("done" if report["status"] == "user_completed" else "skip")
-        if report["status"] == "user_completed":
+        if report["status"] == "user_completed" and not any(
+                r["date"] == report["date"] for r in training_store().context()["recent_outcomes"]):
             _save_pending({"date": report["date"], "last_ts": time.time(),
                            "user_requested": True})
     if reports and PROGRAM_ENABLED:
         _rotation_context(reconcile=True)
+    if plans or (reports and PROGRAM_ENABLED):
+        projected, projection_errors = project_rotation(plans, _rotation_context())
+        if projection_errors and plans:
+            raise ValueError("Rotation changed before plan save: " + "; ".join(projection_errors))
+        if projected and not projection_errors:
+            training_store().save(projected, source="model_proposal_in_response_to_user" if source_text
+                                  else "scheduled_coaching_proposal",
+                                  request_id=_current_request, source_text=source_text)
+            RotationStore(os.path.join(STATE, "coach.sqlite3")).save_deferrals(projected)
+        for plan in plans:
+            if plan["date"] == coach_clock.today().isoformat():
+                if _is_rest_or_recovery_plan(plan) or plan.get("rotation_slot"):
+                    _set_coach_rest(_is_rest_or_recovery_plan(plan))
     clean = _MODEL_LOG_RECEIPT_RE.sub("", clean)
     clean = _LOG_REPLACES_RE.sub("", clean)
     clean, _, _ = _extract_log_marker(clean)
