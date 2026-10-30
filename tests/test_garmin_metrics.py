@@ -604,6 +604,56 @@ class CoverageTests(unittest.TestCase):
         self.assertEqual(snapshot["training_rhythm"]["completed_days_streak"], 1)
         save.assert_called_once()
 
+    def timestamp_snapshot(self, *, body_battery=None, last_sync=None):
+        fixed_now = datetime(2026, 9, 7, 12, 30, tzinfo=timezone.utc)
+        athlete_zone = timezone(timedelta(hours=-7))
+
+        class FixedDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return fixed_now.astimezone(tz) if tz else fixed_now.replace(tzinfo=None)
+
+        class FakeGarmin:
+            def __getattr__(self, _name):
+                return lambda *_args, **_kwargs: {}
+
+            def get_activities(self, _start, _limit):
+                return []
+
+            def get_body_battery(self, *_args):
+                return body_battery or []
+
+            def get_user_summary(self, *_args):
+                return {"lastSyncTimestampGMT": last_sync}
+
+        with patch.object(coach, "client", return_value=FakeGarmin()), \
+             patch.object(coach, "datetime", FixedDatetime), \
+             patch.object(coach.coach_clock, "zone", return_value=athlete_zone), \
+             patch.object(coach.coach_clock, "now", return_value=fixed_now.astimezone(athlete_zone)), \
+             patch.object(coach, "_load_sets_cache", return_value={}), \
+             patch.object(coach, "_save_sets_cache"):
+            return coach.build_snapshot(TODAY)
+
+    def test_snapshot_body_battery_sample_uses_athlete_timezone(self):
+        instant = datetime(2026, 9, 7, 12, 15, tzinfo=timezone.utc)
+        battery = [{"date": "2026-09-07", "bodyBatteryValuesArray": [
+            [int(instant.timestamp() * 1000), 54]]}]
+        snapshot = self.timestamp_snapshot(body_battery=battery)
+        self.assertEqual(snapshot["body_battery_current"], 54)
+        self.assertEqual(snapshot["body_battery_current_as_of"], "2026-09-07T05:15-07:00")
+        self.assertEqual(snapshot["body_battery_current_age_min"], 15)
+
+    def test_snapshot_last_sync_gmt_handles_naive_and_offset_timestamps(self):
+        for value in ("2026-09-07T12:15:00", "2026-09-07T12:15:00Z",
+                      "2026-09-07T14:15:00+02:00"):
+            with self.subTest(value=value):
+                snapshot = self.timestamp_snapshot(last_sync=value)
+                self.assertEqual(snapshot["last_sync_gmt"], "2026-09-07T12:15+00:00")
+                self.assertEqual(snapshot["last_sync_age_min"], 15)
+        malformed = self.timestamp_snapshot(last_sync="not-a-time")
+        self.assertEqual(malformed["last_sync_gmt"], "not-a-time")
+        self.assertIsNone(malformed["last_sync_age_min"])
+
 
 class NutritionGoalTests(unittest.TestCase):
     def budget(self, goal=None, weight_g=70000, birth_date="1990-01-01", protein=None):

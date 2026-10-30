@@ -882,11 +882,13 @@ def build_snapshot(d_today=None):
         sync = usumm.get("lastSyncTimestampGMT")
         if sync:
             try:
-                _st = datetime.fromisoformat(sync.replace("Z", ""))
+                _st = datetime.fromisoformat(sync.replace("Z", "+00:00"))
+                _st = (_st.replace(tzinfo=timezone.utc) if _st.tzinfo is None
+                       else _st.astimezone(timezone.utc))
                 last_sync_gmt = _st.isoformat(timespec="minutes")
                 last_sync_age_min = round((datetime.now(timezone.utc) - _st).total_seconds() / 60)
-            except Exception:  # noqa: BLE001
-                last_sync_gmt = sync[:16]
+            except (AttributeError, TypeError, ValueError):
+                last_sync_gmt = str(sync)[:16]
 
     # Whole-day strain from YESTERDAY (a completed day) - the morning brief's "how hard
     # was yesterday" read. today's wellness_today counters are still accumulating in the AM.
@@ -919,7 +921,7 @@ def build_snapshot(d_today=None):
     bb_current_as_of = None
     bb_current_age_min = None
     if bb_series_ts:
-        _bb_ts = datetime.fromtimestamp(bb_series_ts / 1000)
+        _bb_ts = datetime.fromtimestamp(bb_series_ts / 1000, coach_clock.zone())
         bb_current_as_of = _bb_ts.isoformat(timespec="minutes")
         bb_current_age_min = round((coach_clock.now() - _bb_ts).total_seconds() / 60)
 
