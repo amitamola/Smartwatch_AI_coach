@@ -32,6 +32,8 @@ import logging
 import tempfile
 import subprocess
 import threading
+import http.client
+from logging.handlers import RotatingFileHandler
 import urllib.parse
 import urllib.request
 import urllib.error
@@ -104,10 +106,25 @@ PROGRAM_REVIEW_DAYS = int(os.environ.get("AGBOT_PROGRAM_REVIEW_DAYS", "7"))
 PROGRAM_BLOCK_DAYS = int(os.environ.get("AGBOT_PROGRAM_BLOCK_DAYS", "28"))
 PROGRAM_REVIEW_TIMEOUT = int(os.environ.get("AGBOT_PROGRAM_REVIEW_TIMEOUT", "180"))
 PROGRAM_POLICY_VERSION = 3
+NUTRITION_OPTIONAL = os.environ.get("AGBOT_NUTRITION_OPTIONAL", "true").lower() == "true"
+MEAL_REMINDERS_ENABLED = os.environ.get("AGBOT_MEAL_REMINDERS", "false").lower() == "true"
+PROMPT_MAX_CHARS = int(os.environ.get("AGBOT_PROMPT_MAX_CHARS", "200000"))
+NUTRITION_POLICY = (
+    "Food logging is optional. Missing photos, meals, calories or protein logs are NOT "
+    "evidence of inadequate intake. Never alter workouts, activity, recovery or other "
+    "recommendations based on calorie estimates, food-log coverage or an apparent logged "
+    "protein shortfall. Do not chase meals, require a complete diary, or prescribe calorie "
+    "compensation. Provide nutritional estimates when requested or food is voluntarily "
+    "reported. A general assurance of healthy eating is a preference, not measured daily "
+    "intake. Independent symptoms, actual effort and user requests still matter."
+)
 
 # Auto-summary window (local time). If no summary has been sent yet today and the
-# current time falls in this window, one is pushed automatically.
+# current time falls in this window, one is pushed automatically. Between AUTO_START
+# and AUTO_SLEEP_WAIT_UNTIL we wait for overnight sleep to sync first.
 AUTO_START = (9, 30)
+AUTO_SLEEP_WAIT_UNTIL = (11, 30)
+AUTO_SLEEP_POLL_SECS = 300
 AUTO_END = (20, 0)
 
 # Daily meal-logging reminders (local time): (slot, hour, minute, message). Each fires
@@ -164,15 +181,30 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
     handlers=[
-        logging.FileHandler(os.path.join(LOGS, "telegram_bridge.log"), encoding="utf-8"),
+        RotatingFileHandler(os.path.join(LOGS, "telegram_bridge.log"), encoding="utf-8",
+                            maxBytes=5_000_000, backupCount=4),
         logging.StreamHandler(sys.stdout),
     ],
 )
 log = logging.getLogger("agbot")
 
+
+class RedactingFormatter(logging.Formatter):
+    def format(self, record):
+        rendered = super().format(record)
+        rendered = re.sub(r"bot\d+:[A-Za-z0-9_-]+", "bot[REDACTED]", rendered)
+        return re.sub(r"\b(?:gh[pousr]_[A-Za-z0-9]+|github_pat_[A-Za-z0-9_]+)\b",
+                      "[REDACTED]", rendered)
+
+
+for _handler in logging.getLogger().handlers:
+    _handler.setFormatter(RedactingFormatter("%(asctime)s %(levelname)s %(message)s"))
+
 sys.path.insert(0, BASE)
 import garmin_coach  # noqa: E402
+import coach_clock
 from coach_memory import MemoryStore
+from coach_nutrition import NutritionStore, parse_food, midpoint, render_receipt
 from coach_plan import TrainingStore, canonical_exercise, parse_plans, render_plans, unsupported_claims
 from coach_program import ProgramStore, build_review_evidence, parse_program_review, render_program
 from coach_runtime import RuntimeStore, SnapshotCache, message_key
@@ -196,6 +228,11 @@ _worker_started = None
 _last_progress = time.time()
 _stop = threading.Event()
 _delivery_lock = threading.Lock()
+_poll_progress = None
+_publisher_progress = None
+_request_deadline = None
+_scheduled_job = None
+_draining = threading.Event()
 
 
 def memory_store():
@@ -211,6 +248,10 @@ def training_store():
     if _training_store is None:
         _training_store = TrainingStore(os.path.join(STATE, "coach.sqlite3"))
     return _training_store
+
+
+def nutrition_store():
+    return NutritionStore(os.path.join(STATE, "coach.sqlite3"))
 
 
 def runtime_store():
@@ -230,18 +271,29 @@ def program_store():
 
 def get_snapshot(force=False):
     started = time.monotonic()
-    result = _snapshot_cache.get(force=force)
-    if isinstance(result, dict) and "__error__" not in result:
+    result = _snapshot_cache.get(force=force, allow_stale=True)
+    if (isinstance(result, dict) and "__error__" not in result
+            and not result.get("snapshot_cache", {}).get("stale")):
         training_store().record_activities(result.get("recent_activities_7d"))
+        if PROGRAM_ENABLED:
+            _rotation_context(reconcile=True)
     log.info("stage=snapshot seconds=%.2f cached_age=%s", time.monotonic() - started,
              (result.get("snapshot_cache") or {}).get("age_seconds")
              if isinstance(result, dict) else None)
     return result
 
 
+def _available_snapshot(data):
+    if not isinstance(data, dict) or "__error__" in data:
+        log.warning("stage=snapshot unavailable; user reporting remains enabled")
+        return {"sensor_status": "unavailable",
+                "coverage_note": "Garmin could not be refreshed. Missing observations are unknown, not rest."}
+    return data
+
+
 def _correction_request_id(question):
     return _current_request or "correction:" + hashlib.sha256(
-        (date.today().isoformat() + question).encode("utf-8")).hexdigest()
+        (coach_clock.today().isoformat() + question).encode("utf-8")).hexdigest()
 
 
 def _prepare_workout_correction(question):
@@ -262,7 +314,7 @@ def _prepare_workout_correction(question):
     request_id = _correction_request_id(question)
     result = store.corrections.process_report(
         question, list(sources.values()), request_id=request_id,
-        observed_on=_sent_backdate() or date.today().isoformat())
+        observed_on=_sent_backdate() or coach_clock.today().isoformat())
     refreshes = {}
     candidates = result["candidate_activity_ids"]
     if not result["replayed"] and len(candidates) <= 3:
@@ -340,7 +392,7 @@ def append_history(role, text, activity_ids=None):
         return
     hist.append({"role": role, "text": text,
                  "request_id": _current_request,
-                 "ts": ((_MSG_SENT_AT if role == "user" and _MSG_SENT_AT else datetime.now())
+                 "ts": ((_MSG_SENT_AT if role == "user" and _MSG_SENT_AT else coach_clock.now())
                         .isoformat(timespec="seconds"))})
     if activity_ids:
         hist[-1]["activity_ids"] = [str(aid) for aid in activity_ids]
@@ -365,7 +417,7 @@ def save_todays_brief(text):
     volatile chat window has scrolled past it."""
     try:
         _atomic_write(TODAYS_BRIEF_FILE,
-                      json.dumps({"date": date.today().isoformat(), "text": text},
+                      json.dumps({"date": coach_clock.today().isoformat(), "text": text},
                                  ensure_ascii=False))
     except Exception as exc:  # noqa: BLE001
         log.error("brief save failed: %s", exc)
@@ -378,33 +430,56 @@ def todays_brief_text():
             d = json.load(fh)
     except (FileNotFoundError, json.JSONDecodeError):
         return ""
-    if isinstance(d, dict) and d.get("date") == date.today().isoformat():
+    if isinstance(d, dict) and d.get("date") == coach_clock.today().isoformat():
         return (d.get("text") or "").strip()
     return ""
 
 
-def _load_pending():
-    """Pending post-workout debrief marker: {'last_ts': epoch of the last new activity}."""
+def _pending_jobs():
+    """Keep dated jobs; the head remains readable by the previous release."""
     try:
         with open(PENDING_DEBRIEF_FILE, "r", encoding="utf-8") as fh:
             d = json.load(fh)
-        return d if isinstance(d, dict) else {}
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
+    except FileNotFoundError:
+        return []
+    if not isinstance(d, dict):
+        raise ValueError("Invalid pending debrief state.")
+    queued = d.pop("queued", [])
+    if not d:
+        return queued
+    d.setdefault("date", datetime.fromtimestamp(
+        d.get("last_ts", time.time()), coach_clock.zone()).date().isoformat())
+    return [d, *queued]
+
+
+def _load_pending():
+    jobs = _pending_jobs()
+    return jobs[0] if jobs else {}
+
+
+def _write_pending_jobs(jobs):
+    if jobs:
+        jobs.sort(key=lambda job: job.get("last_ts", 0))
+        _atomic_write(PENDING_DEBRIEF_FILE, json.dumps(dict(jobs[0], queued=jobs[1:])))
+    else:
+        try:
+            os.remove(PENDING_DEBRIEF_FILE)
+        except FileNotFoundError:
+            pass
 
 
 def _save_pending(d):
-    try:
-        _atomic_write(PENDING_DEBRIEF_FILE, json.dumps(d))
-    except Exception as exc:  # noqa: BLE001
-        log.error("pending save failed: %s", exc)
+    jobs = {job["date"]: job for job in _pending_jobs()}
+    day = d.get("date") or coach_clock.today().isoformat()
+    previous = jobs.get(day, {})
+    jobs[day] = {**previous, **d, "date": day}
+    jobs[day]["user_requested"] = bool(previous.get("user_requested") or d.get("user_requested"))
+    _write_pending_jobs(list(jobs.values()))
 
 
-def _clear_pending():
-    try:
-        os.remove(PENDING_DEBRIEF_FILE)
-    except FileNotFoundError:
-        pass
+def _clear_pending(day=None):
+    day = day or coach_clock.today().isoformat()
+    _write_pending_jobs([job for job in _pending_jobs() if job["date"] != day])
 
 
 _REVIEW_CUES = (
@@ -432,7 +507,7 @@ def _day_tag(date_str):
         d = date.fromisoformat((date_str or "")[:10])
     except ValueError:
         return ""
-    delta = (date.today() - d).days
+    delta = (coach_clock.today() - d).days
     if delta == 0:
         return "today"
     if delta == 1:
@@ -448,7 +523,7 @@ def _within_days(ts_str, days):
         d = date.fromisoformat((ts_str or "")[:10])
     except ValueError:
         return False
-    return 0 <= (date.today() - d).days <= days
+    return 0 <= (coach_clock.today() - d).days <= days
 
 
 def recent_history_text():
@@ -486,7 +561,8 @@ def journal_entry_id(entry):
 
 
 def journal_entries():
-    return [json.loads(line) for line in read_file(JOURNAL_FILE).splitlines() if line.strip()]
+    legacy = [json.loads(line) for line in read_file(JOURNAL_FILE).splitlines() if line.strip()]
+    return legacy + nutrition_store().entries()
 
 
 def active_journal_entries(entries=None):
@@ -504,10 +580,10 @@ def append_journal(text, on_date=None, replaces_entry_id=None):
     target = next((e for e in existing if journal_entry_id(e) == replaces_entry_id), None)
     if replaces_entry_id and target is None:
         raise ValueError("The meal selected for correction was not found.")
-    entry = {"date": on_date or (target["date"] if target else date.today().isoformat()),
+    entry = {"date": on_date or (target["date"] if target else coach_clock.today().isoformat()),
              "text": text.strip(),
-             "ts": datetime.now().isoformat(timespec="seconds"), "request_id": _current_request}
-    if date.fromisoformat(entry["date"]) > date.today():
+             "ts": coach_clock.now().isoformat(timespec="seconds"), "request_id": _current_request}
+    if date.fromisoformat(entry["date"]) > coach_clock.today():
         raise ValueError("Future food consumption cannot be logged.")
     if replaces_entry_id:
         entry["replaces_entry_id"] = replaces_entry_id
@@ -559,14 +635,14 @@ def _logged_confirmation(on_date=None, updated=False):
     """The 'logged' line appended after a meal is saved. Names the day whenever the entry
     was back-dated, so it's obvious it did NOT land on today's tally."""
     base = "\n\n\U0001F37D\uFE0F " + ("updated log" if updated else "logged") + " \u2713"
-    today = date.today().isoformat()
+    today = coach_clock.today().isoformat()
     if not on_date or on_date == today:
         return base
     try:
         d = date.fromisoformat(on_date)
     except ValueError:
         return base
-    label = "yesterday" if (date.today() - d).days == 1 else d.strftime("%a %d %b")
+    label = "yesterday" if (coach_clock.today() - d).days == 1 else d.strftime("%a %d %b")
     return base + " \u00B7 " + label
 
 
@@ -582,7 +658,7 @@ def _set_msg_sent_at(ts):
     """Record the send time (unix seconds) of the message about to be handled."""
     global _MSG_SENT_AT
     try:
-        _MSG_SENT_AT = datetime.fromtimestamp(ts) if ts else None
+        _MSG_SENT_AT = datetime.fromtimestamp(ts, coach_clock.zone()) if ts else None
     except (TypeError, ValueError, OSError):
         _MSG_SENT_AT = None
 
@@ -593,7 +669,7 @@ def _sent_backdate():
     if not _MSG_SENT_AT:
         return None
     d = _MSG_SENT_AT.date()
-    return d.isoformat() if d < date.today() else None
+    return d.isoformat() if d < coach_clock.today() else None
 
 
 def _delayed_message_note():
@@ -669,7 +745,7 @@ def recent_journal_text():
                                label + ": " + (e.get("text") or "")).strip()))
     selected, size, omitted = [], 0, 0
     for day, line in reversed(entries):
-        if day != date.today().isoformat() and size + len(line) > JOURNAL_PROMPT_CHARS:
+        if day != coach_clock.today().isoformat() and size + len(line) > JOURNAL_PROMPT_CHARS:
             omitted += 1
             continue
         selected.append(line)
@@ -723,7 +799,7 @@ def load_fitness_profile():
         cached = None
     if isinstance(cached, dict) and cached.get("schema_version") == 2:
         try:
-            age_h = ((datetime.now()
+            age_h = ((coach_clock.now()
                       - datetime.fromisoformat(cached.get("generated_at")))
                      .total_seconds() / 3600)
             if age_h < FITNESS_MAX_AGE_H:
@@ -799,21 +875,23 @@ def _strip_control_markers(text):
     return text.rstrip()
 
 
-def send_message(chat_id, text, summary_date=None):
+def send_message(chat_id, text, summary_date=None, expires_at=None, delivery_key=None):
     global _send_sequence
     text = _strip_control_markers(text)
     rendered = md_to_html(text)
     keys = []
     chunks = [chunk for chunk in html_chunks(rendered, 4000) if _html_to_plain(chunk).strip()]
+    group = delivery_key or message_key(_current_request, _send_sequence + 1, chat_id, text)
     for index, chunk in enumerate(chunks):
         if not chunk.strip():
             continue
         _send_sequence += 1
-        key = message_key(_current_request, _send_sequence, chat_id, chunk)
+        key = (f"{delivery_key}:{index}" if delivery_key
+               else message_key(_current_request, _send_sequence, chat_id, chunk))
         payload = {"text": chunk, "parse_mode": "HTML", "disable_web_page_preview": "true"}
         if summary_date:
             payload.update(_summary_date=summary_date, _summary_complete=index == len(chunks) - 1)
-        runtime_store().enqueue(key, chat_id, payload)
+        runtime_store().enqueue(key, chat_id, payload, group_id=group, expires_at=expires_at)
         keys.append(key)
     return keys
 
@@ -822,7 +900,10 @@ def flush_outbox():
     if not _delivery_lock.acquire(blocking=False):
         return
     try:
+        blocked_groups = set()
         for item in runtime_store().due_messages():
+            if item.get("group_id") in blocked_groups:
+                continue
             params = {k: v for k, v in item["payload"].items() if not k.startswith("_")}
             params["chat_id"] = item["chat_id"]
             response = _post("sendMessage", params)
@@ -838,9 +919,14 @@ def flush_outbox():
             else:
                 description = response.get("description", "Telegram rejected delivery")
                 retry = (response.get("parameters") or {}).get("retry_after")
-                runtime_store().delivery_failed(item["id"], description, retry)
-                log.error("stage=delivery queued_for_retry=true error=%s", description)
-                break  # Preserve chunk order while the endpoint is unavailable.
+                permanent = response.get("error_code") in (400, 401, 403, 404)
+                runtime_store().delivery_failed(item["id"], description, retry,
+                                               permanent=permanent)
+                log.error("stage=delivery permanent=%s error_code=%s",
+                          permanent, response.get("error_code"))
+                blocked_groups.add(item.get("group_id"))
+                if response.get("error_code") == 429:
+                    break
     finally:
         _delivery_lock.release()
 
@@ -1041,11 +1127,23 @@ def run_llm(prompt, image=None, images=None, cache_scope=None, timeout=None):
         # Optional review calls must not shift the answer's retry-cache slots.
         generation_key = "scope:" + cache_scope
     cache_key = f"{_current_request}:{generation_key}" if _current_request else None
+    if cache_key:
+        artifact_key = cache_key + ":input"
+        frozen = runtime_store().get_artifact(artifact_key)
+        if frozen is None:
+            runtime_store().save_artifact(artifact_key, {"prompt": prompt})
+        else:
+            prompt = frozen["prompt"]
     cached = runtime_store().saved_generation(cache_key)
     if cached is not None:
         return cached
-    if len(prompt) > 120000:
-        log.warning("prompt is very large (%d chars, ~%dK tokens)", len(prompt), len(prompt) // 4000)
+    if len(prompt) > PROMPT_MAX_CHARS:
+        raise ValueError("Context exceeds the configured budget; no safety facts were silently removed.")
+    if _request_deadline is not None:
+        remaining = _request_deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("The overall coaching request deadline was reached.")
+        timeout = min(timeout or COPILOT_TIMEOUT, remaining)
     imgs = list(images or [])
     if image:
         imgs.insert(0, image)
@@ -1085,7 +1183,7 @@ def _llm_copilot(prompt, images, timeout=None):
         "--no-ask-user", "--available-tools=",
         "--no-custom-instructions",
         "--disable-builtin-mcps", "--disable-mcp-server", "garmin",
-        "--no-color", "--no-remote", "--no-remote-export",
+        "--no-color", "--sync-session", "off",
         "--reasoning-effort", COPILOT_REASONING_EFFORT, "--context", "default",
     ]
     for att in images:
@@ -1093,7 +1191,8 @@ def _llm_copilot(prompt, images, timeout=None):
             cmd += ["--attachment", att]
     budget = COPILOT_TIMEOUT if timeout is None else min(COPILOT_TIMEOUT, timeout)
     deadline = time.monotonic() + budget
-    for model in dict.fromkeys((COPILOT_MODEL, *COPILOT_FALLBACK_MODELS)):
+    models = list(dict.fromkeys((COPILOT_MODEL, *COPILOT_FALLBACK_MODELS)))
+    for model_index, model in enumerate(models):
         if _unavailable_models.get(model, 0) > time.monotonic():
             continue
         remaining = deadline - time.monotonic()
@@ -1106,12 +1205,13 @@ def _llm_copilot(prompt, images, timeout=None):
             res = subprocess.run(
                 command, input=prompt, capture_output=True, text=True,
                 encoding="utf-8", errors="replace",
-                timeout=remaining, env=env, cwd=BASE,
+                timeout=remaining / max(1, len(models) - model_index), env=env, cwd=BASE,
             )
         except subprocess.TimeoutExpired:
             _llm_last_error = "model_timeout"
             log.error("copilot model=%s timed out", model or "(CLI default)")
-            return None
+            _unavailable_models[model] = time.monotonic() + _MODEL_RECHECK_SECONDS
+            continue
         except OSError:
             _llm_last_error = "cli_launch_error"
             log.exception("Could not launch the Copilot CLI")
@@ -1126,13 +1226,18 @@ def _llm_copilot(prompt, images, timeout=None):
                 continue
             _llm_last_outage = _is_llm_outage(stderr)
             _llm_last_error = "service_unavailable" if _llm_last_outage else "cli_error"
-            log.error("copilot model=%s exit %s: %s", model, res.returncode, stderr[:600])
+            log.error("copilot model=%s exit=%s category=%s", model, res.returncode, _llm_last_error)
+            if re.search(r"\b503\b|No server is currently available|service unavailable|"
+                         r"temporarily unavailable|Failed to fetch", stderr, re.I) and not re.search(
+                             r"OAuth|authentication|token|unknown option|unrecognized", stderr, re.I):
+                _unavailable_models[model] = time.monotonic() + _MODEL_RECHECK_SECONDS
+                continue
             return None
         answer = _scrub(res.stdout or "")
         if not answer:
             _llm_last_error = "empty_response"
             log.error("copilot model=%s returned an empty answer", model)
-            return None
+            continue
         _unavailable_models.pop(model, None)
         _llm_active_model = model or "(CLI default)"
         _llm_last_error = None
@@ -1140,7 +1245,8 @@ def _llm_copilot(prompt, images, timeout=None):
         if model != COPILOT_MODEL:
             log.warning("stage=llm fallback configured=%s active=%s", COPILOT_MODEL, model)
         return answer
-    _llm_last_error = "model_unavailable"
+    if _llm_last_error not in ("model_timeout", "empty_response", "service_unavailable"):
+        _llm_last_error = "model_unavailable"
     _llm_last_outage = True
     log.error("No configured Copilot model is currently available")
     return None
@@ -1193,14 +1299,20 @@ _LLM_BACKENDS = {
 
 
 def today_human():
-    return datetime.now().strftime("%a %d %b")
+    return coach_clock.now().strftime("%a %d %b")
 
 
 def _program_inputs():
     profile = read_file(PROFILE_FILE)
     records = []
     for kind in ("preference", "anchor", "health"):
-        for record in memory_store().records(kind):
+        source_records = (memory_store().health_context() if kind == "health"
+                          else memory_store().records(kind))
+        for record in source_records:
+            if kind == "health":
+                if not record["context_constraint_active"]:
+                    continue
+                record = dict(record, stored_status=record["status"], status="active")
             if kind == "anchor" and not (
                     record.get("verified") and record.get("source_type") == "user"):
                 continue
@@ -1222,21 +1334,24 @@ def _training_policy():
     return load_training_policy(os.path.join(os.path.dirname(STATE), "training_policy.json"))
 
 
-def _rotation_context():
+def _rotation_context(reconcile=False):
     if not PROGRAM_ENABLED:
         return {"enabled": False}
-    programme = program_store().context().get("active")
+    programme = program_store().peek_context().get("active")
     store = RotationStore(os.path.join(STATE, "coach.sqlite3"))
-    if programme:
+    if programme and reconcile:
         store.configure(programme)
-    return store.context(_program_training_context())
+    training = _program_training_context()
+    if reconcile:
+        store.reconcile(training, coach_clock.today())
+    return store.context(training)
 
 
 def _resolved_health_reports():
     return [{key: record.get(key) for key in (
         "key", "status", "resolved_at", "resolution_source_text")}
-        for record in memory_store().records("health", status="resolved")
-        if not (record.get("source_metadata") or {}).get("reclassification")]
+        for record in memory_store().health_context()
+        if record["resolution_state"] == "source_supported_user_report"]
 
 
 def _program_training_context():
@@ -1267,13 +1382,18 @@ def _program_context(nutrition_focused=False):
         if nutrition_focused:
             result["active"]["review"] = {key: active["review"].get(key) for key in (
                 "goal", "weekly_training_days", "recovery_rule")}
+        else:
+            result["active"]["review"] = dict(result["active"]["review"])
+            result["active"]["review"]["decisions"] = [
+                {k: v for k, v in decision.items() if k != "evidence_refs"}
+                for decision in result["active"]["review"].get("decisions", [])]
     return result
 
 
 def _program_evidence_prompt(evidence, repair=False):
     """Show each fact once; retain full provenance in the stored review audit."""
     def observation_view(observation):
-        result = {k: v for k, v in observation.items() if k != "logged_sets"}
+        result = _routine_evidence({k: v for k, v in observation.items() if k != "logged_sets"})
         result["logged_sets"] = []
         for group in observation.get("logged_sets", []):
             reduced = {k: group[k] for k in (
@@ -1307,7 +1427,7 @@ def _program_evidence_prompt(evidence, repair=False):
         baseline = view["refs"].get("block_baseline")
         if baseline:
             baseline.pop("observations", None)
-    return json.dumps(view, ensure_ascii=False, default=str, separators=(",", ":"))
+    return _prompt_json(view, "REVIEW_EVIDENCE")
 
 
 def _queue_program_update(record):
@@ -1329,7 +1449,7 @@ def _program_review_failed(reason):
     own = owner()
     if own:
         runtime_store().enqueue(
-            f"program-review:notice:{date.today().isoformat()}", own,
+            f"program-review:notice:{coach_clock.today().isoformat()}", own,
             {"text": "AgBot: I couldn't complete the programme review, so no programme "
                      "change was saved. I'll retry automatically. Your current symptoms "
                      "and movement exclusions still take priority over any older plan."})
@@ -1355,7 +1475,8 @@ def ensure_program_review(force=False):
     if not force and not context["review_due"]:
         return None
     snapshot = get_snapshot()
-    if not isinstance(snapshot, dict) or "__error__" in snapshot:
+    if (not isinstance(snapshot, dict) or "__error__" in snapshot
+            or snapshot.get("snapshot_cache", {}).get("stale")):
         _program_review_failed("garmin_unavailable")
         return None
     history = garmin_coach.program_history()
@@ -1392,16 +1513,22 @@ def ensure_program_review(force=False):
             "meaning": "Immutable block-start observations, not old programme proposals or recent progression proof.",
         }
     # These are proposals to honour, not evidence that their sets were completed.
-    commitments = [row for row in training["plans"] if row["date"] >= date.today().isoformat()]
+    commitments = [dict(row, payload={k: v for k, v in row["payload"].items() if k != "exercises"},
+                        detail_scope="Dated commitment; full dose stays in the plan store.")
+                   for row in training["plans"] if row["date"] >= coach_clock.today().isoformat()]
     prompt = (
         read_file(PROGRAM_PROMPT_FILE)
-        + "\n\nTODAY: " + date.today().isoformat()
+        + "\n\nTODAY: " + coach_clock.today().isoformat()
         + "\n\nPROFILE:\n" + profile
         + "\n\nREVIEW_EVIDENCE:\n" + _program_evidence_prompt(evidence)
         + "\n\nEXISTING_DATED_PROPOSALS:\n" + json.dumps(commitments, ensure_ascii=False)
         + "\n\nCURRENT_PROGRAMME:\n" + json.dumps(
             _program_context(), ensure_ascii=False, default=str)
-        + "\n\n" + read_file(os.path.join(PROMPTS, "coaching_policy.md"))
+        + "\n\n" + read_file(os.path.join(PROMPTS, "coaching_policy.md")).split(
+            "## Structured updates (hidden markers)")[0]
+        + "\n\nEVIDENCE REFERENCES: JSON objects named prompt_reference point to identical "
+          "data elsewhere in this prompt. Follow them; they are not missing evidence."
+        + ("\n\nNUTRITION POLICY:\n" + NUTRITION_POLICY if NUTRITION_OPTIONAL else "")
         + "\n\nTASK BOUNDARY: this is only a programme review, not a daily prescription. "
           "Return exactly one TRAINING_PROGRAM marker; no SESSION_PLAN, MEMORY or LOG markers."
     )
@@ -1454,7 +1581,7 @@ def ensure_program_review(force=False):
 def maybe_program_review(now=None):
     if not PROGRAM_ENABLED or not owner():
         return
-    now = now or datetime.now()
+    now = now or coach_clock.now()
     _, _, fingerprint = _program_inputs()
     context = program_store().context(today=now.date(), fingerprint=fingerprint)
     if not AUTO_START <= (now.hour, now.minute) < AUTO_END:
@@ -1468,7 +1595,7 @@ def _scheduling_context(plans=()):
     training = _program_training_context()
     profile, records, _ = _program_inputs()
     evidence = build_review_evidence(training, records, profile)
-    active = program_store().context().get("active") if PROGRAM_ENABLED else None
+    active = program_store().peek_context().get("active") if PROGRAM_ENABLED else None
     review = active["review"] if active else {}
     target = review.get("weekly_training_days")
     availability = evidence["weekly_training_days"]
@@ -1481,13 +1608,16 @@ def _scheduling_context(plans=()):
                 if r["classification"] == "intentional_training"}
     reported = {r["date"] for r in training["user_reported_day_status"]
                 if r["status"] == "user_completed" and r.get("plan_kind_at_report") in intentional
-                and r["date"] <= date.today().isoformat()}
+                and r["date"] <= coach_clock.today().isoformat()}
     proposals = {r["date"]: r["payload"] for r in training["plans"]
-                 if r["date"] >= date.today().isoformat()}
+                 if r["date"] >= coach_clock.today().isoformat()
+                 and r["payload"].get("projection_status") != "needs_replanning"}
     proposals.update({p["date"]: p for p in plans})
-    planned = {day for day, p in proposals.items() if p["kind"] in intentional}
+    planned = {day for day, p in proposals.items() if p["kind"] in intentional
+               and p.get("projection_status") != "needs_replanning"}
     all_days = observed | reported | planned
-    proposed_days = {p["date"] for p in plans if p["kind"] in intentional}
+    proposed_days = {p["date"] for p in plans if p["kind"] in intentional
+                     and p.get("projection_status") != "needs_replanning"}
     windows = []
     for day in sorted(planned):
         start = (date.fromisoformat(day) - timedelta(days=6)).isoformat()
@@ -1509,19 +1639,8 @@ def _scheduling_context(plans=()):
     }
 
 
-def _program_plan_errors(plans):
-    if not plans or not PROGRAM_ENABLED:
-        return []
-    active = program_store().context().get("active")
-    if not active:
-        return []
-    review = active["review"]
-    templates = {item["id"]: item for item in review["session_templates"]}
-    rotation = _rotation_context()
-    errors = rotation_plan_errors(plans, rotation)
-    required = {canonical_exercise(name) for name in _training_policy().get("required_exercises", [])}
-    required.update(canonical_exercise(d["exercise"]) for d in review["decisions"]
-                    if d["action"] == "introduce")
+def _plan_load_errors(plans):
+    errors = []
     observed = training_store().context()["latest_observed_per_movement"]
     feedback = [r for r in memory_store().records("anchor")
                 if r.get("verified") and r.get("source_type") == "user"]
@@ -1540,15 +1659,29 @@ def _program_plan_errors(plans):
                     name in canonical_exercise(r["key"] + " " + r["text"])
                     and re.search(r"\b\d+(?:\.\d+)?\s*kg\b", r["text"], re.I)
                     and re.search(basis_pattern, r["text"], re.I) for r in feedback)
-            if name in required and not own_load and any(
-                    item.get("weight_kg") is not None for item in move.get("sets", [])):
+            if not own_load and any(
+                    isinstance(item.get("weight_kg"), (int, float)) and item["weight_kg"] > 0
+                    for item in move.get("sets", [])):
                 errors.append("A new exercise without its own observed load needs "
                               "weight_kg=null and a calibration/effort instruction. Observations "
                               "must also establish the same apparatus/per-hand weight basis; "
                               "do not borrow a weight from a different curl or machine.")
+    return errors
+
+
+def _program_plan_errors(plans):
+    errors = _plan_load_errors(plans) if plans else []
+    if not plans or not PROGRAM_ENABLED:
+        return errors
+    active = program_store().peek_context().get("active")
+    if not active:
+        return errors
+    review = active["review"]
+    templates = {item["id"]: item for item in review["session_templates"]}
+    errors.extend(rotation_plan_errors(plans, _rotation_context()))
     for plan in plans:
         if (plan["kind"] == "rest" or (plan.get("detail_level") == "outline"
-                                      and plan["date"] > date.today().isoformat())):
+                                      and plan["date"] > coach_clock.today().isoformat())):
             continue
         template_id = plan.get("program_template_id")
         if template_id is not None and not isinstance(template_id, str):
@@ -1567,10 +1700,12 @@ def _program_plan_errors(plans):
             continue
         if template["kind"] != plan["kind"] and not adjustment:
             errors.append("Changing the programme session kind needs a program_adjustment.")
-        expected = {canonical_exercise(item["name"]) for item in template["exercises"]}
+        expected = {canonical_exercise(item["name"]) for item in template["exercises"]
+                    if item.get("role") not in ("warmup", "cooldown")
+                    and item.get("phase") not in ("warmup", "cooldown")}
         actual = {canonical_exercise(item["name"]) for item in plan.get("exercises", [])
-                  if (canonical_exercise(item["name"]) in expected
-                      or item.get("role") not in ("warmup", "cooldown"))}
+                  if item.get("role") not in ("warmup", "cooldown")
+                  and item.get("phase") not in ("warmup", "cooldown")}
         if actual != expected and not adjustment:
             errors.append("Changing programme exercises needs a program_adjustment: "
                           "explain the scope, recovery, equipment or tolerability reason.")
@@ -1592,9 +1727,9 @@ def _enrich_activity_context(data, question="", summary=False):
     activities = data.get("recent_activities_7d") or data.get("activities") or []
     requested_day = None
     if summary or re.search(r"\byesterday\b", question, re.IGNORECASE):
-        requested_day = (date.today() - timedelta(days=1)).isoformat()
+        requested_day = (coach_clock.today() - timedelta(days=1)).isoformat()
     elif re.search(r"\btoday\b", question, re.IGNORECASE):
-        requested_day = date.today().isoformat()
+        requested_day = coach_clock.today().isoformat()
     explicit_day = re.search(r"\b\d{4}-\d{2}-\d{2}\b", question)
     if explicit_day:
         try:
@@ -1626,12 +1761,15 @@ def _enrich_activity_context(data, question="", summary=False):
 
 def _compact_training_context(context, data, data_key, keep_older_sequences=False):
     """Reference repeated workout payloads without removing their sole occurrence."""
-    supplied, sequences, sequence_values = {}, {}, {}
+    supplied, sequences, sequence_values, observed_sets = {}, {}, {}, {}
     for field in ("recent_activities_7d", "activities"):
         for index, activity in enumerate(data.get(field, []) or []):
             aid = str(activity.get("activity_id"))
             supplied[aid] = (activity, f"{data_key}.{field}[{index}]")
             sets = activity.get("logged_sets") or []
+            for group_index, group in enumerate(sets):
+                observed_sets[(aid, canonical_exercise(group.get("exercise", "")))] = (
+                    group.get("observed_sets"), f"{supplied[aid][1]}.logged_sets[{group_index}].observed_sets")
             if sets and "set_sequence" in sets[0]:
                 sequences[aid] = supplied[aid][1] + ".logged_sets[0].set_sequence"
                 sequence_values[aid] = sets[0]["set_sequence"]
@@ -1645,10 +1783,21 @@ def _compact_training_context(context, data, data_key, keep_older_sequences=Fals
         if aid in supplied:
             activity, reference = supplied[aid]
             row["payload"] = {key: value for key, value in row["payload"].items()
-                              if key not in activity or value != activity[key]}
+                              if key not in activity or _stable_measurements(value) !=
+                              _stable_measurements(activity[key])}
             row["activity_reference"] = reference
+        for group_index, group in enumerate(row["payload"].get("logged_sets", [])):
+            observed_sets[(aid, canonical_exercise(group.get("exercise", "")))] = (
+                group.get("observed_sets"),
+                f"TRAINING_STATE.recent_outcomes[{index}].payload.logged_sets[{group_index}].observed_sets")
     for movement in context["latest_observed_per_movement"].values():
         aid = str(movement["activity_id"])
+        recorded = movement["recorded_sets"]
+        shared = observed_sets.get((aid, canonical_exercise(recorded.get("exercise", ""))))
+        if shared and recorded.get("observed_sets") is not None and recorded["observed_sets"] == shared[0]:
+            recorded = movement["recorded_sets"] = dict(recorded)
+            recorded.pop("observed_sets")
+            recorded["observed_sets_reference"] = shared[1]
         if aid in sequences and "set_sequence" in movement["recorded_sets"]:
             movement["recorded_sets"] = dict(movement["recorded_sets"])
             movement["recorded_sets"].pop("set_sequence")
@@ -1670,51 +1819,136 @@ def _compact_training_context(context, data, data_key, keep_older_sequences=Fals
     return context
 
 
+def _stable_measurements(value):
+    if isinstance(value, dict):
+        return {key: _stable_measurements(item) for key, item in value.items()
+                if key not in ("cache_age_hours", "age_seconds", "fetched_at")}
+    if isinstance(value, list):
+        return [_stable_measurements(item) for item in value]
+    return value
+
+
+def _prompt_json(value, label, seen=None):
+    """Replace only exact repeated structures; every fact has a full first occurrence."""
+    seen = {} if seen is None else seen
+
+    def project(item, path):
+        if not isinstance(item, (dict, list, str)):
+            return item
+        signature = json.dumps(item, sort_keys=True, ensure_ascii=False, default=str)
+        if len(signature) >= (96 if isinstance(item, str) else 160):
+            if signature in seen:
+                return {"prompt_reference": seen[signature]}
+            seen[signature] = path
+        if isinstance(item, str):
+            return item
+        if (isinstance(item, list) and item and path.rsplit(".", 1)[-1] in (
+                "set_sequence", "observed_sets")
+                and all(isinstance(row, dict) for row in item)):
+            columns = list(dict.fromkeys(k for row in item for k in row))
+            item = {"columns": columns, "rows": [[row.get(k) for k in columns] for row in item],
+                    "format": "Rows correspond to columns in order; null values are unknown."}
+        if isinstance(item, dict):
+            return {k: project(v, path + "." + str(k)) for k, v in item.items()}
+        return [project(v, f"{path}[{i}]") for i, v in enumerate(item)]
+
+    return json.dumps(project(value, label), ensure_ascii=False, default=str, separators=(",", ":"))
+
+
+def _routine_evidence(value):
+    """A bounded-detail view; originals and correction provenance remain in their stores."""
+    if isinstance(value, list):
+        return [_routine_evidence(v) for v in value]
+    if not isinstance(value, dict):
+        return value
+    result = {}
+    for key, item in value.items():
+        if key in ("detail_descriptors", "source_descriptors", "raw_fields"):
+            continue
+        if key == "detail_metrics" and isinstance(item, dict):
+            item = {k: item[k] for k in ("status", "fuel_estimate", "groups", "fetched_at")
+                    if k in item}
+        if key == "fuel_estimate" and isinstance(item, dict):
+            item = {k: v for k, v in item.items() if k not in ("fields", "app_id")}
+            item["detail_scope"] = "Raw developer fields retained in metric cache, not repeated here."
+        if key == "observed_sets" and isinstance(item, list) and item and all(
+                isinstance(row, dict) for row in item):
+            columns = list(dict.fromkeys(k for row in item for k in row))
+            item = {"columns": columns, "rows": [[row.get(k) for k in columns] for row in item],
+                    "format": "Each row uses the listed columns; null/missing values are unknown."}
+        if key == "recorded_sets" and isinstance(item, dict) and item.get("set_sequence"):
+            indices = item.get("set_indices")
+            if isinstance(indices, list):
+                item = dict(item, set_sequence=[
+                    row for i, row in enumerate(item["set_sequence"])
+                    if row.get("sequence_index", i) in indices])
+        result[key] = _routine_evidence(item)
+    return result
+
+
 def _nutrition_focused(prompt_file, question):
     if prompt_file == NUTRITION_PROMPT_FILE:
         return True
     question = question or ""
     return bool(
-        re.search(r"\b(?:food|meal|breakfast|lunch|dinner|protein|calories|oats|scoop|hydration)\b",
+        re.search(r"\b(?:food|meal|breakfast|lunch|dinner|protein|calories|oats|scoop|hydration|ate|eaten|drank)\b|^\s*log:",
                   question, re.IGNORECASE)
         and not re.search(r"\b(?:exercise|workout|training|sets?|reps?|press|curl|row|squat|"
                           r"deadlift|rdl|run|running|bike|cycling|pain|injury|knee|back|shoulder)\b",
                           question, re.IGNORECASE))
 
 
+def _trim_nutrition_activity(activity):
+    out = {key: value for key, value in activity.items()
+           if key not in ("logged_sets", "detail_metrics")}
+    dm = activity.get("detail_metrics")
+    if isinstance(dm, dict):
+        lean = _routine_evidence({k: dm[k] for k in ("status", "fuel_estimate") if k in dm})
+        if lean:
+            out["detail_metrics"] = lean
+    return out
+
+
 def _nutrition_context(data, training):
     data = dict(data)
     for field in ("recent_activities_7d", "activities"):
         if field in data:
-            data[field] = [{key: value for key, value in activity.items()
-                            if key not in ("logged_sets", "detail_metrics")}
+            data[field] = [_trim_nutrition_activity(activity)
                            for activity in data[field]]
     for outcome in training["recent_outcomes"]:
-        outcome["payload"] = {key: value for key, value in outcome["payload"].items()
-                              if key not in ("logged_sets", "detail_metrics")}
+        outcome["payload"] = _trim_nutrition_activity(outcome["payload"])
+    for row in training["plans"]:
+        row["payload"] = {k: v for k, v in row["payload"].items() if k != "exercises"}
     training["latest_observed_per_movement"] = {}
     training["detail_selection"] = (
         "Nutrition-focused view: exact set timelines/capabilities are omitted, not absent. "
-        "Activity totals, plans, reported day status, active symptoms and preferences remain.")
+        "Activity totals, fuel estimates, plans, reported day status, active symptoms and preferences remain.")
     return data, training
 
 
 def _qa_plan_scope(question, training=None):
     training = training if training is not None else training_store().context()
-    completed = any(r["date"] == date.today().isoformat() and r["status"] == "user_completed"
+    completed = any(r["date"] == coach_clock.today().isoformat() and r["status"] == "user_completed"
                     for r in training["user_reported_day_status"])
     return plan_request_scope(question, completed_today=completed)
 
 
 def _assemble(prompt_file, question=None, include_history=True,
-              data=None, data_key="GARMIN_JSON", include_brief=True):
+              data=None, data_key="GARMIN_JSON", include_brief=True, routine_only=False):
+    if question:
+        memory_store().resolve_supported_health(question, prompt_context=_last_bot_message())
     correction = _prepare_workout_correction(question) if question else None
     if data is None:
         data = get_snapshot()
+    data = _available_snapshot(data)
     nutrition_focused = _nutrition_focused(prompt_file, question) and not plan_request_scope(question)
-    if (prompt_file in (SUMMARY_PROMPT_FILE, PERF_PROMPT_FILE)
+    if (data.get("sensor_status") != "unavailable"
+            and not data.get("snapshot_cache", {}).get("stale")) and (
+            prompt_file in (SUMMARY_PROMPT_FILE, PERF_PROMPT_FILE, WEEKLY_PROMPT_FILE, NUTRITION_PROMPT_FILE)
             or re.search(r"\b(?:workout|exercise|training|stamina|running dynamics|"
-                         r"fat burner|fat burned|fuel use|carbohydrate burned)\b",
+                         r"fat burner|fat burned|fuel use|carbohydrate burned|"
+                         r"ride|cycling|bike|run|running|hike|hiking|gym|session|"
+                         r"calories|carbs|fat|recovery|rpe|feel|zone)\b",
                          question or "", re.IGNORECASE)):
         _enrich_activity_context(data, question or "", summary=prompt_file == SUMMARY_PROMPT_FILE)
     for field in ("recent_activities_7d", "activities"):
@@ -1724,14 +1958,30 @@ def _assemble(prompt_file, question=None, include_history=True,
     if nutrition_focused:
         data, training = _nutrition_context(data, training)
     else:
-        chronology = (prompt_file == DEBRIEF_PROMPT_FILE or _is_workout_review(question)
-                      or bool(re.search(r"\b(?:order|sequence|superset)\b", question or "", re.I)))
+        chronology = (not routine_only and (
+            prompt_file == DEBRIEF_PROMPT_FILE or _is_workout_review(question)
+            or bool(re.search(r"\b(?:order|sequence|superset)\b", question or "", re.I))))
         data = compact_workouts(data, full_chronology=chronology)
         training = compact_workouts(training, full_chronology=chronology)
-    js = json.dumps(data, separators=(",", ":"), default=str)
+        if not chronology:
+            data, training = _routine_evidence(data), _routine_evidence(training)
+            for row in training["plans"]:
+                if row["date"] != coach_clock.today().isoformat():
+                    row["payload"] = {k: v for k, v in row["payload"].items()
+                                      if k != "exercises"}
+                    if row["date"] < coach_clock.today().isoformat():
+                        row["payload"] = {k: v for k, v in row["payload"].items() if k in (
+                            "date", "kind", "objective", "rotation_slot", "projection_status",
+                            "program_revision", "program_template_id")}
+                    row["context_note"] = "Dated proposal; detailed prescription retained in the plan store."
+    if NUTRITION_OPTIONAL and not nutrition_focused:
+        data = {k: v for k, v in data.items() if k not in ("calorie_budget", "nutrition")}
+    shared = {}
+    js = _prompt_json(data, data_key, shared)
     parts = [
         read_file(prompt_file),
-        "\n\n---\nTODAY: " + today_human() + " (" + date.today().isoformat() + ")\n",
+        "\n\n---\nTODAY: " + today_human() + " (" + coach_clock.today().isoformat() + ") "
+        + coach_clock.now().strftime("%H:%M") + "\n",
     ]
     delayed = _delayed_message_note()
     if delayed:
@@ -1765,18 +2015,30 @@ def _assemble(prompt_file, question=None, include_history=True,
                      "and do not assume an alternative is safe. Apply their equipment/scheduling "
                      "rules. Use dates and provenance, not list position; clarify genuine "
                      "conflicts between active records):\n" + prefs + "\n")
-    if include_brief:
+    if include_brief and not any(row["date"] == coach_clock.today().isoformat()
+                                 for row in training["plans"]):
         brief = todays_brief_text()
         if brief:
             parts.append("\nTODAY'S PREVIOUS BRIEF (historical advice, not proof of execution; "
                          "a later dated TRAINING_STATE revision takes precedence):\n"
                          + brief + "\n")
-    notes = recent_journal_text()
+    notes = recent_journal_text() if nutrition_focused else ""
     if notes:
         parts.append("\nNOTES YOU'VE SHARED (durable context the user logged):\n"
                      + notes + "\n")
+    nutr_summary = rolling_nutrition_summary(
+        days=7,
+        today=coach_clock.today(),
+        calorie_budget=data.get("calorie_budget") if isinstance(data, dict) else None,
+    )
+    if nutrition_focused and nutr_summary.get("logged_days_count", 0) > 0:
+        parts.append("\nNUTRITION_SUMMARY_7D (aggregated from active food journal entries; "
+                     "superseded corrections excluded):\n"
+                     + json.dumps(nutr_summary, separators=(",", ":"), default=str) + "\n")
     hist = recent_history_text() if include_history else ""
-    fit = None if nutrition_focused else load_fitness_profile()
+    fit = (None if nutrition_focused or routine_only or _is_workout_review(question)
+           or data.get("sensor_status") == "unavailable"
+           or data.get("snapshot_cache", {}).get("stale") else load_fitness_profile())
     if isinstance(fit, dict):
         fit_view = fit
         if fit_view:
@@ -1791,24 +2053,23 @@ def _assemble(prompt_file, question=None, include_history=True,
         # instruction the model reads.
         parts.append("\n\nRECENT CONVERSATION (context, oldest to newest):\n"
                      + hist + "\n")
-    keep_older_sequences = (prompt_file == DEBRIEF_PROMPT_FILE or _is_workout_review(question)
-                            or bool(re.search(r"\b(?:order|sequence|superset)\b",
-                                              question or "", re.IGNORECASE)))
+    keep_older_sequences = (not routine_only and (
+        prompt_file == DEBRIEF_PROMPT_FILE or _is_workout_review(question)
+        or bool(re.search(r"\b(?:order|sequence|superset)\b", question or "", re.IGNORECASE))))
     training = _compact_training_context(training, data, data_key, keep_older_sequences)
-    parts.append("\n\nTRAINING_STATE:\n" + json.dumps(training,
-                 separators=(",", ":"), default=str))
+    parts.append("\n\nTRAINING_STATE:\n" + _prompt_json(training, "TRAINING_STATE", shared))
     if correction:
         parts.append("\n\nWORKOUT_CORRECTION_RESULT:\n" + json.dumps(correction, default=str)
                      + "\nSaved corrections are user-reported overlays, not Garmin verification. "
                      "Use effective corrected sets and their source/freshness. If clarification "
                      "is needed, name the ambiguity and ask for activity/exercise/set; do not "
                      "claim the edit was applied. Handle other feedback in the message normally.")
-    parts.append("\n\nPROGRAMME_STATE:\n" + json.dumps(
-        _program_context(nutrition_focused), separators=(",", ":"), default=str))
+    parts.append("\n\nPROGRAMME_STATE:\n" + _prompt_json(
+        _program_context(nutrition_focused), "PROGRAMME_STATE", shared))
     if not nutrition_focused:
-        parts.append("\n\nROTATION_STATE:\n" + json.dumps(_rotation_context(), default=str))
-        parts.append("\n\nSCHEDULING_CONTEXT:\n" + json.dumps(
-            _scheduling_context(), separators=(",", ":"), default=str))
+        parts.append("\n\nROTATION_STATE:\n" + _prompt_json(_rotation_context(), "ROTATION_STATE", shared))
+        parts.append("\n\nSCHEDULING_CONTEXT:\n" + _prompt_json(
+            _scheduling_context(), "SCHEDULING_CONTEXT", shared))
         parts.append("\n\n" + read_file(os.path.join(PROMPTS, "garmin_interpretation.md")))
     scope = _qa_plan_scope(question, training)
     if scope:
@@ -1817,9 +2078,17 @@ def _assemble(prompt_file, question=None, include_history=True,
                      "Use a provisional outline for an unfamiliar future class; do not invent "
                      "its exercises or clear the user for an unknown intensity.")
     parts.append("\n\n" + read_file(os.path.join(PROMPTS, "coaching_policy.md")))
+    if NUTRITION_OPTIONAL:
+        parts.append("\n\nNUTRITION POLICY (overrides older profile/logging requests):\n" + NUTRITION_POLICY)
+    parts.append("\n\nEVIDENCE REFERENCES: JSON objects named prompt_reference point to "
+                 "identical structures elsewhere in this prompt. Follow those references; "
+                 "they are not missing observations. Full originals remain in their stores.")
     if question is not None:
         parts.append("\n\nQUESTION:\n" + question)
-    return "".join(parts), data
+    prompt = "".join(parts)
+    log.info("stage=context prompt_chars=%d data_chars=%d training_chars=%d",
+             len(prompt), len(js), len(json.dumps(training, default=str)))
+    return prompt, data
 
 
 def _food_reporting_errors(text, source_text):
@@ -1835,30 +2104,12 @@ def _food_reporting_errors(text, source_text):
     for day, _ in logs:
         if day:
             try:
-                if date.fromisoformat(day) > date.today():
+                if date.fromisoformat(day) > coach_clock.today():
                     errors.append("Do not log future food consumption.")
             except ValueError:
                 errors.append("LOG must use a valid calendar date.")
-    if not logs:
-        return errors
-    visible = _LOG_MARKER_RE.sub("", _LOG_REPLACES_RE.sub("", text))
-    progress_pattern = r"\b(?:daily|today['\u2019]s)\s+(?:progress|totals?|intake|tally)\b"
-    sections = {
-        "Meal estimate": r"\b(?:meal estimate|meal breakdown|food breakdown|rough estimates?)\b",
-        "Meal total": (r"\b(?:meal|snack)\s+(?:total|summary)\b|"
-                       r"^\s*(?:[-*]\s+)?(?:\*\*)?Total\s*:"),
-        "Daily progress": progress_pattern,
-    }
-    for section, pattern in sections.items():
-        if not re.search(pattern, visible, re.IGNORECASE | re.MULTILINE):
-            errors.append("Food reply needs a visible " + section + " section.")
-    progress = re.search(progress_pattern, visible, re.IGNORECASE)
-    if progress:
-        tail = visible[progress.end():]
-        if not re.search(r"\b(?:calories|kcal)\b", tail, re.IGNORECASE):
-            errors.append("Daily progress must include calories eaten, target and remaining.")
-        if not re.search(r"\bprotein\b", tail, re.IGNORECASE):
-            errors.append("Daily progress must include protein eaten, target and remaining.")
+    if logs:
+        errors.append("Use structured MEAL items with a source_quote, not prose LOG accounting.")
     return errors
 
 
@@ -1876,10 +2127,61 @@ def _present_reply(text):
     return "\n".join(lines)
 
 
+def _last_bot_message():
+    history = load_history()
+    for turn in reversed(history):
+        if (turn.get("role") == "agbot" and turn.get("text")
+                and _within_days(turn.get("ts"), 1)):
+            return turn["text"]
+    return ""
+
+
+_TRAINING_REPORT_RE = re.compile(r"\[\[TRAINING_REPORT:\s*(.*?)\]\]", re.I | re.S)
+
+
+def _training_reports(text, source):
+    reports, errors = [], []
+    for raw in _TRAINING_REPORT_RE.findall(text):
+        try:
+            item = json.loads(raw)
+            quote = item["source_quote"]
+            if not isinstance(quote, str) or not quote or quote not in source:
+                raise ValueError("A training report requires the current user's exact quote.")
+            if coach_clock.today() < date.fromisoformat(item["date"]):
+                raise ValueError("A future workout cannot be marked complete or skipped.")
+            clause = re.split(r"[.!?;\n]", source[:source.find(quote)])[-1] + quote
+            if re.search(r"\b(?:if|would|might|could|should|tomorrow)\b|\?", clause, re.I):
+                raise ValueError("Hypothetical training is not a completion/skip report.")
+            if item["status"] == "user_completed":
+                if (re.search(r"\b(?:not|never|didn't|haven't|isn't)\b", clause, re.I)
+                        or not re.search(r"\b(?:done|finished|completed)\b", quote, re.I)
+                        or not re.search(r"\b(?:exercise|workout|session|run|ride|training)\b", quote, re.I)):
+                    raise ValueError("Completion requires affirmative exercise-specific evidence.")
+            elif item["status"] == "user_skipped":
+                if not re.search(r"\b(?:skip|skipping|rest day|not exercising|no workout)\b", quote, re.I):
+                    raise ValueError("Skipping requires an explicit user choice.")
+            else:
+                raise ValueError("Unknown training report status.")
+            reports.append(item)
+        except (ValueError, KeyError, TypeError) as exc:
+            errors.append(str(exc))
+    return _TRAINING_REPORT_RE.sub("", text), reports, errors
+
+
 def _generate_checked(prompt, source_text="", images=None, require_plan=False, show_schedule=False):
     """Persist source-backed facts and validate proposals before returning an answer."""
+    artifact_key = (_current_request + ":validated-answer:" +
+                    hashlib.sha256(source_text.encode()).hexdigest()[:16]
+                    if _current_request else None)
+    if artifact_key:
+        saved_answer = runtime_store().get_artifact(artifact_key)
+        if saved_answer is not None:
+            return saved_answer["text"]
+    prev_bot = _last_bot_message() if source_text else ""
+    auto_resolved = (memory_store().resolve_supported_health(source_text, prompt_context=prev_bot)
+                     if source_text else [])
     text = run_llm(prompt, images=images)
-    receipts = []
+    receipts = list(auto_resolved)
     pending_memory_errors = []
     for attempt in range(2):
         if not text:
@@ -1887,7 +2189,7 @@ def _generate_checked(prompt, source_text="", images=None, require_plan=False, s
         # User-sourced facts stand independently of whether the proposed workout is valid.
         # Apply them first so a newly stated exclusion guards this very response.
         candidate, changes, memory_errors = memory_store().process_markers(
-            text, source_text=source_text, source_type="user")
+            text, source_text=source_text, source_type="user", prompt_context=prev_bot)
         receipts.extend(changes)
         if memory_errors:
             pending_memory_errors = memory_errors
@@ -1895,10 +2197,23 @@ def _generate_checked(prompt, source_text="", images=None, require_plan=False, s
             pending_memory_errors = []
         existing = training_store().context()["plans"]
         clean, plans, errors = parse_plans(candidate, memory_store().records("preference"),
-                                          existing_plans=existing)
+                                          existing_plans=existing, require_phases=True)
+        clean, meals, food_days, food_errors = parse_food(
+            clean, source_text, reported_on=_MSG_SENT_AT.date() if _MSG_SENT_AT else None)
+        errors.extend(food_errors)
+        clean, reports, report_errors = _training_reports(clean, source_text)
+        errors.extend(report_errors)
+        if meals and plans and not require_plan:
+            errors.append("Logging food must not create an unsolicited workout revision.")
+        if NUTRITION_OPTIONAL:
+            for plan in plans:
+                reason = " ".join(str(plan.get(k, "")) for k in ("reason", "program_adjustment"))
+                if re.search(r"\b(?:calorie|calories|food log|intake|protein shortfall|underfuel)", reason, re.I):
+                    errors.append("Nutrition tracking must not determine training changes. "
+                                  "Use independent symptoms, observed effort, availability and goals.")
         errors.extend(_program_plan_errors(plans))
         if (not source_text and plans and _rotation_context().get("completed_today")
-                and any(p["date"] == date.today().isoformat() for p in plans)):
+                and any(p["date"] == coach_clock.today().isoformat() for p in plans)):
             errors.append("Today's rotation session is already completed; automatic advice must "
                           "not rewrite it or prescribe another session. Emit future dates only.")
         errors.extend(unsupported_claims(clean))
@@ -1908,10 +2223,10 @@ def _generate_checked(prompt, source_text="", images=None, require_plan=False, s
         if require_plan and not plans:
             errors.append("a dated structured SESSION_PLAN is required")
         if require_plan in (True, "today") and not any(
-                p["date"] == date.today().isoformat() for p in plans):
+                p["date"] == coach_clock.today().isoformat() for p in plans):
             errors.append("today's structured SESSION_PLAN is required")
         if require_plan in (True, "today") and any(
-                p["date"] == date.today().isoformat() and p["kind"] != "rest"
+                p["date"] == coach_clock.today().isoformat() and p["kind"] != "rest"
                 and (p.get("detail_level") == "outline" or not p.get("exercises"))
                 and p.get("delivery") != "instructor_led"
                 for p in plans):
@@ -1943,26 +2258,45 @@ def _generate_checked(prompt, source_text="", images=None, require_plan=False, s
                               request_id=_current_request, source_text=source_text)
         RotationStore(os.path.join(STATE, "coach.sqlite3")).save_deferrals(plans)
         for plan in plans:
-            if plan["date"] == date.today().isoformat():
-                _set_coach_rest(plan["kind"] == "rest")
+            if plan["date"] == coach_clock.today().isoformat():
+                if _is_rest_or_recovery_plan(plan) or plan.get("rotation_slot"):
+                    _set_coach_rest(_is_rest_or_recovery_plan(plan))
+    for report in reports:
+        training_store().set_status(report["date"], report["status"],
+                                    source=report["source_quote"])
+        if report["date"] == coach_clock.today().isoformat():
+            _set_exercise_status("done" if report["status"] == "user_completed" else "skip")
+        if report["status"] == "user_completed":
+            _save_pending({"date": report["date"], "last_ts": time.time(),
+                           "user_requested": True})
+    if reports and PROGRAM_ENABLED:
+        _rotation_context(reconcile=True)
     clean = _MODEL_LOG_RECEIPT_RE.sub("", clean)
-    replacements = _LOG_REPLACES_RE.findall(clean)
     clean = _LOG_REPLACES_RE.sub("", clean)
-    clean, logged, log_date = _extract_log_marker(clean)
-    if logged and source_text:
-        log_date = log_date or (None if replacements else _sent_backdate())
-        entry = append_journal(logged, on_date=log_date,
-                               replaces_entry_id=replacements[0] if replacements else None)
-        clean = re.sub(r"(?m)^Logged\.\s*", "", clean)
-        clean += _logged_confirmation(entry["date"], updated=bool(replacements))
+    clean, _, _ = _extract_log_marker(clean)
+    if source_text:
+        _, intent = _extract_exercise_plan_marker(clean)
+        if intent and intent in source_text and not _sent_backdate():
+            clean = _harvest_exercise_plan(clean)
+    if meals or food_days:
+        source_id = _current_request or "food:" + hashlib.sha256(
+            (coach_clock.today().isoformat() + source_text).encode()).hexdigest()
+        nutrition_store().save(meals, food_days, source_id, source_text,
+                               legacy_ids={journal_entry_id(e) for e in active_journal_entries()})
+        if meals:
+            # Replace model arithmetic with a receipt computed from the persisted ledger.
+            clean = render_receipt(meals, rolling_nutrition_summary(days=35)["days"])
+            notes = list(dict.fromkeys(meal["coaching_note"] for meal in meals if meal.get("coaching_note")))
+            if notes:
+                clean += "\n\n" + "\n\n".join(notes)
     clean = _strip_control_markers(clean)
     if plans or show_schedule:
         clean = strip_schedule_rendering(clean)
         visible = plans[:]
         mentioned = {p["date"] for p in visible}
         visible.extend(r["payload"] for r in training_store().context()["plans"]
-                       if date.today().isoformat() < r["date"] <=
-                       (date.today() + timedelta(days=7)).isoformat() and r["date"] not in mentioned)
+                       if coach_clock.today().isoformat() < r["date"] <=
+                       (coach_clock.today() + timedelta(days=7)).isoformat() and r["date"] not in mentioned)
         if visible:
             clean += "\n\n" + render_plans(sorted(visible, key=lambda p: p["date"]))
         if plans and PROGRAM_ENABLED:
@@ -2009,17 +2343,19 @@ def _generate_checked(prompt, source_text="", images=None, require_plan=False, s
             if rotation.get("unconfirmed_sessions"):
                 clean += ("\nThe previous rotation session is unconfirmed. After completing "
                           "the prescribed session, use DWRE; report substitutions separately.")
-    if plans and source_text and any(p["date"] == date.today().isoformat() for p in plans):
+    if plans and source_text and any(p["date"] == coach_clock.today().isoformat() for p in plans):
         save_todays_brief(clean)
+    if artifact_key:
+        runtime_store().save_artifact(artifact_key, {"text": clean})
     return clean
 
 
 def generate_summary():
-    ensure_program_review()
+    # Optional review work has its own scheduler slot; it must not block a requested brief.
     prompt, snap = _assemble(SUMMARY_PROMPT_FILE, include_history=True, include_brief=False)
     if isinstance(snap, dict) and "__error__" in snap:
         return None, snap
-    completed_rotation = bool(_rotation_context().get("completed_today"))
+    completed_rotation = bool(_rotation_context(reconcile=True).get("completed_today"))
     if completed_rotation:
         prompt += ("\n\nTODAY'S ROTATION SESSION IS ALREADY COMPLETED. Do not emit or rewrite "
                    "a plan for today; summarise the recorded session and outline future dates.")
@@ -2041,20 +2377,21 @@ def generate_qa(question):
     if text:
         append_history("user", question)
         append_history("agbot", text)
-    if text and _is_workout_review(question):
-        _clear_pending()  # asked how they did -> don't also auto-debrief this session later
     return text, snap
 
 
 
 
-def generate_images(image_paths, caption, extra=None, media_label="photo"):
+def generate_images(image_paths, caption, extra=None, media_label="photo", spoken_text=""):
     n = len(image_paths)
     if n > 1:
         q = caption or ("(no caption - these items were sent together; analyze them AS "
                         "A SET and coach me on them)")
     else:
         q = caption or "(no caption - analyze this image and coach me on it)"
+    source = "\n".join(s for s in (caption, spoken_text) if s)
+    if spoken_text:
+        q += "\nTranscribed user speech (confirm ambiguous transcription):\n" + spoken_text
     prompt, snap = _assemble(IMAGE_PROMPT_FILE, question=q, include_history=True)
     if n > 1:
         prompt += ("\n\nATTACHMENTS: " + str(n) + " images are attached and belong to a "
@@ -2064,7 +2401,7 @@ def generate_images(image_paths, caption, extra=None, media_label="photo"):
                    "THE CONTENT OF EVERY image - never analyse just one and never drop a part.")
     if extra:
         prompt += "\n\n" + extra
-    text = _generate_checked(prompt, source_text=caption or "", images=image_paths)
+    text = _generate_checked(prompt, source_text=source, images=image_paths)
     if text:
         plural = "s" if n != 1 else ""
         label = caption or ("[shared " + str(n) + " " + media_label + plural + "]")
@@ -2078,7 +2415,6 @@ def generate_image(image_path, caption):
 
 
 def generate_weekly():
-    ensure_program_review()
     data = garmin_coach.build_weekly()
     if isinstance(data, dict) and "__error__" in data:
         return None, data
@@ -2101,19 +2437,20 @@ def generate_nutrition():
     return text, snap
 
 
-def generate_debrief(activities):
+def generate_debrief(activities, source_text=""):
     """Collective post-workout debrief. `activities` is the just-finished session block - a
     list of trimmed activities the user logged back-to-back, often split across Garmin types
     (a cardio warm-up, the Strength block, a run, a Pilates/stretch cool-down). The WHOLE
-    session is judged against this morning's plan at once, so we never nag after a single
-    part. Accepts a single activity dict too, for back-compat."""
+    session is assessed against its dated plan, not necessarily today's.
+    Accepts a single activity dict too, for back-compat."""
     if isinstance(activities, dict):
         activities = [activities]
     activities = [a for a in (activities or []) if isinstance(a, dict)]
     if not activities:
         return None
     snap = get_snapshot(force=True)
-    base_prompt, _ = _assemble(DEBRIEF_PROMPT_FILE, data=snap)
+    base_prompt, _ = _assemble(DEBRIEF_PROMPT_FILE, data=snap, question=source_text or None,
+                              routine_only=True)
     parts = [base_prompt]
     for a in activities:
         if "strength" in str(a.get("type") or ""):
@@ -2121,19 +2458,22 @@ def generate_debrief(activities):
             if isinstance(sets, list) and sets:
                 a["logged_sets"] = sets
     if len(activities) > 1:
-        header = ("SESSION_JUST_FINISHED - these " + str(len(activities)) + " activities were "
-                  "logged back-to-back and TOGETHER form ONE workout session (the user records "
-                  "each part under a different Garmin type - e.g. a cardio warm-up, the Strength "
-                  "block, a run, a Pilates/stretch cool-down). Judge this morning's plan as "
-                  "potentially covered collectively; do not invent a completion percentage; "
+        header = ("SESSION_ACTIVITIES - these " + str(len(activities)) + " activities are "
+                  "nearby recordings on the reported day. Consider their dated plan collectively, "
+                  "but proximity alone does not establish warmup/main/cooldown coverage. "
+                  "Do not invent a completion percentage; "
                   "flag a genuinely-missing piece only once, and if they did something OFF the "
                   "plan note the pivot supportively - never ask 'is that all?' after one part")
     else:
-        header = "JUST_FINISHED_ACTIVITY"
+        header = "SESSION_ACTIVITIES (one recorded activity)"
     training_store().record_activities(activities)
     effective = training_store().corrections.apply(activities)
-    parts.append("\n\n" + header + ":\n" + json.dumps(
-        compact_workouts(effective, full_chronology=True), separators=(",", ":"), default=str))
+    parts.append("\n\n" + header + ":\n" + _prompt_json(
+        compact_workouts(effective, full_chronology=True), "SESSION_ACTIVITIES"))
+    session_dates = {str(a.get("start", ""))[:10] for a in activities}
+    dated_plans = [row for row in training_store().context()["plans"] if row["date"] in session_dates]
+    parts.append("\n\nDATED_SESSION_PLANS (proposals, not execution evidence):\n"
+                 + _prompt_json(dated_plans, "DATED_SESSION_PLANS"))
     extras_all = {}
     for a in activities:
         ex = garmin_coach.activity_extras(a.get("activity_id"))
@@ -2142,7 +2482,11 @@ def generate_debrief(activities):
     if extras_all:
         parts.append("\n\nACTIVITY_EXTRAS (per activity; time-in-HR-zone minutes; weather if "
                      "outdoor):\n" + json.dumps(extras_all, indent=2, default=str))
-    text = _generate_checked("".join(parts), show_schedule=True)
+    parts.append("\nSESSION_DATES: " + json.dumps(sorted({
+        str(a.get("start", ""))[:10] for a in activities}))
+        + "\nUse these dates, not the processing day. Nearby activities are associated, "
+        "not proof that prescribed warm-up, dose or cool-down was performed.")
+    text = _generate_checked("".join(parts), source_text=source_text, show_schedule=True)
     if text:
         append_history("agbot", "[post-workout debrief] " + text,
                        activity_ids=[a["activity_id"] for a in activities if a.get("activity_id")])
@@ -2159,11 +2503,11 @@ def do_summary(chat_id, auto=False):
     if not text:
         _llm_fail_notice(chat_id, "generate your brief")
         return
-    send_message(chat_id, text, summary_date=date.today().isoformat())
+    send_message(chat_id, text, summary_date=coach_clock.today().isoformat())
 
 
 def do_qa(chat_id, question):
-    log.info("Q&A: %s", question[:120])
+    log.info("stage=qa input_chars=%d", len(question))
     text, snap = generate_qa(question)
     if isinstance(snap, dict) and "__error__" in snap:
         raise RuntimeError("Garmin data unavailable")
@@ -2306,7 +2650,8 @@ def do_video(chat_id, msg):
         if transcript:
             bits.append('Audio transcript of the video (what the user says): "' + transcript + '"')
         text, _snap = generate_images(frames, (msg.get("caption") or "").strip(),
-                                      extra="\n".join(bits), media_label="video frame")
+                                      extra="\n".join(bits), media_label="video frame",
+                                      spoken_text=transcript or "")
         if not text:
             _llm_fail_notice(chat_id, "analyze that video")
             return
@@ -2378,8 +2723,10 @@ HELP_TEXT = (
     "- \U0001FA79 **Tell me if you're hurt or unwell** ('my knee hurts', 'I feel sick') and "
     "I'll ask what's going on, remember it, and adapt your training (or call for rest) until "
     "you reply **recovered**.\n"
-    "- \U0001F37D\uFE0F I nudge you to log meals at 8:30am, 12:15pm & 9pm, and \U0001F4A7 "
-    "remind you to drink water every 2h from 8am-10pm (log the water on your watch).\n"
+    "- Food logging is optional. Missing photos/meals never change your workout. "
+    "Meal reminders are off unless explicitly enabled.\n"
+    "- **starting workout** / **cooldown** shows your saved workout card immediately.\n"
+    "- **pause reminders** / **resume reminders** controls optional check-ins.\n"
     "- \U0001F3CB\uFE0F I check in through the day (12 / 4pm / 9pm) on whether you did "
     "the recommended exercise - reply **DWRE** when done, or 'rest day' / 'skip today' to stop "
     "the check-ins for the day.\n"
@@ -2394,47 +2741,78 @@ HELP_TEXT = (
     "Advice uses available Garmin data and your private profile; missing data stays unknown."
 )
 
-def do_dwre(chat_id):
-    """User signalled they're done with today's recommended exercise (DWRE). Mark today done
-    so the check-ins stop, cancel any pending auto-debrief, and send the collective wrap-up."""
-    log.info("DWRE - marking today's exercise done, sending collective summary")
-    _set_exercise_status("done")
-    training_store().set_status(date.today(), "user_completed")
+def _report_day(report=""):
+    day = _MSG_SENT_AT.date() if _MSG_SENT_AT else coach_clock.today()
+    explicit = re.search(r"\b\d{4}-\d{2}-\d{2}\b", report)
+    if explicit:
+        day = date.fromisoformat(explicit.group())
+    elif re.search(r"\byesterday\b", report, re.I):
+        day -= timedelta(days=1)
+    if day > coach_clock.today():
+        raise ValueError("A future workout cannot be reported completed.")
+    return day
+
+
+def _deliver_debrief(chat_id, block, day, source_text=""):
+    ids = sorted(str(a.get("activity_id")) for a in block)
+    key = "debrief:" + day + ":" + hashlib.sha256(json.dumps(ids).encode()).hexdigest()[:16]
+    saved = runtime_store().get_artifact(key)
+    text = saved["text"] if saved else generate_debrief(block, source_text=source_text)
+    if not text:
+        raise RuntimeError("Debrief generation failed; the dated job remains pending.")
+    if not saved:
+        runtime_store().save_artifact(key, {"text": text})
+    send_message(chat_id, text, delivery_key=key)
+    _clear_pending(day)
+
+
+def do_dwre(chat_id, report=""):
+    """Completion is a dated user report; syncing and debrief delivery are separate."""
+    day = _report_day(report)
+    if day == coach_clock.today():
+        _set_exercise_status("done")
+    training_store().set_status(day, "user_completed")
+    if PROGRAM_ENABLED:
+        _rotation_context(reconcile=True)
     _snapshot_cache.invalidate()
-    _clear_pending()
+    _save_pending({"date": day.isoformat(), "last_ts": time.time() - DEBRIEF_QUIET_SECS,
+                   "user_requested": True, "source_text": report})
     send_message(chat_id, "\U0001F916 AgBot: nice work \u2713 pulling your whole session "
                  "together...")
-    block = garmin_coach.session_block()
+    block = garmin_coach.session_block(target_day=day)
     if isinstance(block, dict) and "__error__" in block:
-        send_message(chat_id, "\U0001F916 AgBot: I couldn't reach Garmin just now - you're "
-                     "marked done for the day; ask me later for the full breakdown.")
+        send_message(chat_id, "\U0001F916 AgBot: I couldn't reach Garmin just now - your "
+                     "completion is saved for " + day.isoformat() + ". The debrief will retry.")
+        if re.match(r"^/?dwre\s*[-:]", report, re.I):
+            do_qa(chat_id, report)
         return
     if not block:
-        send_message(chat_id, "\U0001F916 AgBot: marked you done for today \u2713 - but I don't "
-                     "see any activity synced from your watch yet. Sync it and I'll give you the "
-                     "full wrap-up, or tell me what you did.")
+        send_message(chat_id, "Completion saved for " + day.isoformat()
+                     + ". No matching synced activity yet; the debrief remains pending. "
+                     "You can also tell me what you did and how the main exercises felt.")
+        if re.match(r"^/?dwre\s*[-:]", report, re.I):
+            do_qa(chat_id, report)
         return
-    text = generate_debrief(block)
-    if text:
-        send_message(chat_id, text)
+    _deliver_debrief(chat_id, block, day.isoformat(), source_text=report)
 
 
 def do_skip_exercise(chat_id):
     """User is not exercising today - stop the check-ins for the rest of the day."""
     log.info("Exercise skipped for today (user opt-out)")
-    _set_exercise_status("skip")
-    training_store().set_status(date.today(), "user_skipped")
-    _clear_pending()
-    send_message(chat_id, "\U0001F916 AgBot: all good \u2713 no exercise pencilled in for today "
-                 "- I'll stop the check-ins and pick it up again tomorrow. Rest up and keep the "
-                 "water going. \U0001F4A7")
+    day = _report_day()
+    if day == coach_clock.today():
+        _set_exercise_status("skip")
+    training_store().set_status(day, "user_skipped")
+    send_message(chat_id, "Rest/skip recorded for " + day.isoformat()
+                 + (". Exercise check-ins are off for today." if day == coach_clock.today()
+                    else ". Today's training status is unchanged."))
 
 
-DWRE_EXACT = {"dwre", "/dwre", "done", "all done", "done for the day", "finished",
+DWRE_EXACT = {"dwre", "/dwre",
               "done with exercise", "done with my exercise", "done with the exercise",
               "done with workout", "done with my workout", "done exercising",
               "finished exercising", "finished my workout", "finished my exercise",
-              "completed my exercise", "done with today's exercise", "i'm done", "im done"}
+              "completed my exercise", "done with today's exercise"}
 DWRE_SUBSTR = ("done with recommended exercise", "done with the recommended exercise",
                "done with all the recommended", "done with my recommended",
                "finished the recommended exercise", "done with today's recommended",
@@ -2469,6 +2847,10 @@ def classify(text):
         return "memory", ""
     if low in ("plan", "/plan", "current plan"):
         return "plan", ""
+    if low in ("pause reminders", "resume reminders"):
+        return "reminders", low
+    if low in ("starting workout", "start workout", "warmup", "warm-up", "cooldown", "cool-down"):
+        return "workout_card", ""
     if low in ("programme", "program", "/programme", "/program", "training programme",
                "training program"):
         return "program", ""
@@ -2491,12 +2873,15 @@ def classify(text):
                "vo2", "vo2max", "race", "races", "race predictions",
                "fitness age", "endurance", "performance stats", "perf"):
         return "performance", ""
-    if low in DWRE_EXACT or any(p in low for p in DWRE_SUBSTR):
-        return "dwre", ""
-    if low in SKIP_EXACT or any(p in low for p in SKIP_SUBSTR):
+    if low in DWRE_EXACT or low in DWRE_SUBSTR:
+        return "dwre", t
+    if re.fullmatch(r"/?dwre\s+(?:yesterday|\d{4}-\d{2}-\d{2})", low):
+        return "dwre", t
+    if re.match(r"^/?dwre\s*[-:]\s*\S", low):
+        return "dwre", t
+    if low in SKIP_EXACT:
         return "skip_exercise", ""
-    if (low == "" or low in SUMMARY_TRIGGERS or low.startswith("gms")
-            or ("morning" in low and "summ" in low)):
+    if low == "" or low in SUMMARY_TRIGGERS:
         return "summary", ""
     return "qa", t
 
@@ -2514,7 +2899,7 @@ def _owner_ok(chat_id):
 
 def _route_text(chat_id, text):
     kind, payload = classify(text)
-    log.info("Message kind=%s text=%r", kind, text[:120])
+    log.info("stage=route kind=%s input_chars=%d", kind, len(text))
     if kind in ("start", "help"):
         send_message(chat_id, HELP_TEXT)
     elif kind == "memory":
@@ -2529,6 +2914,16 @@ def _route_text(chat_id, text):
                  f"(revision {p['revision']}, {p['status']})" for p in plans]
         send_message(chat_id, "AgBot - Dated plans\n" +
                      ("\n".join(lines) if lines else "No structured plan recorded yet."))
+    elif kind == "workout_card":
+        plans = [p["payload"] for p in training_store().context()["plans"]
+                 if p["date"] == coach_clock.today().isoformat()]
+        send_message(chat_id, render_plans(plans) if plans else
+                     "No dated workout is saved for today. Ask for a plan before starting.")
+    elif kind == "reminders":
+        paused = payload.startswith("pause")
+        _atomic_write(os.path.join(STATE, "reminder_settings.json"), json.dumps({"paused": paused}))
+        send_message(chat_id, "Optional reminders paused." if paused else
+                     "Optional reminders resumed. Meal logging remains optional.")
     elif kind in ("program", "program_review"):
         if not PROGRAM_ENABLED:
             send_message(chat_id, "AgBot: programme coaching is not enabled in this installation.")
@@ -2580,7 +2975,7 @@ def _route_text(chat_id, text):
         send_message(chat_id, "\U0001F916 AgBot: pulling your performance metrics...")
         do_performance(chat_id)
     elif kind == "dwre":
-        do_dwre(chat_id)
+        do_dwre(chat_id, payload)
     elif kind == "skip_exercise":
         do_skip_exercise(chat_id)
     elif kind == "summary":
@@ -2667,18 +3062,45 @@ def dispatch(msg):
     _route_text(chat_id, text)
 
 
+_last_sleep_sync_check = 0.0
+
+
+def _auto_summary_sleep_ready(now):
+    """Wait until AUTO_SLEEP_WAIT_UNTIL for overnight sleep to sync before auto-sending
+    the morning brief; after that cutoff, or on any API error, proceed (fail-open)."""
+    global _last_sleep_sync_check
+    if (now.hour, now.minute) >= AUTO_SLEEP_WAIT_UNTIL:
+        return True
+    mono = time.monotonic()
+    if _last_sleep_sync_check and mono - _last_sleep_sync_check < AUTO_SLEEP_POLL_SECS:
+        return False
+    _last_sleep_sync_check = mono
+    try:
+        logged = garmin_coach.sleep_logged_today(now.date())
+    except Exception as exc:  # noqa: BLE001
+        log.warning("sleep_logged_today check failed, proceeding with brief: %s", exc)
+        return True
+    if logged is False:
+        log.info("Auto-summary waiting for overnight sleep sync at %s (cutoff %02d:%02d)",
+                 now.strftime("%H:%M"), AUTO_SLEEP_WAIT_UNTIL[0], AUTO_SLEEP_WAIT_UNTIL[1])
+        return False
+    return True
+
+
 def maybe_auto_summary():
     own = owner()
     if not own:
         return
-    if (read_file(LAST_SUMMARY_FILE).strip() == date.today().isoformat()
-            or runtime_store().summary_delivered(date.today().isoformat())):
+    if (read_file(LAST_SUMMARY_FILE).strip() == coach_clock.today().isoformat()
+            or runtime_store().summary_delivered(coach_clock.today().isoformat())):
         return
-    if runtime_store().summary_pending(date.today().isoformat()):
+    if runtime_store().summary_pending(coach_clock.today().isoformat()):
         return
-    now = datetime.now()
+    now = coach_clock.now()
     cur = (now.hour, now.minute)
     if cur < AUTO_START or cur >= AUTO_END:
+        return
+    if not _auto_summary_sleep_ready(now):
         return
     log.info("Auto-summary trigger at %s", now.strftime("%H:%M"))
     do_summary(own, auto=True)
@@ -2688,17 +3110,8 @@ def _todays_food_log_times(now):
     """Local datetimes of today's journaled food entries. Used to skip a meal nudge
     for a meal that's already been logged (the journal is the bot's own food log)."""
     times = []
-    try:
-        with open(JOURNAL_FILE, "r", encoding="utf-8") as fh:
-            lines = [ln for ln in fh.read().strip().split("\n") if ln]
-    except FileNotFoundError:
-        return times
     today = now.date().isoformat()
-    for ln in lines[-JOURNAL_KEEP:]:
-        try:
-            e = json.loads(ln)
-        except json.JSONDecodeError:
-            continue
+    for e in active_journal_entries()[-JOURNAL_KEEP:]:
         if e.get("date") != today:
             continue
         try:
@@ -2723,40 +3136,141 @@ def _meal_slot_windows():
     return windows
 
 
-_PROTEIN_RE = re.compile(r"(\d+)\s*g\s*(?:of\s+)?protein", re.IGNORECASE)
-_KCAL_RE = re.compile(r"(\d+)\s*k?cal\b", re.IGNORECASE)
+_MACRO_NUM_RE = r"\d+(?:,\d{3})*(?:\.\d+)?"
+_MACRO_SPAN_RE = rf"(?<!\d)(?<!\.)({_MACRO_NUM_RE})(?:\s*(?:[-–—]|to)\s*({_MACRO_NUM_RE}))?"
+_PROTEIN_RE = re.compile(
+    rf"{_MACRO_SPAN_RE}\s*g\s*(?:of\s+)?protein"
+    r"(?!\s*(?:powder|isolate|concentrate|blend|scoop|bar|shake)\b)",
+    re.IGNORECASE,
+)
+_CARBS_RE = re.compile(rf"{_MACRO_SPAN_RE}\s*g\s*(?:of\s+)?carb(?:ohydrate)?s?\b", re.IGNORECASE)
+_FAT_RE = re.compile(
+    rf"(?<!low[- ])(?<!full[- ]){_MACRO_SPAN_RE}\s*g\s*(?:of\s+)?fat\b",
+    re.IGNORECASE,
+)
+_KCAL_RE = re.compile(rf"{_MACRO_SPAN_RE}\s*k?cal\b", re.IGNORECASE)
+
+
+def _macro_midpoint(match):
+    lo = float(match.group(1).replace(",", ""))
+    hi = float(match.group(2).replace(",", "")) if match.group(2) else lo
+    return (lo + hi) / 2.0
+
+
+def _parse_entry_macros(txt):
+    """Conservative legacy reader. Ambiguous aggregates and missing fields stay unknown."""
+    if re.search(r"\b(?:total|combined)\b", txt, re.I) and len(_KCAL_RE.findall(txt)) > 1:
+        return (None, None, None, None)
+    parens = [p for p in re.findall(r"\([^()]*\)", txt) if _KCAL_RE.search(p)]
+    target = " ".join(parens) if parens else txt
+    result = []
+    for pattern, name in ((_KCAL_RE, "kcal"), (_PROTEIN_RE, "protein"),
+                          (_CARBS_RE, "carbs"), (_FAT_RE, "fat")):
+        values = [_macro_midpoint(m) for m in pattern.finditer(target)]
+        if not values and name != "kcal":
+            reverse = re.compile(rf"\b{name}\s*[:=]?\s*~?{_MACRO_SPAN_RE}\s*g\b", re.I)
+            values = [_macro_midpoint(m) for m in reverse.finditer(txt)]
+        result.append(sum(values) if values else None)
+    return tuple(result)
+
+
+def _entry_macros(entry):
+    if entry.get("entry_type") == "structured_meal":
+        return tuple(midpoint(entry["macros"].get(k))
+                     for k in ("kcal", "protein_g", "carbs_g", "fat_g"))
+    return _parse_entry_macros(entry.get("text", ""))
+
+
+def _protein_status(protein_g, calorie_budget):
+    if not isinstance(calorie_budget, dict):
+        return None
+    pr = calorie_budget.get("protein_range_g")
+    if isinstance(pr, dict) and isinstance(pr.get("min"), (int, float)) and isinstance(pr.get("max"), (int, float)):
+        if protein_g < pr["min"]:
+            return "below_range"
+        if protein_g > pr["max"]:
+            return "above_range"
+        return "within_range"
+    pt = calorie_budget.get("protein_target_g")
+    if isinstance(pt, (int, float)) and pt > 0:
+        return "met" if protein_g >= pt else "below_target"
+    return None
+
+
+def rolling_nutrition_summary(days=7, today=None, calorie_budget=None):
+    """Reported intake only. Coverage and unknown macros are never inferred from calories."""
+    d_today = today if isinstance(today, date) else date.fromisoformat(str(today or coach_clock.today())[:10])
+    start_iso = (d_today - timedelta(days=max(1, days) - 1)).isoformat()
+    today_iso = d_today.isoformat()
+    by_day = {}
+    for e in active_journal_entries():
+        day = e.get("date")
+        if not isinstance(day, str) or not (start_iso <= day <= today_iso):
+            continue
+        txt = e.get("text") or ""
+        if txt.lstrip().startswith("[coach plan]"):
+            continue
+        values = _entry_macros(e)
+        bucket = by_day.setdefault(day, {"entries_count": 0, "kcal": [], "protein_g": [],
+                                         "carbs_g": [], "fat_g": []})
+        bucket["entries_count"] += 1
+        for key, value in zip(("kcal", "protein_g", "carbs_g", "fat_g"), values):
+            bucket[key].append(value)
+    coverage = nutrition_store().coverage()
+    rows = []
+    for day in sorted(by_day):
+        b = by_day[day]
+        row = {
+            "date": day,
+            "is_today": day == today_iso,
+            "entries_count": b["entries_count"],
+            "coverage": "user_reported_complete" if coverage.get(day) == "complete" else "partial_or_unconfirmed",
+        }
+        for key in ("kcal", "protein_g", "carbs_g", "fat_g"):
+            row[key] = round(sum(b[key]), 1) if all(v is not None for v in b[key]) else None
+        rows.append(row)
+    completed = [r for r in rows if not r["is_today"] and r["coverage"] == "user_reported_complete"]
+    avg_completed = None
+    if completed:
+        avg_completed = {key: (round(sum(r[key] for r in completed) / len(completed), 1)
+                               if all(r[key] is not None for r in completed) else None)
+                         for key in ("kcal", "protein_g", "carbs_g", "fat_g")}
+    today_row = next((r for r in rows if r["is_today"]), None)
+    return {
+        "window_start": start_iso,
+        "window_end": today_iso,
+        "logged_days_count": len(rows),
+        "completed_logged_days_count": len(completed),
+        "protein_goal_hit_days": None,
+        "completed_days_average": avg_completed,
+        "today_so_far": today_row or {"date": today_iso, "is_today": True, "entries_count": 0,
+                                      "coverage": "unlogged", "kcal": None, "protein_g": None,
+                                      "carbs_g": None, "fat_g": None},
+        "days": rows,
+        "note": NUTRITION_POLICY,
+    }
 
 
 def _todays_food_summary(now):
-    """(count, protein_g, kcal) from today's journal food entries. protein_g / kcal are
+    """(count, protein_g, kcal) from today's active journal food entries. protein_g / kcal are
     best-effort sums of the '~Xg protein' / '~Y kcal' estimates in the auto-log text (0 if
-    none parseable); count excludes '[coach plan]' notes. Lets a meal nudge show real
-    running totals without calling the model."""
-    count = protein = kcal = 0
-    try:
-        with open(JOURNAL_FILE, "r", encoding="utf-8") as fh:
-            lines = [ln for ln in fh.read().strip().split("\n") if ln]
-    except FileNotFoundError:
-        return (0, 0, 0)
+    none parseable); count excludes '[coach plan]' notes and superseded entries. Lets a meal
+    nudge show real running totals without calling the model."""
+    count = 0
+    protein, kcal = [], []
     today = now.date().isoformat()
-    for ln in lines[-JOURNAL_KEEP:]:
-        try:
-            e = json.loads(ln)
-        except json.JSONDecodeError:
-            continue
+    for e in active_journal_entries()[-JOURNAL_KEEP:]:
         if e.get("date") != today:
             continue
         txt = e.get("text") or ""
         if txt.lstrip().startswith("[coach plan]"):
             continue
         count += 1
-        pm = _PROTEIN_RE.search(txt)
-        if pm:
-            protein += int(pm.group(1))
-        km = _KCAL_RE.search(txt)
-        if km:
-            kcal += int(km.group(1))
-    return (count, protein, kcal)
+        entry_kcal, entry_prot, _c, _f = _entry_macros(e)
+        protein.append(entry_prot)
+        kcal.append(entry_kcal)
+    return (count, round(sum(protein)) if all(v is not None for v in protein) else None,
+            round(sum(kcal)) if all(v is not None for v in kcal) else None)
 
 
 def _meal_nudge_text(slot, base_text, now):
@@ -2767,9 +3281,9 @@ def _meal_nudge_text(slot, base_text, now):
     if count <= 0:
         return base_text
     bits = []
-    if protein > 0:
+    if protein is not None and protein > 0:
         bits.append("~%dg protein" % protein)
-    if kcal > 0:
+    if kcal is not None and kcal > 0:
         bits.append("~%d kcal" % kcal)
     if bits:
         head = "\U0001F4CA So far today: " + ", ".join(bits) + " logged.\n"
@@ -2779,11 +3293,13 @@ def _meal_nudge_text(slot, base_text, now):
 
 
 def maybe_meal_reminders():
+    if not MEAL_REMINDERS_ENABLED or not _reminders_allowed():
+        return
     own = owner()
     if not own:
         return
-    now = datetime.now()
-    today = date.today().isoformat()
+    now = coach_clock.now()
+    today = coach_clock.today().isoformat()
     try:
         sent = json.loads(read_file(MEAL_STATE_FILE) or "{}")
     except Exception:  # noqa: BLE001
@@ -2808,7 +3324,8 @@ def maybe_meal_reminders():
         late_min = (now - target).total_seconds() / 60
         if late_min <= MEAL_CATCHUP_MIN:
             log.info("Meal reminder: %s at %s", slot, now.strftime("%H:%M"))
-            send_message(own, _meal_nudge_text(slot, text, now))
+            send_message(own, _meal_nudge_text(slot, text, now),
+                         expires_at=target.timestamp() + MEAL_CATCHUP_MIN * 60)
         else:
             log.info("Meal reminder %s missed window (%.0f min late) - skipping",
                      slot, late_min)
@@ -2816,6 +3333,18 @@ def maybe_meal_reminders():
         changed = True
     if changed:
         write_file(MEAL_STATE_FILE, json.dumps(sent))
+
+
+def _reminders_allowed():
+    settings = json.loads(read_file(os.path.join(STATE, "reminder_settings.json")) or "{}")
+    if settings.get("paused"):
+        return False
+    start = int(os.environ.get("AGBOT_QUIET_START_HOUR", "22"))
+    end = int(os.environ.get("AGBOT_QUIET_END_HOUR", "8"))
+    if not 0 <= start <= 23 or not 0 <= end <= 23:
+        raise ValueError("Quiet-hour settings must be hours from 0 to 23.")
+    hour = coach_clock.now().hour
+    return not (start <= hour < end if start < end else hour >= start or hour < end) if start != end else True
 
 
 def hydration_slots_due(now, sent, today):
@@ -2855,8 +3384,10 @@ def _hydration_on_pace(hour, logged_ml, goal_ml):
         return False
     span = max(1, HYDRATION_END - HYDRATION_START)
     frac = min(1.0, max(0.0, (hour - HYDRATION_START) / span))
+    if logged_ml >= goal_ml:
+        return True
     if frac <= 0:
-        return False  # first slot of the day: always nudge to kick hydration off
+        return logged_ml > 0
     return logged_ml >= goal_ml * frac
 
 
@@ -2888,11 +3419,13 @@ def _hydration_nudge_text(hour, logged_ml, goal_ml, fallback):
 
 
 def maybe_hydration_reminders():
+    if not _reminders_allowed():
+        return
     own = owner()
     if not own:
         return
-    now = datetime.now()
-    today = date.today().isoformat()
+    now = coach_clock.now()
+    today = coach_clock.today().isoformat()
     try:
         sent = json.loads(read_file(HYDRATION_STATE_FILE) or "{}")
     except Exception:  # noqa: BLE001
@@ -2903,6 +3436,9 @@ def maybe_hydration_reminders():
     if not due:
         return
     logged_ml, goal_ml = _hydration_progress()
+    if logged_ml is None or goal_ml is None:
+        log.info("stage=hydration unknown intake/goal; no deficit-based nudge")
+        return
     changed = False
     for idx, slot, hh, should in due:
         if should and _hydration_on_pace(hh, logged_ml, goal_ml):
@@ -2911,7 +3447,9 @@ def maybe_hydration_reminders():
             log.info("Hydration reminder %s at %s (%s/%s ml)", slot,
                      now.strftime("%H:%M"), logged_ml, goal_ml)
             send_message(own, _hydration_nudge_text(
-                hh, logged_ml, goal_ml, HYDRATION_MESSAGES[idx % len(HYDRATION_MESSAGES)]))
+                hh, logged_ml, goal_ml, HYDRATION_MESSAGES[idx % len(HYDRATION_MESSAGES)]),
+                expires_at=now.replace(hour=hh, minute=0, second=0).timestamp()
+                + HYDRATION_CATCHUP_MIN * 60)
         else:
             log.info("Hydration %s missed window - skipping", slot)
         sent[slot] = today
@@ -2935,13 +3473,13 @@ def _load_exercise_state():
             d = json.load(fh)
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
-    if not isinstance(d, dict) or d.get("date") != date.today().isoformat():
+    if not isinstance(d, dict) or d.get("date") != coach_clock.today().isoformat():
         return {}   # stale day -> fresh 'pending' state
     return d
 
 
 def _save_exercise_state(d):
-    d["date"] = date.today().isoformat()
+    d["date"] = coach_clock.today().isoformat()
     _atomic_write(EXERCISE_STATE_FILE, json.dumps(d))
 
 
@@ -2955,10 +3493,16 @@ def _set_exercise_status(status):
     _save_exercise_state(st)
 
 
+def _is_rest_or_recovery_plan(plan):
+    if not isinstance(plan, dict):
+        return False
+    return plan.get("kind") in ("rest", "recovery") or bool(plan.get("rotation_defer"))
+
+
 def _set_coach_rest(flag):
-    """Record whether TODAY's morning brief prescribed a genuine rest/recovery day, so the
-    adherence check-ins go rest-aware instead of nagging. Cleared if a later brief the same
-    day prescribes a workout."""
+    """Record whether TODAY's plan prescribed rest/recovery (or deferred the pending session),
+    so exercise-adherence check-ins stay quiet for the day. Cleared if a later plan the same
+    day prescribes an active workout."""
     st = _load_exercise_state()
     if flag:
         st["coach_rest"] = True
@@ -2966,6 +3510,21 @@ def _set_coach_rest(flag):
         st.pop("coach_rest", None)
         st.pop("rest_note_sent", None)
     _save_exercise_state(st)
+
+
+def _coach_prescribed_rest_today(st=None):
+    st = _load_exercise_state() if st is None else st
+    if st.get("coach_rest"):
+        return True
+    today_iso = coach_clock.today().isoformat()
+    try:
+        plans = training_store().context().get("plans") or []
+    except Exception:  # noqa: BLE001
+        plans = []
+    for row in plans:
+        if row.get("date") == today_iso:
+            return _is_rest_or_recovery_plan(row.get("payload"))
+    return False
 
 
 def exercise_checkin_slots_due(now, asked, catchup_min=EXERCISE_CHECKIN_CATCHUP_MIN):
@@ -3004,28 +3563,20 @@ def _exercise_rest_message():
 
 
 def maybe_exercise_checkins():
+    if not _reminders_allowed():
+        return
     own = owner()
     if not own:
         return
     st = _load_exercise_state()
     if st.get("status") in ("done", "skip", "stated"):
         return  # resolved for today (finished, opted out, or they've told me their plan)
-    now = datetime.now()
-    asked = list(st.get("asked") or [])
-    # The coach itself prescribed rest today -> send ONE gentle rest-aware note (not the
-    # 'did you exercise?' nag), then stay quiet for the rest of the day.
-    if st.get("coach_rest"):
-        if st.get("rest_note_sent"):
-            return
-        due = exercise_checkin_slots_due(now, asked)
-        if not due:
-            return  # first check-in hour not reached yet
-        if any(should for _s, _h, should in due):
-            log.info("Exercise rest-day note at %s", now.strftime("%H:%M"))
-            send_message(own, _exercise_rest_message())
-        st["rest_note_sent"] = True
-        _save_exercise_state(st)
+    # When the coach itself prescribed rest / recovery / rotation deferral today, stay
+    # completely quiet - never nudge about logging or completing a workout.
+    if _coach_prescribed_rest_today(st):
         return
+    now = coach_clock.now()
+    asked = list(st.get("asked") or [])
     changed = False
     for slot, hh, should in exercise_checkin_slots_due(now, asked):
         if should:
@@ -3033,17 +3584,20 @@ def maybe_exercise_checkins():
             # a morning/evening commute ride or a gym session), don't ask 'did you exercise?'.
             # Leave status untouched so the post-workout auto-debrief still wraps up each
             # session. Fails open (asks) if the check errors.
-            already_trained = False
+            already_trained = None
             try:
                 already_trained = garmin_coach.trained_today()
             except Exception as exc:  # noqa: BLE001
-                log.error("trained_today check failed, asking anyway: %s", exc)
-            if already_trained:
+                log.warning("stage=exercise data unavailable; suppressing check-in (%s)", type(exc).__name__)
+            if already_trained is None:
+                log.info("stage=exercise unknown activity coverage; staying quiet")
+            elif already_trained:
                 log.info("Exercise check-in %s at %s - already trained today, staying quiet",
                          slot, now.strftime("%H:%M"))
             else:
                 log.info("Exercise check-in %s at %s", slot, now.strftime("%H:%M"))
-                send_message(own, _exercise_checkin_message())
+                send_message(own, _exercise_checkin_message(),
+                             expires_at=time.time() + EXERCISE_CHECKIN_CATCHUP_MIN * 60)
         else:
             log.info("Exercise check-in %s missed window - skipping", slot)
         asked.append(slot)
@@ -3079,7 +3633,7 @@ def maybe_post_workout():
         write_file(LAST_ACTIVITY_FILE, aid)
         if not seen:
             return  # first run - baseline only, don't debrief a historical activity
-        if _exercise_status() in ("done", "skip"):
+        if _exercise_status() in ("done", "skip") and not pend:
             # The user already got their DWRE wrap-up (or opted out) for today. An activity that
             # finishes syncing to Garmin just AFTER they pressed DWRE must NOT re-arm the auto-
             # debrief - that race produced a duplicate collective debrief ~90 min later. Just
@@ -3088,26 +3642,26 @@ def maybe_post_workout():
                      aid, _exercise_status())
             return
         log.info("New activity %s (%s) - queuing collective debrief", aid, act.get("type"))
-        pend["last_ts"] = now
-        _save_pending(pend)
+        _save_pending({"last_ts": now, "date": str(act.get("start", ""))[:10]})
         return
     # No new activity. If a session is pending and it's been quiet long enough, send the one
     # collective debrief for the whole just-finished block.
     if pend and (now - float(pend.get("last_ts", 0) or 0) >= DEBRIEF_QUIET_SECS):
-        if _exercise_status() in ("done", "skip"):
-            _clear_pending()  # already debriefed via DWRE / opted out today - never duplicate
+        if (pend.get("date") == coach_clock.today().isoformat()
+                and _exercise_status() == "skip" and not pend.get("user_requested")):
+            _clear_pending(pend["date"])
             return
-        block = garmin_coach.session_block()
+        day = pend.get("date") or coach_clock.today().isoformat()
+        block = garmin_coach.session_block(target_day=date.fromisoformat(day))
         if isinstance(block, dict) and "__error__" in block:
             log.error("session_block error, will retry next poll: %s", block.get("__error__"))
             return  # keep pending; retry
         if block:
             log.info("Quiet for %dm - collective debrief of %d activities",
                      DEBRIEF_QUIET_SECS // 60, len(block))
-            text = generate_debrief(block)
-            if text:
-                send_message(own, text)
-                _clear_pending()
+            _deliver_debrief(own, block, day, source_text=pend.get("source_text", ""))
+        else:
+            _save_pending(dict(pend, last_ts=now - DEBRIEF_QUIET_SECS + ACTIVITY_CHECK_SECS))
 
 
 def evaluate_red_flags(snap):
@@ -3132,7 +3686,7 @@ def maybe_red_flags():
     own = owner()
     if not own:
         return
-    today = date.today().isoformat()
+    today = coach_clock.today().isoformat()
     if read_file(RED_FLAGS_FILE).strip() == today:
         return
     if (read_file(LAST_SUMMARY_FILE).strip() == today
@@ -3140,7 +3694,7 @@ def maybe_red_flags():
             or runtime_store().summary_pending(today)):
         write_file(RED_FLAGS_FILE, today)  # the brief already covers this ground
         return
-    now = datetime.now()
+    now = coach_clock.now()
     cur = (now.hour, now.minute)
     if cur < (5, 30) or cur >= AUTO_START:
         return
@@ -3177,9 +3731,13 @@ def acquire_singleton_lock():
 
 
 def _poll_messages():
+    global _poll_progress
     delay = 5
     while not _stop.is_set():
         try:
+            if _draining.is_set():
+                _stop.wait(1)
+                continue
             params = {"timeout": POLL_TIMEOUT}
             offset = runtime_store().offset(get_offset())
             if offset is not None:
@@ -3188,7 +3746,12 @@ def _poll_messages():
             if not response.get("ok"):
                 raise RuntimeError(response.get("description", "Telegram poll rejected"))
             runtime_store().ingest(response.get("result", []))
+            _poll_progress = time.time()
             delay = 5
+        except (http.client.RemoteDisconnected, urllib.error.URLError, TimeoutError, ConnectionResetError) as exc:
+            log.warning("stage=poll reconnecting error_type=%s; cursor retained", type(exc).__name__)
+            _stop.wait(delay)
+            delay = min(60, delay * 2)
         except Exception:
             log.exception("stage=poll failed; durable cursor retained")
             _stop.wait(delay)
@@ -3196,18 +3759,33 @@ def _poll_messages():
 
 
 def _publish_messages():
+    global _publisher_progress
     while not _stop.is_set():
         try:
             flush_outbox()
+            _publisher_progress = time.time()
         except Exception:
             log.exception("stage=outbox failed; pending messages retained")
         _stop.wait(2)
 
 
 def _health_report():
+    now = time.time()
+    busy = _worker_started is not None
+    components = {
+        "poller": _poll_progress is not None and (_draining.is_set() or now - _poll_progress < 180),
+        "outbox": _publisher_progress is not None and now - _publisher_progress < 30,
+        "worker": (now - (_worker_started or _last_progress)) < max(360, COPILOT_TIMEOUT * 2 + 60),
+        "scheduler": (now - (_worker_started or _last_progress)) < max(360, COPILOT_TIMEOUT * 2 + 60),
+    }
     report = {
         "status": ("degraded" if _llm_last_error else
-                   "busy" if _current_request else "ready"),
+                   "busy" if busy else "ready"),
+        "ready": all(components.values()) and not _llm_last_error,
+        "components": components,
+        "worker_busy": busy,
+        "scheduled_jobs_busy": _scheduled_job is not None,
+        "draining": _draining.is_set(),
         "model": COPILOT_MODEL, "reasoning": COPILOT_REASONING_EFFORT,
         "active_model": _llm_active_model,
         "fallback_models": list(COPILOT_FALLBACK_MODELS),
@@ -3217,9 +3795,12 @@ def _health_report():
                                 if _worker_started else 0),
         "last_progress_age_seconds": round(time.time() - _last_progress),
         "queues": runtime_store().counts(),
+        "queue_health": runtime_store().queue_health(),
     }
+    if not report["ready"]:
+        report["status"] = "degraded"
     if PROGRAM_ENABLED:
-        context = _program_context()
+        context = program_store().peek_context()
         active = context.get("active") or {}
         report["programme"] = {
             "enabled": True, "revision": active.get("revision"),
@@ -3240,6 +3821,13 @@ def _serve_health(listener):
             connection.settimeout(2)
             try:
                 request = connection.recv(4096)
+                if request.startswith(b"POST /drain ") or request.startswith(b"POST /resume "):
+                    if request.startswith(b"POST /drain "):
+                        _draining.set()
+                    else:
+                        _draining.clear()
+                    connection.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK")
+                    continue
                 if not request.startswith(b"GET /health "):
                     connection.sendall(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
                     continue
@@ -3265,6 +3853,7 @@ def _process_request(item):
 
 def main():
     global _current_request, _send_sequence, _generation_sequence, _worker_started, _last_progress
+    global _poll_progress, _publisher_progress, _request_deadline, _scheduled_job
     listener = acquire_singleton_lock()
     if not os.path.isfile(PROFILE_FILE):
         raise FileNotFoundError("Create your private profile first: " + PROFILE_FILE)
@@ -3273,7 +3862,11 @@ def main():
     training_store()
     if PROGRAM_ENABLED:
         program_store()
+        _rotation_context(reconcile=True)
     me = tg("getMe")
+    if not me.get("ok"):
+        raise RuntimeError("Telegram startup check failed.")
+    _poll_progress = _publisher_progress = time.time()
     log.info("AgBot online as @%s", me.get("result", {}).get("username"))
     log.info("LLM model=%s reasoning-effort=%s release=%s",
              COPILOT_MODEL or "(CLI default)", COPILOT_REASONING_EFFORT,
@@ -3282,6 +3875,7 @@ def main():
                          (_serve_health, (listener,))):
         threading.Thread(target=target, args=args, daemon=True).start()
     next_schedule = 0
+    job_index = 0
     jobs = (maybe_program_review, maybe_auto_summary, maybe_red_flags, maybe_post_workout, maybe_meal_reminders,
             maybe_hydration_reminders, maybe_exercise_checkins)
     while not _stop.is_set():
@@ -3290,6 +3884,7 @@ def main():
             _current_request = item["id"]
             _send_sequence = _generation_sequence = 0
             _worker_started = time.time()
+            _request_deadline = time.monotonic() + max(300, COPILOT_TIMEOUT * 2)
             try:
                 _process_request(item)
                 runtime_store().finish(item["id"])
@@ -3311,16 +3906,27 @@ def main():
                          time.time() - _worker_started)
                 _current_request = None
                 _worker_started = None
+                _request_deadline = None
                 _last_progress = time.time()
             continue
-        if time.time() >= next_schedule:
+        if not _draining.is_set() and time.time() >= next_schedule:
             _set_msg_sent_at(None)
-            for job in jobs:
-                try:
-                    job()
-                except Exception:
-                    log.exception("stage=scheduler job=%s failed; next tick will retry", job.__name__)
-            next_schedule = time.time() + 60
+            job = jobs[job_index]
+            _scheduled_job = job.__name__
+            _current_request = f"scheduled:{job.__name__}:{int(time.time() // 60)}"
+            _send_sequence = _generation_sequence = 0
+            _worker_started = time.time()
+            _request_deadline = time.monotonic() + max(300, COPILOT_TIMEOUT * 2)
+            try:
+                job()
+            except Exception:
+                log.exception("stage=scheduler job=%s failed; next tick will retry", job.__name__)
+            finally:
+                _scheduled_job = _current_request = _worker_started = _request_deadline = None
+                job_index = (job_index + 1) % len(jobs)
+                next_schedule = time.time() + (60 if job_index == 0 else 0)
+                _last_progress = time.time()
+        if _draining.is_set():
             _last_progress = time.time()
         _stop.wait(1)
 
@@ -3371,10 +3977,10 @@ if __name__ == "__main__":
         print(text)
         sys.exit(0)
     if "--selftest-hydration" in sys.argv:
-        _t = date.today().isoformat()
+        _t = coach_clock.today().isoformat()
 
         def _hy(h, m, sent=None):
-            return hydration_slots_due(datetime.now().replace(hour=h, minute=m, second=0,
+            return hydration_slots_due(coach_clock.now().replace(hour=h, minute=m, second=0,
                                                                microsecond=0), sent or {}, _t)
         assert _hy(7, 59) == [], "pre-8am must be empty"
         _d8 = _hy(8, 0)
@@ -3389,7 +3995,7 @@ if __name__ == "__main__":
         sys.exit(0)
     if "--selftest-checkin" in sys.argv:
         def _ck(h, m, asked=None):
-            return exercise_checkin_slots_due(datetime.now().replace(hour=h, minute=m, second=0,
+            return exercise_checkin_slots_due(coach_clock.now().replace(hour=h, minute=m, second=0,
                                                                      microsecond=0), asked or [])
         # Derive expected slots from EXERCISE_CHECKIN_HOURS so the test self-adjusts if the
         # schedule ever changes (the previous fixture hard-coded a since-removed 10am slot).

@@ -139,6 +139,78 @@ def lactate_metric(payload, today, history=None):
     return out
 
 
+def fitness_age_components(components):
+    """Normalize Garmin's fitness-age levers (BMI, vigorous mins/days, RHR) when supplied."""
+    if not isinstance(components, dict):
+        return None
+    out = {}
+    for key in ("bmi", "vigorousMinutesAvg", "vigorousDaysAvg", "rhr"):
+        raw = components.get(key)
+        if not isinstance(raw, dict):
+            continue
+        pot = raw.get("potentialAge")
+        item = {k: v for k, v in {
+            "value": round(raw["value"], 1) if number(raw.get("value")) else raw.get("value"),
+            "target_value": (round(raw["targetValue"], 1)
+                             if number(raw.get("targetValue")) else raw.get("targetValue")),
+            "improvement_value": (round(raw["improvementValue"], 1)
+                                  if number(raw.get("improvementValue")) else raw.get("improvementValue")),
+            "potential_fitness_age": round(pot, 1) if number(pot) else None,
+            "priority": raw.get("priority"),
+            "stale": raw.get("stale"),
+            "weeks_window": raw.get("numOfWeeksForIm"),
+            "last_measurement_date": raw.get("lastMeasurementDate"),
+        }.items() if v is not None}
+        if item:
+            out[key] = item
+    return out or None
+
+
+def acclimation_metric(payload, today):
+    """Normalize heat and altitude acclimation from get_max_metrics(date)."""
+    status = payload_status(payload)
+    out = {
+        "status": status,
+        "source": "garmin.get_max_metrics",
+        "note": ("Garmin populates heat/altitude acclimation only after outdoor activities "
+                 "in heat (>22C) or at altitude; decays to 0 without continued exposure."),
+    }
+    row = payload[0] if isinstance(payload, list) and payload else payload
+    if status != "available" or not isinstance(row, dict):
+        if out["status"] == "available":
+            out["status"] = "unavailable"
+        return out
+    acc = row.get("heatAltitudeAcclimation") or row.get("heatAltitudeAcclimationDTO")
+    if not isinstance(acc, dict) or not acc:
+        out["status"] = "unavailable"
+        return out
+    heat = acc.get("heatAcclimationPercentage")
+    prev_heat = acc.get("previousHeatAcclimationPercentage")
+    alt = acc.get("altitudeAcclimation")
+    prev_alt = acc.get("previousAltitudeAcclimation")
+    as_of = (acc.get("calendarDate") or acc.get("heatAcclimationDate")
+             or acc.get("altitudeAcclimationDate"))
+    out.update(
+        status="available",
+        **freshness(as_of, today),
+        **{k: v for k, v in {
+            "heat_acclimation_pct": heat if number(heat) else None,
+            "previous_heat_acclimation_pct": prev_heat if number(prev_heat) else None,
+            "heat_acclimation_change_pct": (round(heat - prev_heat, 1)
+                                           if number(heat) and number(prev_heat) else None),
+            "heat_trend": acc.get("heatTrend"),
+            "heat_acclimation_date": acc.get("heatAcclimationDate"),
+            "altitude_acclimation_m": alt if number(alt) else None,
+            "previous_altitude_acclimation_m": prev_alt if number(prev_alt) else None,
+            "altitude_trend": acc.get("altitudeTrend"),
+            "current_altitude_m": acc.get("currentAltitude") if number(acc.get("currentAltitude")) else None,
+            "acclimation_pct": (acc.get("acclimationPercentage")
+                                if number(acc.get("acclimationPercentage")) else None),
+        }.items() if v is not None},
+    )
+    return out
+
+
 _ACTIVITY_FIELDS = {
     "power": ("averagePower", "maxPower", "minPower", "normalizedPower", "avgPower"),
     "running_dynamics": ("groundContactTime", "groundContactBalance", "strideLength",
@@ -147,6 +219,7 @@ _ACTIVITY_FIELDS = {
     "self_evaluation": ("directWorkoutFeel", "directWorkoutRpe", "workoutFeel", "workoutRpe",
                         "selfEvaluation", "perceivedEffort"),
     "fuel_energy": ("calories", "bmrCalories"),
+    "recovery": ("recoveryHeartRate",),
 }
 
 
@@ -194,7 +267,8 @@ def activity_metrics(summary, details=None):
         dto = {}
     descriptors = (details.get("metricDescriptors") or []) if isinstance(details, dict) else []
     for group, fields in _ACTIVITY_FIELDS.items():
-        values = {k: {"value": dto[k], "unit": "W" if group == "power" else None,
+        unit = "W" if group == "power" else "bpm" if group == "recovery" else None
+        values = {k: {"value": dto[k], "unit": unit,
                        "source_field": "summaryDTO." + k}
                   for k in fields if dto.get(k) is not None}
         out["groups"][group] = {"status": "available" if values else "unavailable", "values": values}

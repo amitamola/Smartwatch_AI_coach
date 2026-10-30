@@ -4,10 +4,14 @@ This is bookkeeping and constraint enforcement, not a medical readiness engine.
 """
 
 import json
+import hashlib
+import math
 import re
 import sqlite3
 from contextlib import contextmanager
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
+
+import coach_clock
 
 
 PLAN_MARKER = re.compile(r"\[\[SESSION_PLAN:\s*(.*?)\]\]", re.DOTALL | re.IGNORECASE)
@@ -20,7 +24,9 @@ def canonical_exercise(name):
     name = re.sub(r"\b(?:standard|normal|conventional)\b", "", name)
     if re.search(r"\bdeadlifts?\b", name):
         name = re.sub(r"\bdeadlifts\b", "deadlift", name)
-        name = re.sub(r"\b(?:with\s+)?(?:dumbbells?|barbells?|db)\b", "", name)
+    name = re.sub(r"\b(?:dumbbells|db)\b", "dumbbell", name)
+    name = re.sub(r"\bbarbells\b", "barbell", name)
+    name = re.sub(r"^(.+?)\s+with\s+(?:a\s+)?(dumbbell|barbell)$", r"\2 \1", name)
     return " ".join(name.split())
 
 
@@ -38,6 +44,10 @@ def exercise_excluded(name, preferences):
     canonical = canonical_exercise(name)
     if canonical in avoided_exercises(preferences):
         return True
+    # A generic deadlift exclusion covers apparatus variants, not single-leg variants.
+    generic = re.sub(r"\b(?:with\s+)?(?:dumbbell|barbell)\b", "", canonical)
+    if "deadlift" in canonical and " ".join(generic.split()) in avoided_exercises(preferences):
+        return True
     for record in preferences:
         key = record.get("key", "")
         if record.get("status", "active") == "active" and key.startswith("avoid_family:"):
@@ -47,8 +57,172 @@ def exercise_excluded(name, preferences):
     return False
 
 
-def parse_plans(text, preferences=(), today=None, existing_plans=()):
-    today = today or date.today()
+def prescription_identity(plan):
+    """Versioned identity of intent, excluding cosmetic prose and forecast bookkeeping."""
+    cosmetic = {"objective", "reason", "program_adjustment", "program_revision",
+                "rotation_slot", "rotation_defer", "projection_status", "projection_reason"}
+    content = {key: value for key, value in plan.items() if key not in cosmetic}
+    encoded = json.dumps(content, sort_keys=True, ensure_ascii=False, allow_nan=False)
+    return "v1:" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def completion_matches(plan, report):
+    if not report or report.get("status", "user_completed") != "user_completed":
+        return False
+    identity = report.get("prescription_id_at_report")
+    if identity:
+        current = plan.get("prescription_id")
+        if current is None:
+            try:
+                current = prescription_identity(plan["payload"])
+            except (TypeError, ValueError):
+                return False
+        return identity == current
+    return report.get("plan_revision_at_report") == plan["revision"]
+
+
+_PHASES = ("warmup", "main", "cooldown")
+_PHASE_ALIASES = {"work": "main", "working": "main", "working_set": "main",
+                  "ramp_up": "warmup", "ramp-up": "warmup"}
+_DOSE_NUMBERS = {
+    "weight_kg": (0, None), "rest_seconds": (0, None),
+    "duration_seconds": (0, None), "duration_minutes": (0, None),
+    "distance_meters": (0, None), "distance_km": (0, None),
+    "rpe": (0, 10), "rir": (0, None), "target_hr_bpm": (1, None),
+    "hr_zone": (1, 5), "speed_kph": (0, None), "cadence_rpm": (0, None),
+    "incline_percent": (-100, 100),
+}
+_DOSE_COUNTS = {"repeats", "repetitions", "rounds", "hr_zone"}
+_DOSE_TEXT = {"effort", "tempo", "target", "notes"}
+_DOSE_ROLES = set(_PHASES) | set(_PHASE_ALIASES) | {"rest", "recovery"}
+
+
+def _number(value, field, minimum=0, maximum=None, integer=False):
+    if value is None:
+        return
+    if (isinstance(value, bool) or not isinstance(value, (int, float))
+            or not math.isfinite(value) or value < minimum
+            or (maximum is not None and value > maximum)
+            or (integer and (not isinstance(value, int)))):
+        raise ValueError(f"{field} must be a finite {'integer' if integer else 'number'} "
+                         f"in its supported range, or null when unknown")
+
+
+def _phase(exercise, item=None):
+    item = item or {}
+    value = item.get("phase") or item.get("role") or item.get("type")
+    if value not in _DOSE_ROLES:
+        value = exercise.get("phase") or exercise.get("role")
+    return _PHASE_ALIASES.get(value, value) if value in _DOSE_ROLES else "main"
+
+
+def _validate_dose(item):
+    if not isinstance(item, dict) or not item:
+        raise ValueError("every prescribed set or block must be a nonempty object")
+    for key, value in item.items():
+        if key == "reps":
+            if isinstance(value, str):
+                match = re.fullmatch(r"([1-9]\d*)-([1-9]\d*)", value)
+                if not match or int(match[1]) > int(match[2]):
+                    raise ValueError("reps must be a positive integer, ordered integer range, or null")
+            else:
+                _number(value, key, 1, integer=True)
+        elif key in _DOSE_NUMBERS:
+            _number(value, key, *_DOSE_NUMBERS[key], integer=key in _DOSE_COUNTS)
+            if value == 0 and key in ("duration_seconds", "duration_minutes",
+                                     "distance_meters", "distance_km"):
+                raise ValueError(key + " must be positive, or null when unknown")
+        elif key in _DOSE_COUNTS:
+            _number(value, key, 1, integer=True)
+        elif key in ("phase", "role", "type"):
+            if value not in (_PHASES if key == "phase" else _DOSE_ROLES):
+                raise ValueError("unsupported set/block " + key)
+        elif key in _DOSE_TEXT:
+            if value is not None and (not isinstance(value, str) or not value.strip()):
+                raise ValueError(key + " must be meaningful text or null")
+        else:
+            raise ValueError("unsupported dose/unit field: " + key)
+    if not set(item) & {"reps", "duration_seconds", "duration_minutes",
+                        "distance_meters", "distance_km"}:
+        raise ValueError("a set or block needs an explicit dose field (null if unknown)")
+    for first, second in (("duration_seconds", "duration_minutes"),
+                          ("distance_meters", "distance_km")):
+        if item.get(first) is not None and item.get(second) is not None:
+            raise ValueError("use only one unit for " + first.split("_")[0])
+
+
+def _validate_prescription(plan, require_phases, constraints):
+    for field in ("duration_minutes", "max_duration_minutes"):
+        if field in plan:
+            _number(plan[field], field, 0)
+    constraints = constraints or {}
+    limit = constraints.get("max_duration_minutes")
+    if limit is not None:
+        _number(limit, "max_duration_minutes", 0)
+    limits = [n for n in (limit, plan.get("duration_minutes"),
+                          plan.get("max_duration_minutes")) if n is not None]
+    if limit is not None and plan.get("duration_minutes") is not None and plan["duration_minutes"] > limit:
+        raise ValueError("plan exceeds the available duration")
+    available = constraints.get("available_equipment")
+    if available is not None:
+        if not isinstance(available, (list, tuple, set)) or any(not isinstance(x, str) for x in available):
+            raise ValueError("available_equipment must be a collection of equipment names")
+        available = {x.strip().casefold() for x in available} | {"none", "bodyweight"}
+    phases, timed_seconds = [], 0
+    detailed = (plan.get("detail_level", "prescription") == "prescription"
+                and plan.get("delivery", "self_directed") == "self_directed")
+    strict = require_phases and detailed and plan["kind"] in ("strength", "cardio", "mixed")
+    for exercise in plan.get("exercises", []):
+        if "phase" in exercise and exercise["phase"] not in _PHASES:
+            raise ValueError("exercise phase must be warmup, main or cooldown")
+        if exercise.get("weight_basis") not in (None, "unspecified", "per_hand", "total",
+                                               "machine_stack", "bodyweight", "per_side",
+                                               "added_load", "assistance"):
+            raise ValueError("unsupported weight_basis")
+        for field in ("effort",):
+            if exercise.get(field) is not None and (
+                    not isinstance(exercise[field], str) or not exercise[field].strip()):
+                raise ValueError(field + " must be meaningful text or null")
+        equipment = exercise.get("equipment", [])
+        if isinstance(equipment, str):
+            equipment = [equipment]
+        if equipment is None:
+            equipment = []
+        if not isinstance(equipment, list) or any(not isinstance(x, str) or not x.strip() for x in equipment):
+            raise ValueError("equipment must be a name, list of names, or null")
+        if available is not None and any(x.strip().casefold() not in available for x in equipment):
+            raise ValueError("exercise requires unavailable equipment")
+        items = exercise.get("sets", []) + exercise.get("blocks", [])
+        if strict and not items:
+            raise ValueError("a detailed exercise needs sets or timed/distance blocks")
+        for item in items:
+            _validate_dose(item)
+            phase = _phase(exercise, item)
+            if phase in _PHASES:
+                phases.append(phase)
+            multiplier = 1
+            for key in ("repeats", "repetitions", "rounds"):
+                multiplier *= item.get(key) or 1
+            timed_seconds += multiplier * ((item.get("duration_seconds") or 0)
+                                          + 60 * (item.get("duration_minutes") or 0)
+                                          + (item.get("rest_seconds") or 0))
+        if not items and exercise.get("phase") in _PHASES:
+            phases.append(exercise["phase"])
+    if strict and (set(phases) != set(_PHASES)
+                   or phases != sorted(phases, key=_PHASES.index)):
+        raise ValueError("detailed self-directed training needs ordered warmup, main and cooldown phases")
+    if limits and timed_seconds > min(limits) * 60:
+        raise ValueError("prescribed timed work/rest exceeds the available duration")
+
+
+def parse_plans(text, preferences=(), today=None, existing_plans=(), require_phases=False,
+                constraints=None):
+    """Validate new intent; strict phases are opt-in, historical reads stay compatible.
+
+    constraints accepts source-backed max_duration_minutes and available_equipment.
+    It never derives constraints from absent food logs or other missing evidence.
+    """
+    today = today or coach_clock.today()
     plans, errors = [], []
     raw_plans = PLAN_MARKER.findall(text or "")
     existing = {row["date"]: row.get("payload", row) for row in existing_plans}
@@ -135,6 +309,12 @@ def parse_plans(text, preferences=(), today=None, existing_plans=()):
                     raise ValueError("an outline must not contain placeholder working sets or blocks")
                 if exercise_excluded(exercise["name"], preferences):
                     raise ValueError("plan contains a movement the user explicitly excluded")
+            _validate_prescription(plan, require_phases, constraints)
+            claims = unsupported_claims(render_plans([plan]))
+            # Outlines omit their reason and guidance in the compact rendered card.
+            claims += unsupported_claims(json.dumps(plan, ensure_ascii=False))
+            if claims:
+                raise ValueError("; ".join(dict.fromkeys(claims)))
             plans.append(plan)
         except (ValueError, TypeError, KeyError) as exc:
             errors.append(str(exc))
@@ -146,10 +326,18 @@ def parse_plans(text, preferences=(), today=None, existing_plans=()):
 def render_plans(plans):
     """Render the validated prescription; hidden JSON must not hide working sets."""
     sections, upcoming = [], []
+    today = coach_clock.today()
     for plan in plans:
         day = date.fromisoformat(plan["date"])
-        label = "Today" if day == date.today() else day.strftime("%a %d %b")
-        if plan.get("delivery") == "instructor_led" and day == date.today():
+        label = "Today" if day == today else day.strftime("%a %d %b")
+        if plan.get("projection_status") == "needs_replanning":
+            sections.append(
+                f"**{label} · Needs replanning**\n"
+                "Previously proposed: " + plan["objective"] + "\n"
+                "**Retained history only — not an active prescription.**\n"
+                + plan.get("projection_reason", "Confirm an updated plan before training."))
+            continue
+        if plan.get("delivery") == "instructor_led" and day == today:
             lines = ["**Today · Instructor-led session**",
                      plan["objective"] + (f" · {plan['start_time']}" if plan.get("start_time") else ""),
                      "**Why:** " + plan["reason"],
@@ -157,7 +345,7 @@ def render_plans(plans):
             lines.extend("- " + g for g in plan["participation_guidance"])
             sections.append("\n".join(lines))
             continue
-        if plan.get("detail_level") == "outline" or (day > date.today() and not plan.get("exercises")):
+        if plan.get("detail_level") == "outline" or (day > today and not plan.get("exercises")):
             objective = re.sub(r"\s*\(provisional outline\)", "", plan["objective"],
                                flags=re.IGNORECASE)
             start = f" · {plan['start_time']}" if plan.get("start_time") else ""
@@ -166,12 +354,31 @@ def render_plans(plans):
         icon = "\U0001F33F" if plan["kind"] == "rest" else "\U0001F4CB"
         lines = [f"**{icon} {label} \u00b7 {plan['kind'].title()} plan**",
                  plan["objective"], "**Why:** " + plan["reason"]]
+        previous_phase = None
         for number, exercise in enumerate(plan.get("exercises", []), 1):
+            items = exercise.get("sets", []) + exercise.get("blocks", [])
+            phase = _phase(exercise, items[0] if items else None)
+            if phase != previous_phase:
+                lines.append("\n**" + {"warmup": "Warm-up / ramp-up", "main": "Main session",
+                                       "cooldown": "Cool-down"}.get(phase, phase.title()) + "**")
+                previous_phase = phase
             lines.extend(["", f"**{number}. {exercise['name']}**"])
             basis = exercise.get("weight_basis", "unspecified")
+            previous_set_phase = None
             for index, prescription in enumerate(exercise.get("sets", []), 1):
+                phase = _phase(exercise, prescription)
+                if phase != previous_phase:
+                    lines.append("**" + {"warmup": "Warm-up / ramp-up", "main": "Main session",
+                                        "cooldown": "Cool-down"}.get(phase, phase.title()) + "**")
+                    previous_phase = phase
+                if phase != previous_set_phase:
+                    lines.append("   " + {"warmup": "Ramp-up sets", "main": "Working sets",
+                                          "cooldown": "Cool-down sets"}.get(phase, phase.title()))
+                    previous_set_phase = phase
                 fields = []
                 for key, value in prescription.items():
+                    if key in ("phase", "role", "type"):
+                        continue
                     if key == "weight_kg":
                         fields.append("load unspecified" if value is None else
                                       f"{value} kg ({str(basis).replace('_', ' ')})")
@@ -184,8 +391,15 @@ def render_plans(plans):
                                       (str(value) if value is not None else "unspecified"))
                 lines.append(f"   Set {index}: " + ("; ".join(fields) or "details unspecified"))
             for index, block in enumerate(exercise.get("blocks", []), 1):
-                detail = ("; ".join(str(key).replace("_", " ") + ": " + str(value)
-                                    for key, value in block.items())
+                phase = _phase(exercise, block) if isinstance(block, dict) else previous_phase
+                if phase != previous_phase:
+                    lines.append("**" + {"warmup": "Warm-up / ramp-up", "main": "Main session",
+                                        "cooldown": "Cool-down"}.get(phase, phase.title()) + "**")
+                    previous_phase = phase
+                detail = ("; ".join(str(key).replace("_", " ") + ": " +
+                                    (str(value) if value is not None else "unspecified")
+                                    for key, value in block.items()
+                                    if key not in ("phase", "role", "type"))
                           if isinstance(block, dict) else str(block))
                 lines.append(f"   Block {index}: " + detail)
             if exercise.get("effort"):
@@ -238,6 +452,24 @@ def unsupported_claims(text):
         denial = r"\b(?:not|never|cannot|can't|isn't|avoid claiming|don't claim|no guarantee)\b"
         if not re.search(denial, prefix) and not re.search(denial, claim):
             problems.append("unsupported physiological certainty: " + match.group(0))
+    missing_food = (r"(?:\b(?:no|missing|absent|incomplete)\s+(?:food|meal|nutrition|intake|calorie)"
+                    r"(?:\s+(?:logs?|entries|records?|data))?\b|"
+                    r"\b(?:food|meals?|intake|nutrition)\s+(?:was |is |were )?"
+                    r"(?:not logged|unlogged|not recorded)\b)")
+    consequence = (r"\b(?:under[- ]?fuel\w*|under[- ]?eat\w*|poor intake|"
+                   r"reduce\w*|lighter|rest|skip\w*|cut\w*|avoid\w*)\b")
+    food_patterns = [
+        missing_food + r"[^.!?\n]{0,80}\b(?:so|therefore|means?|indicates?|suggests?)\b"
+        r"[^.!?\n]{0,80}" + consequence,
+        consequence + r"[^.!?\n]{0,80}\b(?:because|due to)\b[^.!?\n]{0,40}" + missing_food,
+    ]
+    for match in re.finditer("|".join(food_patterns), text or "", re.IGNORECASE):
+        prefix = re.split(r"[.!?;\n]", text[:match.start()])[-1][-100:].lower()
+        if (not re.search(r"\b(?:not|never|cannot|can't|don't|doesn't)\b", prefix)
+                and not re.search(r"\b(?:does not|doesn't|cannot|can't|never|not evidence)\b",
+                                  match.group(0), re.IGNORECASE)):
+            problems.append("missing optional food logs are not evidence of poor intake "
+                            "or a reason to change training: " + match.group(0))
     return problems
 
 
@@ -265,6 +497,13 @@ class TrainingStore:
                 CREATE TABLE IF NOT EXISTS training_plan_sources (
                     date TEXT NOT NULL, revision INTEGER NOT NULL, request_id TEXT,
                     source_text TEXT NOT NULL, PRIMARY KEY(date,revision));
+                CREATE TABLE IF NOT EXISTS training_completion_identity (
+                    date TEXT PRIMARY KEY, prescription_id TEXT, rotation_slot TEXT,
+                    source TEXT NOT NULL, session_id TEXT, reported_at TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS training_status_events (
+                    id INTEGER PRIMARY KEY, date TEXT NOT NULL, status TEXT NOT NULL,
+                    prescription_id TEXT, rotation_slot TEXT, source TEXT NOT NULL,
+                    session_id TEXT, reported_at TEXT NOT NULL);
                 INSERT OR IGNORE INTO training_day_status
                     SELECT date,status,updated_at FROM training_plans
                     WHERE status IN ('user_completed','user_skipped','user_planned');
@@ -284,6 +523,20 @@ class TrainingStore:
                 db.execute("INSERT INTO training_completion_context VALUES (?,?,?,?)",
                            (day, json.loads(earlier[0]).get("kind") if earlier else None,
                             earlier[1] if earlier else None, reported_at))
+            for day, revision, reported_at in db.execute(
+                    "SELECT date,plan_revision_at_report,reported_at FROM training_completion_context "
+                    "WHERE date NOT IN (SELECT date FROM training_completion_identity)").fetchall():
+                earlier = db.execute(
+                    "SELECT payload FROM training_plan_events WHERE date=? AND revision=?",
+                    (day, revision)).fetchone()
+                payload = json.loads(earlier[0]) if earlier else None
+                try:
+                    identity = prescription_identity(payload) if payload else None
+                except (ValueError, TypeError):
+                    identity = None
+                db.execute("INSERT INTO training_completion_identity VALUES (?,?,?,?,?,?)",
+                           (day, identity, payload.get("rotation_slot") if payload else None,
+                            "legacy_report", None, reported_at))
 
     @contextmanager
     def connection(self):
@@ -295,7 +548,7 @@ class TrainingStore:
             db.close()
 
     def save(self, plans, source="model_proposal", request_id=None, source_text=""):
-        now = datetime.now().isoformat(timespec="seconds")
+        now = coach_clock.now().isoformat(timespec="seconds")
         with self.connection() as db:
             for plan in plans:
                 payload = json.dumps(plan, sort_keys=True, ensure_ascii=False)
@@ -319,27 +572,38 @@ class TrainingStore:
                 db.execute("INSERT INTO training_plan_sources VALUES (?,?,?,?)",
                            (plan["date"], revision, request_id, source_text))
 
-    def set_status(self, day, status):
+    def set_status(self, day, status, source="user_report", session_id=None):
         if status not in ("user_completed", "user_skipped", "user_planned"):
             raise ValueError("unknown training status")
         day = date.fromisoformat(str(day)).isoformat()
-        now = datetime.now().isoformat(timespec="seconds")
+        now = coach_clock.now().isoformat(timespec="seconds")
         with self.connection() as db:
+            proposed = db.execute("SELECT payload,revision FROM training_plans WHERE date=?",
+                                  (day,)).fetchone()
+            payload = json.loads(proposed[0]) if proposed else None
+            identity = prescription_identity(payload) if payload else None
+            slot = payload.get("rotation_slot") if payload else None
             if status == "user_completed":
-                proposed = db.execute("SELECT payload,revision FROM training_plans WHERE date=?",
-                                      (day,)).fetchone()
-                kind = json.loads(proposed[0]).get("kind") if proposed else None
+                kind = payload.get("kind") if payload else None
                 db.execute(
                     "INSERT OR REPLACE INTO training_completion_context VALUES (?,?,?,?)",
                     (day, kind, proposed[1] if proposed else None, now))
+                db.execute("INSERT OR REPLACE INTO training_completion_identity VALUES (?,?,?,?,?,?)",
+                           (day, identity, slot, source, session_id, now))
+            db.execute("INSERT INTO training_status_events(date,status,prescription_id,rotation_slot,"
+                       "source,session_id,reported_at) VALUES (?,?,?,?,?,?,?)",
+                       (day, status, identity, slot, source, session_id, now))
             db.execute("INSERT INTO training_day_status VALUES (?,?,?) "
                        "ON CONFLICT(date) DO UPDATE SET status=excluded.status,"
                        "updated_at=excluded.updated_at", (day, status, now))
             db.execute("UPDATE training_plans SET status=?,updated_at=? WHERE date=?",
                        (status, now, day))
+        return {"date": day, "status": status, "prescription_id_at_report": identity,
+                "rotation_slot_at_report": slot, "plan_revision_at_report": proposed[1] if proposed else None,
+                "source": source, "session_id": session_id}
 
     def record_activities(self, activities):
-        now = datetime.now().isoformat(timespec="seconds")
+        now = coach_clock.now().isoformat(timespec="seconds")
         with self.connection() as db:
             for activity in activities or []:
                 if any(g.get("user_corrections") or g.get("garmin_original_summary")
@@ -365,7 +629,7 @@ class TrainingStore:
                     (str(aid), start, json.dumps(payload, ensure_ascii=False, default=str), now))
 
     def raw_activities(self, today=None, days=28):
-        today = today or date.today()
+        today = today or coach_clock.today()
         with self.connection() as db:
             rows = db.execute(
                 "SELECT payload FROM training_outcomes WHERE date>=? AND date<=? "
@@ -374,7 +638,7 @@ class TrainingStore:
         return [json.loads(row[0]) for row in rows]
 
     def context(self, today=None, outcome_limit=12):
-        today = today or date.today()
+        today = today or coach_clock.today()
         if outcome_limit is not None and (
                 isinstance(outcome_limit, bool) or not isinstance(outcome_limit, int)
                 or outcome_limit < 1):
@@ -389,9 +653,13 @@ class TrainingStore:
                 "SELECT activity_id,date,payload FROM training_outcomes WHERE date>=? AND date<=? "
                 "ORDER BY date,activity_id", (start, today.isoformat()))]
             day_status = [dict(r) for r in db.execute(
-                "SELECT s.date,s.status,s.updated_at,c.plan_kind_at_report,c.plan_revision_at_report "
+                "SELECT s.date,s.status,s.updated_at,c.plan_kind_at_report,c.plan_revision_at_report,"
+                "i.prescription_id AS prescription_id_at_report,i.rotation_slot AS rotation_slot_at_report,"
+                "i.source AS completion_source,i.session_id AS completion_session_id "
                 "FROM training_day_status s LEFT JOIN training_completion_context c "
                 "ON c.date=s.date AND c.reported_at=s.updated_at AND s.status='user_completed' "
+                "LEFT JOIN training_completion_identity i ON i.date=c.date "
+                "AND i.reported_at=c.reported_at "
                 "WHERE s.date>=? ORDER BY s.date", (start,))]
         for row in plans + outcomes:
             row["payload"] = json.loads(row["payload"])
@@ -400,6 +668,10 @@ class TrainingStore:
             str(row["payload"].get("start") or row["date"]).replace(" ", "T"),
             row["activity_id"]))
         for row in plans:
+            try:
+                row["prescription_id"] = prescription_identity(row["payload"])
+            except (ValueError, TypeError):
+                row["prescription_id"] = None
             row["proposal_status"] = "proposed"
             row["status_meaning"] = "last explicit user report for the day, not proof this revision was completed"
         # Keep exact latest observed sessions per movement across the four-week window.

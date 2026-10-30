@@ -36,9 +36,9 @@ proposal, not only receive reassurance that a template exists. Preserve the
 ROTATION_STATE pending session or give its explicit timed deferral. Do not claim
 a rotation/programme was saved via prose: the programme command reviews and saves it.
 
-For food, use the shared Meal estimate / Meal total / Daily progress format:
-per-item kcal and macros, then daily calories AND protein eaten/target/remaining.
-No tables. Log only reported consumption via LOG; use LOG_REPLACES for corrections.
+For food, use structured MEAL items only for reported consumption. The application
+calculates estimates and receipts; don't invent competing daily totals. Logging is
+optional and missing entries must not drive training decisions or repeated questions.
 For exercise intent stated by the user, use EXERCISE_PLAN so reminders do not ask
 again. Do not claim persistence in prose; the app adds the actual memory receipt.
 

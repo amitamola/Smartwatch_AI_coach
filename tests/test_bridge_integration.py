@@ -37,6 +37,9 @@ class BridgeTests(unittest.TestCase):
         b._unavailable_models = {}
         b._llm_active_model = b._llm_last_error = None
         b._llm_last_outage = False
+        b._poll_progress = b._publisher_progress = b._last_progress = b.time.time()
+        b._worker_started = b._request_deadline = b._scheduled_job = None
+        b._draining.clear()
         for name, value in (("COPILOT_MODEL", "primary-test"), ("COPILOT_FALLBACK_MODELS", ()),
                             ("PROGRAM_ENABLED", False)):
             model_setting = patch.object(b, name, value)
@@ -57,7 +60,12 @@ class BridgeTests(unittest.TestCase):
                 "exercises": []}
         return "A recovery day is planned.\n[[SESSION_PLAN: " + json.dumps(plan) + "]]"
 
-    def food_reply(self):
+    def food_reply(self, source="I ate fruit and yogurt.", day=None, replaces=None):
+        meal = {"date": day or date.today().isoformat(), "source_quote": source,
+                "items": [{"name": "Fruit and yogurt", "kcal": 200, "protein_g": 11,
+                           "carbs_g": 24, "fat_g": 6}]}
+        if replaces:
+            meal["replaces_entry_id"] = replaces
         return (
             "AgBot - A synthetic day\n\n**Meal estimate**\n"
             "- Fruit: ~60 kcal; P 1g, C 15g, F 0g\n"
@@ -66,16 +74,17 @@ class BridgeTests(unittest.TestCase):
             "**Daily progress**\n"
             "- Calories: ~300 eaten / 2,100 kcal target; ~1,800 remaining.\n"
             "- Protein: ~21g eaten / 100g target; ~79g remaining.\n"
-            "[[LOG: Fruit and yogurt (~200 kcal, ~11g protein)]]")
+            "[[MEAL: " + json.dumps(meal) + "]]")
 
-    def test_food_reply_repairs_missing_calories_and_daily_progress(self):
+    def test_legacy_prose_food_requires_structured_repair(self):
         b = self.bridge
         incomplete = "Protein looks good.\n[[LOG: Fruit and yogurt (~200 kcal, ~11g protein)]]"
         with patch.object(b, "run_llm", side_effect=[incomplete, self.food_reply()]) as model:
             result = b._generate_checked("food", source_text="I ate fruit and yogurt.")
         self.assertEqual(model.call_count, 2)
-        self.assertIn("Meal total", result)
-        self.assertIn("1,800 remaining", result)
+        self.assertIn("Estimated meal total", result)
+        self.assertIn("200 kcal", result)
+        self.assertNotIn("1,800 remaining", result)
         self.assertEqual(len(b.journal_entries()), 1)
 
     def test_food_receipt_is_app_owned_and_shown_once(self):
@@ -83,7 +92,8 @@ class BridgeTests(unittest.TestCase):
         reply = self.food_reply() + "\n\n\U0001F37D\uFE0F logged \u2713\n\n\n\n\U0001F37D\uFE0F logged \u2713"
         with patch.object(b, "run_llm", return_value=reply):
             result = b._generate_checked("food", source_text="I ate fruit and yogurt.")
-        self.assertEqual(result.count("logged \u2713"), 1)
+        self.assertEqual(result.count("Meal saved for"), 1)
+        self.assertNotIn("logged \u2713", result)
         self.assertNotIn("\n\n\n", result)
         self.assertTrue(result.startswith("**\U0001F916 AgBot \u00b7"))
 
@@ -115,15 +125,15 @@ class BridgeTests(unittest.TestCase):
         b._current_request = "update:1"
         original = b.append_journal("Fruit and yogurt (~180 kcal)")
         b._current_request = "update:2"
-        reply = self.food_reply() + "\n[[LOG_REPLACES: " + original["entry_id"] + "]]"
+        reply = self.food_reply(source="There were two portions.", replaces=original["entry_id"])
         with patch.object(b, "run_llm", return_value=reply):
             for _ in range(2):
                 result = b._generate_checked("correction", source_text="There were two portions.")
         self.assertEqual(len(b.journal_entries()), 2)
         self.assertEqual(len(b.active_journal_entries()), 1)
         self.assertNotIn("180 kcal", b.recent_journal_text())
-        self.assertIn("200 kcal", b.recent_journal_text())
-        self.assertEqual(result.count("updated log \u2713"), 1)
+        self.assertEqual(b.active_journal_entries()[0]["macros"]["kcal"], [200, 200])
+        self.assertEqual(result.count("Meal saved for"), 1)
 
     def test_meal_correction_preserves_original_day_without_explicit_new_date(self):
         b = self.bridge
@@ -143,16 +153,16 @@ class BridgeTests(unittest.TestCase):
 
     def test_unknown_meal_correction_is_not_silently_an_extra_meal(self):
         b = self.bridge
-        reply = self.food_reply() + "\n[[LOG_REPLACES: note:missing]]"
+        reply = self.food_reply(source="It was two portions.", replaces="note:missing")
         with patch.object(b, "run_llm", return_value=reply), self.assertRaises(ValueError):
             b._generate_checked("correction", source_text="It was two portions.")
         self.assertEqual(b.journal_entries(), [])
 
     def test_future_food_date_is_not_relabelled_today(self):
         tomorrow = (date.today() + timedelta(days=1)).isoformat()
-        reply = self.food_reply().replace("[[LOG:", "[[LOG " + tomorrow + ":")
-        self.assertIn("Do not log future food consumption.",
-                      self.bridge._food_reporting_errors(reply, "A food report"))
+        reply = self.food_reply(day=tomorrow)
+        self.assertIn("Future food consumption cannot be logged.",
+                      self.bridge.parse_food(reply, "I ate fruit and yogurt.")[3])
 
     def test_invalid_memory_quote_gets_one_repair_before_claiming_persistence(self):
         b = self.bridge
@@ -177,6 +187,30 @@ class BridgeTests(unittest.TestCase):
         state = json.loads(Path(b.EXERCISE_STATE_FILE).read_text())
         self.assertTrue(state["coach_rest"])
         self.assertEqual(b.training_store().context()["plans"][0]["payload"]["kind"], "rest")
+        with patch.object(b, "owner", return_value="123"), \
+                patch.object(b, "send_message") as send:
+            b.maybe_exercise_checkins()
+            send.assert_not_called()
+
+        # A recovery/optional-walk update the same day must preserve coach_rest and stay quiet.
+        recovery_plan = {
+            "date": date.today().isoformat(),
+            "kind": "recovery",
+            "objective": "Optional easy walk while resting from strength",
+            "reason": "Low readiness; keep pending strength deferred.",
+            "exercises": [{"name": "Easy walk", "blocks": [
+                {"role": "work", "duration_seconds": 600, "effort": "Easy conversational pace"}
+            ]}],
+        }
+        recovery_reply = "Take an easy walk only if you feel like it.\n[[SESSION_PLAN: " + json.dumps(recovery_plan) + "]]"
+        with patch.object(b, "run_llm", return_value=recovery_reply):
+            b._generate_checked("Can I walk?", require_plan=True)
+        state2 = json.loads(Path(b.EXERCISE_STATE_FILE).read_text())
+        self.assertTrue(state2["coach_rest"])
+        with patch.object(b, "owner", return_value="123"), \
+                patch.object(b, "send_message") as send:
+            b.maybe_exercise_checkins()
+            send.assert_not_called()
 
     def test_repeated_sequences_are_referenced_without_losing_source_detail(self):
         b = self.bridge
@@ -382,13 +416,13 @@ class BridgeTests(unittest.TestCase):
                 run.assert_called_once()
                 self.assertEqual(b._health_report()["status"], "degraded")
 
-    def test_timeout_never_switches_models_or_returns_partial_output(self):
+    def test_timeout_uses_bounded_fallback_without_returning_partial_output(self):
         b = self.bridge
         with patch.object(b, "COPILOT_FALLBACK_MODELS", ("backup-test",)), \
                 patch.object(b.subprocess, "run", side_effect=b.subprocess.TimeoutExpired(
                     "copilot", 1, output="partial")) as run:
             self.assertIsNone(b._llm_copilot("synthetic", []))
-        run.assert_called_once()
+        self.assertEqual(run.call_count, 2)
         self.assertEqual(b._llm_last_error, "model_timeout")
 
     def test_optional_review_can_use_a_smaller_copilot_budget(self):
@@ -414,12 +448,13 @@ class BridgeTests(unittest.TestCase):
         b._set_msg_sent_at(datetime.combine(yesterday, datetime.min.time()).replace(
             hour=23, minute=58).timestamp())
         b._current_request = "update:synthetic-photo"
-        with patch.object(b, "run_llm", return_value=self.food_reply()):
+        with patch.object(b, "run_llm", return_value=self.food_reply(
+                source="Having fruit and yogurt.", day=yesterday.isoformat())):
             for _ in range(2):
                 result = b._generate_checked("photo", source_text="Having fruit and yogurt.")
         self.assertEqual(len(b.journal_entries()), 1)
         self.assertEqual(b.journal_entries()[0]["date"], yesterday.isoformat())
-        self.assertIn("yesterday", result)
+        self.assertIn(yesterday.isoformat(), result)
 
     def test_album_downloads_have_distinct_paths_without_token_global(self):
         b = self.bridge
@@ -496,6 +531,290 @@ class BridgeTests(unittest.TestCase):
             b.generate_debrief([{"activity_id": 1, "start": day_string(),
                                  "type": "running", "name": "Synthetic run"}])
         self.assertEqual(checked.call_count, 7)
+
+    def test_todays_food_summary_ignores_replaced_entries_and_parses_ranges(self):
+        b = self.bridge
+        now = datetime.now()
+        yesterday = (now.date() - timedelta(days=1)).isoformat()
+        b._current_request = "update:food1"
+        first = b.append_journal(
+            "Late meal (~780–960 kcal, ~58–70 g protein)"
+        )
+        b._current_request = "update:food2"
+        second = b.append_journal(
+            "Combined day intake: ~1,083–1,340 kcal, ~90–107 g protein"
+        )
+        # Re-dating the second entry to yesterday and superseding the first leaves zero today.
+        b._current_request = "update:food3"
+        moved = b.append_journal(
+            "Corrected yesterday meal: ~1,083–1,340 kcal, ~90–107 g protein",
+            on_date=yesterday,
+            replaces_entry_id=second["entry_id"],
+        )
+        with open(b.JOURNAL_FILE, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({
+                "entry_type": "supersession",
+                "replaces_entry_id": first["entry_id"],
+                "superseded_by": moved["entry_id"],
+                "date": yesterday,
+            }) + "\n")
+        self.assertEqual(b._todays_food_summary(now), (0, 0, 0))
+        self.assertEqual(b._todays_food_log_times(now), [])
+
+        # Decimal grams, comma-formatted calories, and ingredient 'protein powder' mentions.
+        b._current_request = "update:food4"
+        b.append_journal(
+            "Shake: ~40g protein powder (~315 kcal, ~35.6g protein, ~30g carbs, ~5g fat) "
+            "Lunch (~1,200 kcal, ~54.4g protein, ~110g carbs, ~35g fat)"
+        )
+        self.assertEqual(b._todays_food_summary(now), (1, 90, 1515))
+
+        roll = b.rolling_nutrition_summary(
+            days=7, today=now.date(),
+            calorie_budget={"maintenance_kcal": 2500, "target_kcal": 2100,
+                            "protein_range_g": {"min": 120, "max": 140}},
+        )
+        self.assertEqual(roll["logged_days_count"], 2)
+        self.assertEqual(roll["completed_logged_days_count"], 0)
+        self.assertEqual(roll["today_so_far"]["protein_g"], 90)
+        self.assertNotIn("protein_status", roll["today_so_far"])
+        self.assertIsNone(roll["completed_days_average"])
+        self.assertNotIn("implied_deficit_kcal", roll["days"][0])
+
+    def test_nutrition_context_retains_lean_fuel_estimate(self):
+        b = self.bridge
+        activity = {
+            "activity_id": 1,
+            "start": date.today().isoformat() + " 10:00:00",
+            "calories": 300,
+            "logged_sets": [{"exercise": "Synthetic press", "sets": 1}],
+            "detail_metrics": {
+                "status": "available",
+                "fuel_estimate": {"status": "available", "fat_g": 6.0, "carbohydrate_g": 70.0},
+                "groups": {"fuel_energy": {"status": "available"}},
+                "detail_descriptors": [{"key": "omitted"}],
+            },
+        }
+        data, _training = b._nutrition_context(
+            {"recent_activities_7d": [activity]}, b.training_store().context()
+        )
+        row = data["recent_activities_7d"][0]
+        self.assertNotIn("logged_sets", row)
+        self.assertEqual(row["detail_metrics"]["fuel_estimate"]["carbohydrate_g"], 70.0)
+        self.assertNotIn("detail_descriptors", row["detail_metrics"])
+
+    def test_auto_summary_waits_for_sleep_sync_until_cutoff(self):
+        b = self.bridge
+        b._last_sleep_sync_check = 0.0
+        early = datetime.now().replace(hour=9, minute=35, second=0, microsecond=0)
+        cutoff = datetime.now().replace(hour=11, minute=30, second=0, microsecond=0)
+        with patch.object(b.garmin_coach, "sleep_logged_today", return_value=False):
+            self.assertFalse(b._auto_summary_sleep_ready(early))
+            self.assertTrue(b._auto_summary_sleep_ready(cutoff))
+        b._last_sleep_sync_check = 0.0
+        with patch.object(b.garmin_coach, "sleep_logged_today", return_value=True):
+            self.assertTrue(b._auto_summary_sleep_ready(early))
+
+    def test_negated_hypothetical_and_generic_done_do_not_change_training(self):
+        for text in ("I am not done with recommended exercise",
+                     "If I am not exercising today, should I change lunch?",
+                     "done", "finished", "GMS and my knee hurts"):
+            self.assertEqual(self.bridge.classify(text)[0], "qa")
+        self.assertEqual(self.bridge.classify("DWRE")[0], "dwre")
+        self.assertEqual(self.bridge.classify("DWRE yesterday")[0], "dwre")
+
+    def test_same_turn_symptom_resolution_precedes_context(self):
+        b = self.bridge
+        b.memory_store().upsert("health", "knee", "My knee hurts.",
+                                source_text="My knee hurts.", verified=True)
+        with patch.object(b, "get_snapshot", return_value={}), \
+                patch.object(b, "load_fitness_profile", return_value={}):
+            prompt, _ = b._assemble(b.QA_PROMPT_FILE, question="My knee is fine now.")
+        self.assertNotIn("ACTIVE HEALTH REPORTS", prompt)
+        self.assertEqual(b.memory_store().records("health"), [])
+
+    def test_optional_food_logs_cannot_influence_training_context(self):
+        b = self.bridge
+        b.append_journal("Snack (~200 kcal, ~10g protein)")
+        data = {"calorie_budget": {"target_kcal": 2200}, "recent_activities_7d": []}
+        with patch.object(b, "get_snapshot", return_value=data), \
+                patch.object(b, "load_fitness_profile", return_value={}):
+            prompt, _ = b._assemble(b.QA_PROMPT_FILE, question="What workout should I do?")
+        self.assertNotIn("NUTRITION_SUMMARY_7D", prompt)
+        self.assertNotIn('"target_kcal"', prompt)
+        self.assertIn("Food logging is optional", prompt)
+        with patch.object(b, "MEAL_REMINDERS_ENABLED", False), patch.object(b, "owner") as own:
+            b.maybe_meal_reminders()
+        own.assert_not_called()
+
+    def test_garmin_failure_does_not_prevent_voluntary_food_logging(self):
+        b = self.bridge
+        with patch.object(b, "get_snapshot", return_value={"__error__": "offline"}), \
+                patch.object(b, "run_llm", return_value=self.food_reply()):
+            text, snapshot = b.generate_qa("I ate fruit and yogurt.")
+        self.assertEqual(snapshot["sensor_status"], "unavailable")
+        self.assertIn("200 kcal", text)
+        self.assertEqual(len(b.journal_entries()), 1)
+
+    def test_delayed_completion_keeps_correct_day_and_pending_sync(self):
+        b = self.bridge
+        yesterday = date.today() - timedelta(days=1)
+        b._set_msg_sent_at(datetime.combine(yesterday, datetime.min.time()).replace(hour=18).timestamp())
+        with patch.object(b.garmin_coach, "session_block", return_value=[]) as session, \
+                patch.object(b, "send_message"):
+            b.do_dwre("123")
+        session.assert_called_once_with(target_day=yesterday)
+        self.assertEqual(b.training_store().context()["user_reported_day_status"][0]["date"],
+                         yesterday.isoformat())
+        self.assertEqual(b._load_pending()["date"], yesterday.isoformat())
+        self.assertEqual(b._exercise_status(), "pending")
+
+    def test_debrief_failure_keeps_durable_job(self):
+        b = self.bridge
+        block = [{"activity_id": 1, "start": date.today().isoformat() + " 10:00:00"}]
+        with patch.object(b.garmin_coach, "session_block", return_value=block), \
+                patch.object(b, "generate_debrief", return_value=None), \
+                patch.object(b, "send_message"), self.assertRaises(RuntimeError):
+            b.do_dwre("123")
+        self.assertTrue(b._load_pending()["user_requested"])
+
+    def test_mixed_completion_retains_symptom_and_feedback(self):
+        b = self.bridge
+        source = "I finished my workout. My knee hurts."
+        report = {"date": date.today().isoformat(), "status": "user_completed",
+                  "source_quote": "I finished my workout."}
+        symptom = {"kind": "health", "key": "knee", "action": "upsert",
+                   "text": "My knee hurts.", "source_quote": "My knee hurts."}
+        reply = ("Thanks for the report. [[TRAINING_REPORT: " + json.dumps(report)
+                 + "]] [[MEMORY: " + json.dumps(symptom) + "]]")
+        with patch.object(b, "run_llm", return_value=reply):
+            result = b._generate_checked("synthetic", source_text=source)
+        self.assertEqual(len(b.memory_store().records("health")), 1)
+        self.assertEqual(b._exercise_status(), "done")
+        self.assertNotIn("TRAINING_REPORT", result)
+
+    def test_stated_intent_is_persisted_before_marker_stripping(self):
+        b = self.bridge
+        source = "I will cycle later today"
+        with patch.object(b, "run_llm", return_value="Understood [[EXERCISE_PLAN: " + source + "]]"):
+            b._generate_checked("synthetic", source_text=source)
+        self.assertEqual(b._exercise_status(), "stated")
+
+    def test_complete_answer_replay_does_not_duplicate_domain_updates(self):
+        b = self.bridge
+        b._current_request = "update:replay"
+        with patch.object(b, "run_llm", return_value=self.food_reply()) as llm:
+            first = b._generate_checked("initial", source_text="I ate fruit and yogurt.")
+            second = b._generate_checked("changed context", source_text="I ate fruit and yogurt.")
+        llm.assert_called_once()
+        self.assertEqual(first, second)
+        self.assertEqual(len(b.journal_entries()), 1)
+
+    def test_multiple_debrief_dates_are_preserved_and_cleared_independently(self):
+        b = self.bridge
+        b._save_pending({"date": "2026-02-01", "last_ts": 100, "user_requested": True})
+        b._save_pending({"date": "2026-02-02", "last_ts": 200})
+        b._save_pending({"date": "2026-02-01", "last_ts": 150})
+        self.assertEqual(len(b._pending_jobs()), 2)
+        self.assertTrue(b._load_pending()["user_requested"])
+        b._clear_pending("2026-02-02")
+        self.assertEqual(b._load_pending()["date"], "2026-02-01")
+        b._clear_pending("2026-02-01")
+        self.assertFalse(b._load_pending())
+
+    def test_mixed_food_reply_preserves_non_accounting_advice(self):
+        b = self.bridge
+        meal = {"date": date.today().isoformat(), "source_quote": "I ate yogurt.",
+                "items": [{"name": "Yogurt", "kcal": 200}],
+                "coaching_note": "Do not push through knee pain."}
+        with patch.object(b, "run_llm", return_value="[[MEAL: " + json.dumps(meal) + "]]"):
+            result = b._generate_checked("synthetic", source_text="I ate yogurt. My knee hurts.")
+        self.assertIn("Do not push through knee pain.", result)
+        self.assertIn("200 kcal", result)
+
+    def test_stale_snapshot_is_not_reingested_as_fresh_activity(self):
+        b = self.bridge
+        stale = {"snapshot_cache": {"stale": True}, "recent_activities_7d": [{"activity_id": 1}]}
+        with patch.object(b._snapshot_cache, "get", return_value=stale), \
+                patch.object(b.training_store(), "record_activities") as record:
+            self.assertEqual(b.get_snapshot(), stale)
+        record.assert_not_called()
+
+    def test_routine_compaction_preserves_fuel_estimates_and_provenance(self):
+        b = self.bridge
+        source = {"detail_metrics": {"status": "available", "fuel_estimate": {
+            "fat_g": 10, "carbohydrate_g": 20, "field_mapping_status": "unverified",
+            "fields": [{"raw": "x" * 10000}]}}}
+        compact = b._routine_evidence(source)
+        self.assertLess(len(json.dumps(compact)), 600)
+        fuel = compact["detail_metrics"]["fuel_estimate"]
+        self.assertEqual(fuel["fat_g"], 10)
+        self.assertEqual(fuel["field_mapping_status"], "unverified")
+        self.assertIn("fields", source["detail_metrics"]["fuel_estimate"])
+
+    def test_exact_prompt_references_preserve_distinct_facts(self):
+        b = self.bridge
+        common = {"meaning": "Synthetic source interpretation. " * 20,
+                  "unit": "kg", "status": "observed"}
+        source = {"first": common, "second": dict(common),
+                  "different": dict(common, status="unconfirmed")}
+        compact = json.loads(b._prompt_json(source, "EVIDENCE"))
+        self.assertEqual(compact["first"], common)
+        self.assertEqual(compact["second"], {"prompt_reference": "EVIDENCE.first"})
+        self.assertEqual(compact["different"]["status"], "unconfirmed")
+        self.assertEqual(compact["different"]["meaning"],
+                         {"prompt_reference": "EVIDENCE.first.meaning"})
+        self.assertEqual(source["second"], common)
+
+    def test_oversized_context_fails_explicitly_before_backend(self):
+        b = self.bridge
+        with patch.object(b, "PROMPT_MAX_CHARS", 20), \
+                patch.dict(b._LLM_BACKENDS, {"copilot": lambda *a, **k: self.fail("backend called")}), \
+                self.assertRaisesRegex(ValueError, "Context exceeds"):
+            b.run_llm("x" * 21)
+
+    def test_unknown_load_requires_calibration_even_without_programme(self):
+        b = self.bridge
+        plan = {"exercises": [{"name": "Dumbbell Curl", "weight_basis": "per_hand",
+                               "sets": [{"weight_kg": 20}]}]}
+        self.assertTrue(b._program_plan_errors([plan]))
+        plan["exercises"][0]["sets"][0]["weight_kg"] = None
+        self.assertEqual(b._program_plan_errors([plan]), [])
+
+    def test_columnar_chronology_preserves_order_units_and_measurements(self):
+        rows = [{"sequence_index": 0, "reps": 8, "weight_raw": 12000, "weight_kg": 12,
+                 "weight_unit_source": "recorded", "set_type": "active"},
+                {"sequence_index": 1, "reps": None, "weight_raw": None, "weight_kg": None,
+                 "weight_unit_source": None, "set_type": "rest"}]
+        result = json.loads(self.bridge._prompt_json({"set_sequence": rows}, "SESSION"))
+        table = result["set_sequence"]
+        reconstructed = [dict(zip(table["columns"], row)) for row in table["rows"]]
+        self.assertEqual(reconstructed, rows)
+
+    def test_debrief_retrieves_the_reported_days_plan_not_todays_plan(self):
+        b = self.bridge
+        day = (date.today() - timedelta(days=1)).isoformat()
+        plan = {"date": day, "kind": "rest", "objective": "Synthetic prior-day plan",
+                "reason": "Agreed recovery", "exercises": []}
+        b.training_store().save([plan])
+        activity = {"activity_id": 45, "start": day + " 18:00:00", "type": "walking",
+                    "duration_s": 600}
+        with patch.object(b, "get_snapshot", return_value={}), \
+                patch.object(b.garmin_coach, "activity_extras", return_value={}), \
+                patch.object(b, "run_llm", return_value="Review saved.") as model:
+            b.generate_debrief([activity])
+        prompt = model.call_args.args[0]
+        self.assertIn("DATED_SESSION_PLANS", prompt)
+        self.assertIn("Synthetic prior-day plan", prompt)
+        self.assertIn(day, prompt)
+
+    def test_legacy_aggregate_ambiguity_and_missing_macros_remain_unknown(self):
+        b = self.bridge
+        self.assertEqual(b._parse_entry_macros(
+            "Yogurt (200 kcal, 20g protein). Meal total (200 kcal, 20g protein)."),
+            (None, None, None, None))
+        self.assertEqual(b._parse_entry_macros("Yogurt (200 kcal; protein 20g)"),
+                         (200, 20, None, None))
 
 
 def day_string():

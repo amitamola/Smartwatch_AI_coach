@@ -13,6 +13,8 @@ from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
+import coach_clock
+
 from coach_plan import canonical_exercise, exercise_excluded, unsupported_claims
 
 
@@ -47,19 +49,29 @@ _ACTIVITY_UNITS = {
     "anaerobic_te": "device training-effect score",
     "elevation_gain_m": "m", "avg_cadence_spm": "steps/min",
     "moderate_intensity_min": "min", "vigorous_intensity_min": "min",
+    "recovery_hr_bpm": "bpm; reported recovery-HR metric, protocol unspecified",
+    "hr_zones_min": "min per reported HR zone; zone thresholds unspecified",
+    "workout_rpe": "raw reported session RPE; scale unspecified unless supplied",
+    "workout_feel": "raw reported session feel; scale unspecified unless supplied",
+}
+_SESSION_METRICS = {
+    "workout_rpe": ("directWorkoutRpe", "reported_session_feedback"),
+    "workout_feel": ("directWorkoutFeel", "reported_session_feedback"),
+    "recovery_hr_bpm": ("recoveryHeartRate", "device_session_measurement"),
+    "hr_zones_min": ("hr_zones_min", "device_session_measurement"),
 }
 
 
 def _day(value=None):
     if value is None:
-        return date.today()
+        return coach_clock.today()
     if isinstance(value, datetime):
         return value.date()
     return value if isinstance(value, date) else date.fromisoformat(str(value)[:10])
 
 
 def _timestamp(value=None):
-    value = value or datetime.now(timezone.utc)
+    value = value or coach_clock.now()
     if isinstance(value, str):
         value = datetime.fromisoformat(value)
     if value.tzinfo is None:
@@ -186,7 +198,8 @@ def build_review_evidence(training_context, memory_records, profile, today=None)
             "effort_form_tolerability": "unknown unless explicitly user-reported",
         }
         for key in (*_ACTIVITY_UNITS, "start", "name", "type", "logged_sets_coverage",
-                    "training_effect_label", "avg_pace", "pace", "pace_unit"):
+                    "training_effect_label", "avg_pace", "pace", "pace_unit",
+                    "workout_rpe_scale", "workout_feel_scale"):
             if key in payload:
                 observation[key] = _compact(payload[key])
         observation["metric_units"] = {
@@ -194,6 +207,18 @@ def build_review_evidence(training_context, memory_records, profile, today=None)
         for key in ("avg_pace", "pace"):
             if key in payload:
                 observation["metric_units"][key] = payload.get("pace_unit") or "unspecified"
+        observation["session_metric_provenance"] = {
+            key: {
+                "ref": ref, "date": observed.isoformat(), "scope": "session",
+                "source_type": source_type, "source_field": source_field,
+                "scale": _compact(payload.get(key + "_scale")) or
+                         ("unspecified; retain raw value without conversion"
+                          if key.startswith("workout_") else _ACTIVITY_UNITS[key]),
+                "exercise_specific_capability": False,
+            }
+            for key, (source_field, source_type) in _SESSION_METRICS.items()
+            if key in payload
+        }
         observations.append(observation)
         refs[ref] = {
             "type": "activity", "date": observed.isoformat(),
@@ -216,7 +241,9 @@ def build_review_evidence(training_context, memory_records, profile, today=None)
             "intensity, duration, conditions and tolerance comparability are unverified.")
     memories, scheduling = [], []
     for supplied in memory_records or ():
-        if (supplied.get("status", "active") != "active"
+        if ((supplied.get("status", "active") != "active"
+             and not (supplied.get("kind") == "health"
+                      and supplied.get("context_constraint_active") is True))
                 or supplied.get("kind") not in {"anchor", "health", "preference"}
                 or supplied.get("id") is None):
             continue
@@ -224,12 +251,13 @@ def build_review_evidence(training_context, memory_records, profile, today=None)
             observed = _day(supplied.get("observed_on")) if supplied.get("observed_on") else None
         except (TypeError, ValueError):
             observed = None
-        if observed and observed > today:
+        if observed and observed > today and supplied["kind"] == "anchor":
             continue
         record = _compact(supplied)
         record["ref"] = "memory:" + str(record["id"])
         record["verified"] = _verified(record)
         record["within_window"] = observed is not None and start <= observed <= today
+        record["future_dated"] = observed is not None and observed > today
         memories.append(record)
         refs[record["ref"]] = {
             "type": "memory", "kind": record["kind"], "key": record.get("key", ""),
@@ -242,7 +270,7 @@ def build_review_evidence(training_context, memory_records, profile, today=None)
                                  str(record.get("key", "")), re.IGNORECASE)
         if str(record.get("key", "")).startswith(("travel:", "temporary:", "equipment:")):
             schedule_key = False
-        if (record["verified"] and observed and
+        if (record["verified"] and observed and observed <= today and
                 (schedule_key or (_DAYS.search(text) and re.search(
                     r"\b(?:train\w*|workout\w*|gym|exercise|available)\b", text, re.IGNORECASE)))):
             scheduling.append((observed.isoformat(), record.get("updated_at") or "",
@@ -300,7 +328,12 @@ def build_review_evidence(training_context, memory_records, profile, today=None)
             "Cardio modality matching does not equate intensities or conditions. Device HR, power and "
             "training-load scores do not establish perceived effort or readiness. Pace is not derived "
             "from speed; ambiguous supplied pace units remain unspecified.",
-            "Older active memory remains a constraint; future memory is excluded and older anchors are not recent progression proof.",
+            "Reported workout RPE/feel and recovery HR/zone minutes describe the session only; "
+            "raw or unspecified scales are not converted. They do not establish exercise-specific "
+            "capability, form, pain-free status or replace a recent verified exercise anchor.",
+            "Older active memory remains a constraint; future preferences/commitments are retained "
+            "as future context, not current availability or progression proof. Future capability "
+            "anchors are excluded and older anchors are not recent progression proof.",
             "Progression validation checks evidence presence only; coaching policy must still establish tolerability.",
         ],
     }
@@ -412,8 +445,8 @@ def _validate_review(review, evidence, preferences, previous):
             local.add(canonical)
             if exercise_excluded(name, constraints):
                 raise ValueError(f"excluded movement cannot be prescribed: {name}")
-            if move["role"] not in {"anchor", "accessory", "skill"}:
-                raise ValueError("exercise role must be anchor, accessory or skill")
+            if move["role"] not in {"anchor", "accessory", "skill", "warmup", "cooldown"}:
+                raise ValueError("exercise role must be anchor, accessory, skill, warmup or cooldown")
             rule = _strategy_text(move["progression_rule"], "progression_rule for " + name, 1000)
             stop = _strategy_text(move["stop_rule"], "stop_rule", 600) if "stop_rule" in move else None
             if not _EFFORT.search(rule) and not stop:
@@ -630,8 +663,9 @@ class ProgramStore:
                 db.execute("ALTER TABLE training_program_state ADD COLUMN pending_review_reason TEXT")
 
     @contextmanager
-    def connection(self):
-        db = sqlite3.connect(self.path, timeout=30)
+    def connection(self, read_only=False):
+        target = Path(self.path).resolve().as_uri() + "?mode=ro" if read_only else self.path
+        db = sqlite3.connect(target, timeout=30, uri=read_only)
         db.row_factory = sqlite3.Row
         try:
             with db:
@@ -677,10 +711,24 @@ class ProgramStore:
             return self._request(db, request_key)
 
     def context(self, today=None, fingerprint=None, now=None):
+        """Write-stage context: reconcile feedback clocks before review generation."""
+        return self._context(today, fingerprint, now, reconcile=True)
+
+    def peek_context(self, today=None, fingerprint=None, now=None):
+        """Read-only context projection, including optional hypothetical feedback.
+
+        Does not persist fingerprints, start/reset feedback clocks, initialize
+        schema or update retries. Construct the store at startup, not in health
+        polling; the constructor still performs explicit schema initialization.
+        Call ``context`` in the write stage to reconcile real feedback.
+        """
+        return self._context(today, fingerprint, now, reconcile=False)
+
+    def _context(self, today, fingerprint, now, *, reconcile):
         instant = _timestamp(now)
         today = _day(today) if today is not None else (_day(now) if now else _day())
-        with self.connection() as db:
-            db.execute("BEGIN IMMEDIATE")
+        with self.connection(read_only=not reconcile) as db:
+            db.execute("BEGIN IMMEDIATE" if reconcile else "BEGIN")
             state = dict(db.execute("SELECT * FROM training_program_state WHERE singleton=1").fetchone())
             active = self._active(db)
             baseline = self._block_baseline(db, active)
@@ -692,7 +740,8 @@ class ProgramStore:
                 detected = detected or today.isoformat()
             else:
                 detected = None
-            if dirty != state["dirty_fingerprint"] or detected != state["feedback_detected_on"]:
+            if reconcile and (dirty != state["dirty_fingerprint"]
+                              or detected != state["feedback_detected_on"]):
                 db.execute("UPDATE training_program_state SET dirty_fingerprint=?,"
                            "feedback_detected_on=? WHERE singleton=1", (dirty, detected))
         reason = None
@@ -714,7 +763,8 @@ class ProgramStore:
         if reason is None and state["last_error"]:
             reason = "retry"
             if state["retry_after"]:
-                retry_day = _timestamp(state["retry_after"]).astimezone().date().isoformat()
+                retry_day = _timestamp(state["retry_after"]).astimezone(
+                    coach_clock.now().tzinfo).date().isoformat()
                 next_date = min(next_date, retry_day)
         in_backoff = bool(state["retry_after"] and instant < _timestamp(state["retry_after"]))
         return {
@@ -830,7 +880,8 @@ def render_program(record):
     if hard is not None:
         lines.insert(4, f"**Explicit scheduling maximum:** {hard} days per rolling seven days")
     for template in review["session_templates"]:
-        names = ", ".join(move["name"] + (" [anchor]" if move["role"] == "anchor" else "")
+        names = ", ".join(move["name"] + (" [" + move["role"] + "]"
+                         if move["role"] in {"anchor", "warmup", "cooldown"} else "")
                           for move in template["exercises"]) or "No prescribed exercises"
         label = template["id"].replace("-", " ").title()
         lines.append(f"- **{label}**: {template['purpose']}\n  {names}")
