@@ -875,13 +875,16 @@ def _strip_control_markers(text):
     return text.rstrip()
 
 
-def send_message(chat_id, text, summary_date=None, expires_at=None, delivery_key=None):
+def send_message(chat_id, text, summary_date=None, expires_at=None, delivery_key=None,
+                 coaching_state=None):
     global _send_sequence
     text = _strip_control_markers(text)
     rendered = md_to_html(text)
     keys = []
     chunks = [chunk for chunk in html_chunks(rendered, 4000) if _html_to_plain(chunk).strip()]
     group = delivery_key or message_key(_current_request, _send_sequence + 1, chat_id, text)
+    if summary_date and coaching_state is None:
+        coaching_state = _coaching_state()
     for index, chunk in enumerate(chunks):
         if not chunk.strip():
             continue
@@ -890,7 +893,8 @@ def send_message(chat_id, text, summary_date=None, expires_at=None, delivery_key
                else message_key(_current_request, _send_sequence, chat_id, chunk))
         payload = {"text": chunk, "parse_mode": "HTML", "disable_web_page_preview": "true"}
         if summary_date:
-            payload.update(_summary_date=summary_date, _summary_complete=index == len(chunks) - 1)
+            payload.update(_summary_date=summary_date, _summary_complete=index == len(chunks) - 1,
+                           _coaching_state=coaching_state)
         runtime_store().enqueue(key, chat_id, payload, group_id=group, expires_at=expires_at)
         keys.append(key)
     return keys
@@ -903,6 +907,18 @@ def flush_outbox():
         blocked_groups = set()
         for item in runtime_store().due_messages():
             if item.get("group_id") in blocked_groups:
+                continue
+            summary_day = item["payload"].get("_summary_date")
+            if summary_day and (
+                    summary_day != coach_clock.today().isoformat()
+                    or item["payload"].get("_coaching_state") != _coaching_state()):
+                runtime_store().cancel_delivery(item["id"], "Coaching state changed before delivery")
+                blocked_groups.add(item.get("group_id"))
+                runtime_store().enqueue(
+                    "superseded-summary:" + (item.get("group_id") or item["id"]), item["chat_id"],
+                    {"text": "AgBot: I withheld an older summary because the coaching context "
+                             "changed while it was waiting to send. Use GMS for the current plan."})
+                log.info("stage=summary_delivery superseded=true")
                 continue
             params = {k: v for k, v in item["payload"].items() if not k.startswith("_")}
             params["chat_id"] = item["chat_id"]
@@ -1641,7 +1657,7 @@ def _scheduling_context(plans=()):
     }
 
 
-def _plan_load_errors(plans):
+def _plan_load_errors(plans, required=()):
     errors = []
     observed = training_store().context()["latest_observed_per_movement"]
     feedback = [r for r in memory_store().records("anchor")
@@ -1652,7 +1668,8 @@ def _plan_load_errors(plans):
             recorded = observed.get(name, {}).get("recorded_sets", {})
             own_load = (isinstance(recorded.get("top_weight_kg"), (int, float))
                         and recorded["top_weight_kg"] > 0
-                        and recorded.get("weight_basis") == move.get("weight_basis")
+                        and (recorded.get("weight_basis") == move.get("weight_basis")
+                             or (name not in required and recorded.get("weight_basis") is None))
                         and move.get("weight_basis") not in (None, "unspecified"))
             basis_pattern = {"per_hand": r"\b(?:per|each) hand\b",
                              "machine_stack": r"\b(?:machine|stack)\b"}.get(move.get("weight_basis"))
@@ -1672,13 +1689,14 @@ def _plan_load_errors(plans):
 
 
 def _program_plan_errors(plans, reports=()):
-    errors = _plan_load_errors(plans) if plans else []
-    if not PROGRAM_ENABLED or (not plans and not reports):
+    active = program_store().peek_context().get("active") if PROGRAM_ENABLED else None
+    review = active["review"] if active else {}
+    required = {canonical_exercise(name) for name in _training_policy().get("required_exercises", [])}
+    required.update(canonical_exercise(d["exercise"]) for d in review.get("decisions", [])
+                    if d.get("action") == "introduce")
+    errors = _plan_load_errors(plans, required=required) if plans else []
+    if not PROGRAM_ENABLED or not active or (not plans and not reports):
         return errors
-    active = program_store().peek_context().get("active")
-    if not active:
-        return errors
-    review = active["review"]
     templates = {item["id"]: item for item in review["session_templates"]}
     pre_rotation = _rotation_context() if reports else None
     rotation = _rotation_context(reports=reports)
@@ -1872,6 +1890,67 @@ def _stable_measurements(value):
     if isinstance(value, list):
         return [_stable_measurements(item) for item in value]
     return value
+
+
+def _decision_values(value):
+    """Ignore retrieval clocks, not measurements, missing coverage, or stale-data warnings."""
+    if isinstance(value, dict):
+        return {k: _decision_values(v) for k, v in value.items() if k not in (
+            "generated_at", "fetched_at", "observed_at", "updated_at", "loaded_at", "loaded_day",
+            "age_seconds", "age_hours", "cache_age_hours", "max_age_seconds",
+            "last_sync_age_min", "body_battery_current_age_min")}
+    if isinstance(value, list):
+        return [_decision_values(v) for v in value]
+    return value
+
+
+def _decision_hash(value):
+    return hashlib.sha256(json.dumps(_decision_values(value), sort_keys=True,
+                                    ensure_ascii=False, default=str).encode("utf-8")).hexdigest()
+
+
+def _coaching_state():
+    """Local revision fence; this read never fetches Garmin or reconciles the rotation."""
+    training = training_store().context(outcome_limit=None)
+    programme = program_store().peek_context().get("active") if PROGRAM_ENABLED else None
+    fitness = read_file(FITNESS_FILE)
+    return {
+        "day": coach_clock.today().isoformat(),
+        "user facts and preferences": _program_inputs()[2],
+        "saved schedule": _decision_hash([
+            {k: p.get(k) for k in ("date", "revision", "status")}
+            for p in training["plans"] if p["date"] >= coach_clock.today().isoformat()]),
+        "workout reports": _decision_hash(training["user_reported_day_status"]),
+        "recorded workouts": _decision_hash([
+            {k: r.get(k) for k in ("date", "activity_id", "payload")}
+            for r in training["recent_outcomes"]]),
+        "programme": _decision_hash({"revision": programme["revision"] if programme else None,
+                                     "rotation": _rotation_context()}),
+        "fitness profile": _decision_hash(json.loads(fitness) if fitness else None),
+        "coaching policy": _decision_hash({
+            "summary": read_file(SUMMARY_PROMPT_FILE),
+            "shared": read_file(os.path.join(PROMPTS, "coaching_policy.md")),
+            "nutrition_optional": NUTRITION_OPTIONAL}),
+    }
+
+
+def _summary_evidence(snapshot):
+    # Meal coverage and live calorie/hydration/step counters cannot drive a training revision.
+    return {label: _decision_hash({k: snapshot.get(k) for k in keys})
+            for label, keys in (
+                ("sleep", ("sleep_date", "last_night_sleep", "naps_today")),
+                ("readiness", ("morning_readiness", "training_readiness")),
+                ("HRV", ("hrv",)),
+                ("training signals", ("training_status", "training_rhythm", "strain_yesterday")),
+                ("workout observations", ("recent_activities_7d", "recent_activities_7d_coverage")),
+                ("trend measurements", ("latest_weigh_in_30d", "weight_trend_30d",
+                                        "weekly_trends", "weekly_intensity")),
+                ("sensor availability", ("sensor_status", "coverage_note", "snapshot_cache")),
+            )}
+
+
+class CoachingStateChanged(RuntimeError):
+    """A draft cannot commit against a newer coaching decision or another calendar day."""
 
 
 def _prompt_json(value, label, seen=None):
@@ -2113,6 +2192,8 @@ def _assemble(prompt_file, question=None, include_history=True,
     parts.append("\n\nPROGRAMME_STATE:\n" + _prompt_json(
         _program_context(nutrition_focused), "PROGRAMME_STATE", shared))
     if not nutrition_focused:
+        parts.append("\n\nRECOVERY_SIGNALS (shared by the brief and informational notices):\n"
+                     + json.dumps(recovery_context(data), separators=(",", ":")))
         parts.append("\n\nROTATION_STATE:\n" + _prompt_json(_rotation_context(), "ROTATION_STATE", shared))
         parts.append("\n\nSCHEDULING_CONTEXT:\n" + _prompt_json(
             _scheduling_context(), "SCHEDULING_CONTEXT", shared))
@@ -2252,11 +2333,15 @@ def _training_reports(text, source, prev_bot=""):
     return _TRAINING_REPORT_RE.sub("", text), reports, errors
 
 
-def _generate_checked(prompt, source_text="", images=None, require_plan=False, show_schedule=False):
+def _generate_checked(prompt, source_text="", images=None, require_plan=False, show_schedule=False,
+                      cache_scope=None, expected_state=None):
     """Persist source-backed facts and validate proposals before returning an answer."""
     artifact_key = (_current_request + ":validated-answer:" +
                     hashlib.sha256(source_text.encode()).hexdigest()[:16]
+                    + (":" + cache_scope if cache_scope else "")
                     if _current_request else None)
+    if expected_state is not None and expected_state != _coaching_state():
+        raise CoachingStateChanged("Coaching state changed; rebuild the summary from current evidence.")
     if artifact_key:
         saved_answer = runtime_store().get_artifact(artifact_key)
         if saved_answer is not None:
@@ -2264,12 +2349,15 @@ def _generate_checked(prompt, source_text="", images=None, require_plan=False, s
     prev_bot = _last_bot_message() if source_text else ""
     auto_resolved = (memory_store().resolve_supported_health(source_text, prompt_context=prev_bot)
                      if source_text else [])
-    text = run_llm(prompt, images=images)
+    text = run_llm(prompt, images=images,
+                   **({"cache_scope": cache_scope + ":draft"} if cache_scope else {}))
     receipts = list(auto_resolved)
     pending_memory_errors = []
     for attempt in range(2):
         if not text:
             return None
+        if expected_state is not None and expected_state != _coaching_state():
+            raise CoachingStateChanged("Coaching state changed while the summary was being generated.")
         # User-sourced facts stand independently of whether the proposed workout is valid.
         # Apply them first so a newly stated exclusion guards this very response.
         candidate, changes, memory_errors = memory_store().process_markers(
@@ -2332,7 +2420,10 @@ def _generate_checked(prompt, source_text="", images=None, require_plan=False, s
                        "merely to avoid a repair. A frequency target is not a hard limit or "
                        "medical finding. Do not invent recovery reasons. Put the calendar "
                        "only in SESSION_PLAN; the application renders it.",
-                       images=images)
+                       images=images,
+                       **({"cache_scope": cache_scope + ":repair"} if cache_scope else {}))
+    if expected_state is not None and expected_state != _coaching_state():
+        raise CoachingStateChanged("Coaching state changed before the summary could be saved.")
     for report in reports:
         training_store().set_status(report["date"], report["status"],
                                     source=report["source_quote"])
@@ -2436,18 +2527,56 @@ def _generate_checked(prompt, source_text="", images=None, require_plan=False, s
     return clean
 
 
-def generate_summary():
+def generate_summary(auto=False):
     # Optional review work has its own scheduler slot; it must not block a requested brief.
+    day = coach_clock.today().isoformat()
+    runtime_store().note_summary_request(day)
+    _rotation_context(reconcile=True)
     prompt, snap = _assemble(SUMMARY_PROMPT_FILE, include_history=True, include_brief=False)
     if isinstance(snap, dict) and "__error__" in snap:
         return None, snap
-    completed_rotation = bool(_rotation_context(reconcile=True).get("completed_today"))
+    completed_rotation = bool(_rotation_context().get("completed_today"))
+    state = _coaching_state()
+    if state["day"] != day:
+        raise CoachingStateChanged("The date changed while assembling the morning brief.")
+    evidence = _summary_evidence(snap)
+    cached = runtime_store().daily_summary(day)
+    if cached and cached["state"] == state and cached["evidence"] == evidence:
+        log.info("stage=summary reused=true")
+        if not auto:
+            append_history("user", "GMS (requested the morning brief)")
+        append_history("agbot", cached["text"])
+        return cached["text"], snap
+    prior_plan = next((r for r in training_store().context()["plans"] if r["date"] == day), None)
+    changed = []
+    if cached:
+        changed = [key for key in evidence if evidence[key] != cached["evidence"].get(key)]
+        changed += [key for key in state if state[key] != cached["state"].get(key)]
+        prompt += ("\n\nSUMMARY REVISION: Since the previous brief these inputs changed: "
+                   + ", ".join(changed)
+                   + ". The current saved plan is authoritative. Only revise it when the "
+                     "changed evidence warrants it, and explain the specific evidence and "
+                     "trade-off. A fresh request, wording change or single watch flag is "
+                     "not by itself a reason to reverse the recommendation.")
     if completed_rotation:
         prompt += ("\n\nTODAY'S ROTATION SESSION IS ALREADY COMPLETED. Do not emit or rewrite "
                    "a plan for today; summarise the recorded session and outline future dates.")
-    text = _generate_checked(prompt, require_plan=not completed_rotation, show_schedule=completed_rotation)
+    scope = "daily-summary:v1:" + _decision_hash({"state": state, "evidence": evidence})
+    text = _generate_checked(prompt, require_plan=not completed_rotation,
+                             show_schedule=completed_rotation, cache_scope=scope, expected_state=state)
     if text:
-        append_history("user", "GMS (requested the morning brief)")
+        current_plan = next((r for r in training_store().context()["plans"] if r["date"] == day), None)
+        if prior_plan and current_plan and prior_plan["revision"] != current_plan["revision"]:
+            before, after = prior_plan["payload"]["kind"], current_plan["payload"]["kind"]
+            note = (f"**Plan revised: {before.title()} → {after.title()}.**"
+                    if before != after else "**Today's saved plan was updated.**")
+            text += "\n\n" + note + " The plan and its rationale above replace the earlier version."
+            if changed:
+                text += " Inputs reviewed: " + ", ".join(changed) + "."
+        runtime_store().save_daily_summary(day, {
+            "text": text, "state": _coaching_state(), "evidence": evidence})
+        if not auto:
+            append_history("user", "GMS (requested the morning brief)")
         append_history("agbot", text)
         save_todays_brief(text)
     return text, snap
@@ -2583,13 +2712,20 @@ def do_summary(chat_id, auto=False):
     log.info("Generating summary (auto=%s) for %s", auto, chat_id)
     if auto:
         send_message(chat_id, "\U0001F916 AgBot: pulling your overnight Garmin data for today's brief...")
-    text, snap = generate_summary()
+    text, snap = generate_summary(auto=auto)
     if isinstance(snap, dict) and "__error__" in snap:
         raise RuntimeError("Garmin data unavailable: " + str(snap["__error__"])[:180])
     if not text:
         _llm_fail_notice(chat_id, "generate your brief")
         return
-    send_message(chat_id, text, summary_date=coach_clock.today().isoformat())
+    day = coach_clock.today().isoformat()
+    record = runtime_store().daily_summary(day)
+    if not record or record["text"] != text:
+        raise CoachingStateChanged("The summary was superseded before it could be queued.")
+    state = record["state"]
+    send_message(chat_id, text, summary_date=day, coaching_state=state,
+                 delivery_key="summary:" + (_current_request or "direct") + ":" + _decision_hash(
+                     {"day": day, "state": state, "text": text}))
 
 
 def do_qa(chat_id, question):
@@ -3751,6 +3887,7 @@ def maybe_post_workout():
 
 
 def evaluate_red_flags(snap):
+    """Legacy name: these watch thresholds are screening signals, not clinical red flags."""
     flags = []
     r = snap.get("training_readiness") or {}
     if str(r.get("level", "")).upper() in ("LOW", "VERY_LOW"):
@@ -3768,6 +3905,21 @@ def evaluate_red_flags(snap):
     return flags
 
 
+def recovery_context(snap):
+    unavailable = not isinstance(snap, dict) or "__error__" in snap or snap.get("sensor_status") == "unavailable"
+    stale = bool(snap.get("snapshot_cache", {}).get("stale")) if isinstance(snap, dict) else False
+    return {
+        "availability": "unavailable" if unavailable else "stale" if stale else "current",
+        "signals": [] if unavailable or stale else evaluate_red_flags(snap),
+        "interpretation": (
+            "Screening signals, not a diagnosis or an automatic rest instruction. Consider "
+            "the same sleep, readiness, HRV trend, recent training, symptoms and user feedback "
+            "together. A below-baseline HRV reading alone does not establish a need for rest. "
+            "Informational notices do not change the saved plan; only a full assessment may "
+            "revise it, with an explanation of what changed."),
+    }
+
+
 def maybe_red_flags():
     own = owner()
     if not own:
@@ -3776,6 +3928,7 @@ def maybe_red_flags():
     if read_file(RED_FLAGS_FILE).strip() == today:
         return
     if (read_file(LAST_SUMMARY_FILE).strip() == today
+            or runtime_store().summary_requested(today)
             or runtime_store().summary_delivered(today)
             or runtime_store().summary_pending(today)):
         write_file(RED_FLAGS_FILE, today)  # the brief already covers this ground
@@ -3787,22 +3940,25 @@ def maybe_red_flags():
     snap = get_snapshot()
     if isinstance(snap, dict) and "__error__" in snap:
         return
-    flags = evaluate_red_flags(snap)
+    context = recovery_context(snap)
+    if context["availability"] != "current":
+        return
+    flags = context["signals"]
     if not flags:
         write_file(RED_FLAGS_FILE, today)
         return
-    log.info("Red flags this morning: %s", flags)
-    prompt, _ = _assemble(SUMMARY_PROMPT_FILE, data=snap)
-    prompt += ("\n\nURGENT_CONTEXT: It is early morning and these red flags fired: "
-               + ", ".join(flags) + ". Instead of a full brief write a SHORT (< 90 "
-               "words) early heads-up: name the concern(s) plainly and give ONE "
-               "adjustment for today (dial back intensity / prioritise recovery). "
-               "First line: \U0001F916 AgBot \u26A0\uFE0F Heads-up \u00B7 " + today_human() + ".")
-    text = _generate_checked(prompt)
-    if text:
-        append_history("agbot", "[early red-flag alert] " + text)
-        send_message(own, text)
-        write_file(RED_FLAGS_FILE, today)
+    log.info("stage=recovery_notice signals=%s plan_changed=false", flags)
+    text = ("AgBot · Recovery signal notice · " + today_human()
+            + "\n\nGarmin reports: " + ", ".join(flags) + "."
+            + "\nThis is not a workout or rest recommendation and does not change your "
+              "saved plan. The morning brief considers these signals alongside sleep, "
+              "recent training, symptoms and your feedback; one signal alone does not "
+              "establish that you need a rest day.")
+    send_message(own, text, delivery_key="recovery-notice:" + today,
+                 expires_at=now.replace(hour=AUTO_START[0], minute=AUTO_START[1],
+                                        second=0, microsecond=0).timestamp())
+    append_history("agbot", "[informational recovery notice; no plan change] " + text)
+    write_file(RED_FLAGS_FILE, today)
 
 
 def acquire_singleton_lock():
