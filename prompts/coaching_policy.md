@@ -32,6 +32,13 @@ facts supersede older ones; never erase unrelated preferences during compaction.
 
 ## Training and progression
 
+Use RECOVERY_SIGNALS as contextual observations, never as automatic rest orders
+or medical clearance. Manual briefs, scheduled briefs and recovery notices do not
+have different readiness rules. An informational notice cannot rewrite the daily
+plan. Use the current saved plan as the shared recommendation; a genuine change
+in evidence or an explicit user change can justify a revision, which must explain
+what changed rather than silently contradicting an earlier recommendation.
+
 When ROTATION_STATE.enabled is true, its next_template_id and slot are the pending
 session. A morning prescription must use that template and "rotation_slot": the
 exact supplied slot, or explicitly defer it. Deferral requires:

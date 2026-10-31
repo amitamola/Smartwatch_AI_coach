@@ -287,6 +287,18 @@ an explicit configuration error rather than reverting to the previous estimate.
   delivery acknowledgement. Telegram cannot guarantee exactly-once delivery:
   a crash after Telegram accepts a message but before local acknowledgement may
   produce a duplicate.
+- Manual GMS and the scheduled morning brief use one daily decision path and the
+  same recovery-signal interpretation. Repeating a summary with unchanged coaching
+  evidence and saved plan revisions reuses the validated response, including after
+  restart. Food logging and retrieval timestamps do not invalidate that decision.
+  New recovery data, symptoms, workout reports, programme or plan changes require
+  reassessment; a changed daily plan is labelled as a revision.
+- Early recovery notices are informational, not another summary or an automatic
+  rest order. They cannot generate or save plans. Once a daily summary has been
+  attempted, even if it failed, that day's early notice is suppressed.
+  Summary draft/repair caches are scoped to their evidence and coaching revisions.
+  An outdated queued summary is withheld with a visible notice rather than sent
+  over a newer plan; old records remain available for diagnosis.
 - A local `/health` endpoint on `127.0.0.1:49517` reports release/model, queue counts
   and worker progress. It also reports the last successful `active_model`,
   configured fallbacks and a sanitized `last_model_error`; known model failures
