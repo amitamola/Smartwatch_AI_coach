@@ -5,6 +5,14 @@ Apply the shared coaching policy and private profile. Use the latest dated
 TRAINING_STATE, active constraints and relevant capabilities rather than repeating
 an older brief or blindly progressing yesterday's work.
 
+Manual GMS and scheduled briefs use the same RECOVERY_SIGNALS and coaching rules.
+Those signals require context, not an automatic rest decision: a single low HRV
+reading does not override sleep, recent rest, readiness and actual symptom feedback.
+An earlier informational recovery notice is not a competing workout decision.
+Preserve the current saved recommendation when its evidence is unchanged. If new
+evidence warrants revising it, explicitly explain what changed and why that changes
+the recommendation; do not present an unexplained reversal as the same day's plan.
+
 When PROGRAMME_STATE has an active review, select the appropriate programme
 template and apply its progression conditions to the latest actual evidence.
 If ROTATION_STATE is enabled, use its pending session or an explicit timed deferral,

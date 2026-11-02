@@ -137,6 +137,35 @@ class RuntimeTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             reopened.save_artifact("nan", {"value": float("nan")})
 
+    def test_requested_and_cached_summary_survive_restart_without_losing_other_days(self):
+        day = "2026-02-01"
+        record = {"state": {"plans": "revision-2"}, "evidence": {"sleep": "observed"},
+                  "text": "A validated summary"}
+        self.store.note_summary_request(day)
+        self.store.save_daily_summary(day, record)
+        reopened = RuntimeStore(self.store.path)
+        self.assertTrue(reopened.summary_requested(day))
+        self.assertFalse(reopened.summary_requested("2026-02-02"))
+        self.assertEqual(reopened.daily_summary(day), record)
+        returned = reopened.daily_summary(day)
+        returned["state"]["plans"] = "modified copy"
+        self.assertEqual(reopened.daily_summary(day), record)
+        reopened.save_daily_summary("2026-02-02", dict(record, text="Next day"))
+        self.assertEqual(reopened.daily_summary(day), record)
+
+    def test_superseding_delivery_cancels_only_unsent_chunks_of_that_group(self):
+        self.store.enqueue("first", 1, {"text": "old first"}, group_id="old")
+        self.store.enqueue("second", 1, {"text": "old second"}, group_id="old")
+        self.store.enqueue("new", 1, {"text": "new summary"}, group_id="new")
+        self.store.delivered("first", 5)
+        self.store.cancel_delivery("first", "Coaching context changed")
+        self.assertEqual([r["id"] for r in self.store.due_messages()], ["new"])
+        with self.store.connection() as db:
+            row = db.execute("SELECT status,last_error,payload FROM outbox WHERE id='second'").fetchone()
+        self.assertEqual(row["status"], "cancelled")
+        self.assertEqual(row["last_error"], "Coaching context changed")
+        self.assertIn("old second", row["payload"])
+
     def test_sent_chunk_deadline_expires_remaining_scheduled_chunks(self):
         self.store.enqueue("first", 1, {}, now=0, group_id="scheduled", expires_at=20)
         self.store.enqueue("second", 1, {}, now=0, group_id="scheduled")

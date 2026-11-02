@@ -1,3 +1,4 @@
+import copy
 import importlib
 import json
 import logging
@@ -75,6 +76,218 @@ class BridgeTests(unittest.TestCase):
             "- Calories: ~300 eaten / 2,100 kcal target; ~1,800 remaining.\n"
             "- Protein: ~21g eaten / 100g target; ~79g remaining.\n"
             "[[MEAL: " + json.dumps(meal) + "]]")
+
+    def alignment_snapshot(self):
+        return {
+            "sleep_date": date.today().isoformat(),
+            "last_night_sleep": {"time_asleep_s": 7.5 * 3600, "score": 81},
+            "training_readiness": {"score": 62, "level": "MODERATE"},
+            "hrv": {"last_night_avg": 28, "baseline_balanced_low": 30},
+            "recent_activities_7d": [],
+            "snapshot_cache": {"stale": False, "age_seconds": 0, "loaded_at": 100},
+        }
+
+    def alignment_workout(self):
+        plan = {"date": date.today().isoformat(), "kind": "strength",
+                "objective": "Controlled synthetic session", "reason": "Review all current evidence",
+                "exercises": [
+                    {"name": "Synthetic preparation", "role": "warmup",
+                     "blocks": [{"duration_seconds": 60}]},
+                    {"name": "Synthetic press", "role": "anchor",
+                     "sets": [{"reps": 8, "weight_kg": None}], "effort": "Comfortable effort"},
+                    {"name": "Synthetic cool-down", "role": "cooldown",
+                     "blocks": [{"duration_seconds": 60}]}]}
+        return "Consider the evidence together.\n[[SESSION_PLAN: " + json.dumps(plan) + "]]"
+
+    def test_early_notice_shares_signals_but_never_generates_or_changes_a_plan(self):
+        b = self.bridge
+        snapshot = self.alignment_snapshot()
+        _, saved_plans, errors = b.parse_plans(self.alignment_workout(), require_phases=True)
+        self.assertEqual(errors, [])
+        b.training_store().save(saved_plans)
+        before = b.training_store().context()["plans"]
+        early = datetime.now().astimezone().replace(hour=8, minute=0)
+        with patch.object(b, "owner", return_value=123), \
+                patch.object(b.coach_clock, "now", return_value=early), \
+                patch.object(b.time, "time", return_value=early.timestamp()), \
+                patch.object(b, "get_snapshot", return_value=snapshot), \
+                patch.object(b, "run_llm", side_effect=AssertionError("An alert must not call a model")):
+            b.maybe_red_flags()
+        self.assertEqual(b.training_store().context()["plans"], before)
+        notices = b.runtime_store().due_messages(now=early.timestamp())
+        self.assertEqual(len(notices), 1)
+        self.assertIn("Recovery signal notice", notices[0]["payload"]["text"])
+        self.assertIn("HRV below baseline", notices[0]["payload"]["text"])
+        self.assertIn("does not change your", notices[0]["payload"]["text"])
+        self.assertIsNotNone(notices[0]["expires_at"])
+        self.assertIsNone(b.runtime_store().daily_summary(date.today().isoformat()))
+        with patch.object(b, "get_snapshot", return_value=snapshot), \
+                patch.object(b, "load_fitness_profile", return_value={}), \
+                patch.object(b, "run_llm", return_value=self.alignment_workout()) as model:
+            result, _ = b.generate_summary()
+        prompt = model.call_args.args[0]
+        self.assertIn("RECOVERY_SIGNALS", prompt)
+        self.assertIn("HRV below baseline", prompt)
+        self.assertNotIn("URGENT_CONTEXT", prompt)
+        self.assertIn("Strength plan", result)
+
+    def test_failed_requested_summary_does_not_spawn_an_alternative_alert_decision(self):
+        b = self.bridge
+        with patch.object(b, "_assemble", side_effect=OSError("temporary snapshot failure")), \
+                self.assertRaises(OSError):
+            b.generate_summary()
+        b._runtime_store = None
+        early = datetime.now().astimezone().replace(hour=8, minute=0)
+        with patch.object(b, "owner", return_value=123), \
+                patch.object(b.coach_clock, "now", return_value=early), \
+                patch.object(b, "get_snapshot") as snapshot, \
+                patch.object(b, "run_llm") as model:
+            b.maybe_red_flags()
+        snapshot.assert_not_called()
+        model.assert_not_called()
+        self.assertEqual(b.runtime_store().due_messages(), [])
+
+    def test_manual_and_automatic_summaries_reuse_same_decision_across_restart(self):
+        b = self.bridge
+        snapshot = self.alignment_snapshot()
+        with patch.object(b, "get_snapshot", side_effect=lambda **_: copy.deepcopy(snapshot)), \
+                patch.object(b, "load_fitness_profile", return_value={}), \
+                patch.object(b, "run_llm", return_value=self.alignment_workout()) as model:
+            b._current_request = "update:manual-summary"
+            first, _ = b.generate_summary()
+            revision = b.training_store().context()["plans"][0]["revision"]
+            b.append_journal("A voluntary meal estimate (~200 kcal).")
+            snapshot["generated_at"] = "later retrieval"
+            snapshot["snapshot_cache"].update(age_seconds=75, loaded_at=200)
+            snapshot["calorie_budget"] = {"target_kcal": 2000}
+            b._runtime_store = None
+            b._current_request = "scheduled:summary"
+            second, _ = b.generate_summary(auto=True)
+        model.assert_called_once()
+        self.assertEqual(first, second)
+        self.assertEqual(b.training_store().context()["plans"][0]["revision"], revision)
+        self.assertFalse(any(t["role"] == "user" and t.get("request_id") == "scheduled:summary"
+                             for t in b.load_history()))
+
+    def test_new_evidence_reassesses_and_labels_a_changed_recommendation(self):
+        b = self.bridge
+        snapshot = self.alignment_snapshot()
+        with patch.object(b, "get_snapshot", side_effect=lambda **_: copy.deepcopy(snapshot)), \
+                patch.object(b, "load_fitness_profile", return_value={}), \
+                patch.object(b, "run_llm", side_effect=[self.alignment_workout(), self.rest_reply()]) as model:
+            first, _ = b.generate_summary()
+            snapshot["last_night_sleep"]["time_asleep_s"] = 4 * 3600
+            second, _ = b.generate_summary()
+        self.assertIn("Strength plan", first)
+        self.assertIn("Plan revised: Strength → Rest", second)
+        self.assertIn("Inputs reviewed: sleep", second)
+        self.assertIn("SUMMARY REVISION", model.call_args.args[0])
+        self.assertNotEqual(model.call_args_list[0].kwargs["cache_scope"],
+                            model.call_args_list[1].kwargs["cache_scope"])
+
+    def test_legacy_cached_answer_cannot_override_a_newer_saved_plan(self):
+        b = self.bridge
+        b._current_request = "update:legacy-summary"
+        old_text = self.alignment_workout()
+        b.runtime_store().save_generation(b._current_request + ":generation:1", old_text)
+        b.runtime_store().save_artifact(
+            b._current_request + ":validated-answer:" + b.hashlib.sha256(b"").hexdigest()[:16],
+            {"text": "Previously validated but now obsolete strength advice."})
+        _, plans, _ = b.parse_plans(self.rest_reply())
+        b.training_store().save(plans, source="newer_plan")
+        with patch.object(b, "get_snapshot", return_value=self.alignment_snapshot()), \
+                patch.object(b, "load_fitness_profile", return_value={}), \
+                patch.dict(b._LLM_BACKENDS, {b.LLM_BACKEND: lambda *_: self.rest_reply()}):
+            result, _ = b.generate_summary()
+        self.assertIn("Rest plan", result)
+        self.assertNotIn("obsolete", result)
+        self.assertEqual(b.training_store().context()["plans"][0]["payload"]["kind"], "rest")
+        self.assertEqual(b.runtime_store().saved_generation(
+            b._current_request + ":generation:1"), old_text)
+
+    def test_failed_draft_is_rebased_when_user_facts_change_before_retry(self):
+        b = self.bridge
+        b._current_request = "update:retry-summary"
+        snapshot = self.alignment_snapshot()
+        with patch.object(b, "get_snapshot", return_value=snapshot), \
+                patch.object(b, "load_fitness_profile", return_value={}), \
+                patch.dict(b._LLM_BACKENDS, {b.LLM_BACKEND: lambda *_: "Invalid: no dated plan."}), \
+                self.assertRaises(ValueError):
+            b.generate_summary()
+        b.memory_store().upsert("health", "knee", "My knee hurts.", source_text="My knee hurts.",
+                                verified=True)
+        with patch.object(b, "get_snapshot", return_value=snapshot), \
+                patch.object(b, "load_fitness_profile", return_value={}), \
+                patch.dict(b._LLM_BACKENDS, {b.LLM_BACKEND: lambda *_: self.rest_reply()}):
+            result, _ = b.generate_summary()
+        self.assertIn("Rest plan", result)
+        with b.runtime_store().connection() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM generations").fetchone()[0], 3)
+        self.assertEqual(len(b.memory_store().records("health")), 1)
+
+    def test_summary_cannot_commit_if_plan_changes_during_generation(self):
+        b = self.bridge
+        _, rest, _ = b.parse_plans(self.rest_reply())
+        def concurrent_plan_change(*args, **kwargs):
+            b.training_store().save(rest, source="newer_user_decision")
+            return self.alignment_workout()
+        with patch.object(b, "get_snapshot", return_value=self.alignment_snapshot()), \
+                patch.object(b, "load_fitness_profile", return_value={}), \
+                patch.object(b, "run_llm", side_effect=concurrent_plan_change), \
+                self.assertRaises(b.CoachingStateChanged):
+            b.generate_summary()
+        self.assertEqual(b.training_store().context()["plans"][0]["payload"]["kind"], "rest")
+        self.assertIsNone(b.runtime_store().daily_summary(date.today().isoformat()))
+
+    def test_queued_older_summary_is_cancelled_without_cancelling_its_replacement(self):
+        b = self.bridge
+        b._current_request = "update:queued-summary"
+        with patch.object(b, "get_snapshot", return_value=self.alignment_snapshot()), \
+                patch.object(b, "load_fitness_profile", return_value={}), \
+                patch.object(b, "run_llm", side_effect=[self.alignment_workout(), self.rest_reply()]):
+            b.do_summary(123)
+            older = [item["id"] for item in b.runtime_store().due_messages()]
+            b.memory_store().upsert("health", "knee", "My knee hurts.", source_text="My knee hurts.",
+                                    verified=True)
+            b.do_summary(123)
+        with patch.object(b, "_post", return_value={"ok": True, "result": {"message_id": 9}}) as post:
+            b.flush_outbox()
+            b.flush_outbox()
+        delivered = "\n".join(call.args[1]["text"] for call in post.call_args_list)
+        self.assertNotIn("Strength plan", delivered)
+        self.assertIn("Rest plan", delivered)
+        self.assertIn("withheld an older summary", delivered)
+        with b.runtime_store().connection() as db:
+            for key in older:
+                self.assertEqual(db.execute("SELECT status FROM outbox WHERE id=?", (key,)).fetchone()[0],
+                                 "cancelled")
+        self.assertTrue(b.runtime_store().summary_delivered(date.today().isoformat()))
+
+    def test_stale_or_unavailable_data_does_not_fire_a_recovery_notice(self):
+        b = self.bridge
+        early = datetime.now().astimezone().replace(hour=8, minute=0)
+        stale = self.alignment_snapshot()
+        stale["snapshot_cache"]["stale"] = True
+        with patch.object(b, "owner", return_value=123), \
+                patch.object(b.coach_clock, "now", return_value=early), \
+                patch.object(b, "get_snapshot", side_effect=[stale, {"__error__": "offline"}]), \
+                patch.object(b, "run_llm") as model:
+            b.maybe_red_flags()
+            b.maybe_red_flags()
+        model.assert_not_called()
+        self.assertEqual(b.runtime_store().due_messages(), [])
+
+    def test_yesterdays_queued_summary_cannot_be_delivered_as_todays_plan(self):
+        b = self.bridge
+        day = date.today()
+        b.send_message(123, "An earlier daily plan", summary_date=day.isoformat())
+        with patch.object(b.coach_clock, "today", return_value=day + timedelta(days=1)), \
+                patch.object(b, "_post") as post:
+            b.flush_outbox()
+        post.assert_not_called()
+        self.assertFalse(b.runtime_store().summary_delivered(day.isoformat()))
+        self.assertEqual(b.runtime_store().counts()["outbox"]["cancelled"], 1)
+        self.assertIn("withheld an older summary", b.runtime_store().due_messages()[0]["payload"]["text"])
 
     def test_legacy_prose_food_requires_structured_repair(self):
         b = self.bridge

@@ -230,6 +230,41 @@ class RuntimeStore:
             row = db.execute("SELECT value FROM runtime_artifacts WHERE key=?", (key,)).fetchone()
         return json.loads(row["value"]) if row else None
 
+    def cancel_delivery(self, key, reason):
+        """Cancel unsent chunks together; retain the original payload and audit reason."""
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT group_id FROM outbox WHERE id=?", (key,)).fetchone()
+            if row is None:
+                raise KeyError(key)
+            db.execute(
+                "UPDATE outbox SET status='cancelled',last_error=? WHERE status='pending' "
+                "AND (id=? OR (group_id IS NOT NULL AND group_id=?))",
+                (reason, key, row["group_id"]))
+
+    def note_summary_request(self, day):
+        with self.connection() as db:
+            db.execute("INSERT OR IGNORE INTO runtime_meta VALUES (?,?)",
+                       ("summary_requested:" + day, str(time.time())))
+
+    def summary_requested(self, day):
+        with self.connection() as db:
+            return db.execute("SELECT 1 FROM runtime_meta WHERE key=?",
+                              ("summary_requested:" + day,)).fetchone() is not None
+
+    def daily_summary(self, day):
+        with self.connection() as db:
+            row = db.execute("SELECT value FROM runtime_meta WHERE key=?",
+                             ("daily_summary:" + day,)).fetchone()
+        return json.loads(row["value"]) if row else None
+
+    def save_daily_summary(self, day, record):
+        """Cache a validated rendering; training_plans remains the plan authority."""
+        encoded = json.dumps(record, sort_keys=True, ensure_ascii=False, allow_nan=False)
+        with self.connection() as db:
+            db.execute("INSERT INTO runtime_meta VALUES (?,?) ON CONFLICT(key) "
+                       "DO UPDATE SET value=excluded.value", ("daily_summary:" + day, encoded))
+
     def save_artifact(self, key, value):
         """Write once, returning stored JSON; conflicting replays raise ArtifactConflictError."""
         if not isinstance(key, str) or not key:
