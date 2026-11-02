@@ -79,6 +79,13 @@ class PlanTests(unittest.TestCase):
             self.assertFalse(self.parse(self.plan(kind="mixed", exercises=[
                 {"name": "Synthetic movement", field: [
                     {"reps": None, "weight_kg": None, "rest_seconds": None}]}]))[2])
+        for valid_reps in ("10", "8-10 each side", "10 per side"):
+            with self.subTest(valid_reps=valid_reps):
+                self.assertFalse(self.parse(self.plan(kind="strength", exercises=[
+                    {"name": "Synthetic movement", "sets": [{"reps": valid_reps}]}]))[2])
+        future_outline = {"date": "2026-01-02", "kind": "cardio", "detail_level": "outline",
+                          "objective": "Provisional aerobic ride", "exercises": []}
+        self.assertFalse(self.parse(future_outline)[2])
         self.assertTrue(self.parse(self.plan(kind="cardio", exercises=[
             {"name": "Synthetic walk", "blocks": ["10 minutes"]}]))[2])
 

@@ -108,6 +108,16 @@ def _number(value, field, minimum=0, maximum=None, integer=False):
                          f"in its supported range, or null when unknown")
 
 
+def _plan_text(value):
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        return ".\n".join(part for v in value.values() for part in (_plan_text(v),) if part)
+    if isinstance(value, list):
+        return ".\n".join(part for v in value for part in (_plan_text(v),) if part)
+    return ""
+
+
 def _phase(exercise, item=None):
     item = item or {}
     value = item.get("phase") or item.get("role") or item.get("type")
@@ -122,8 +132,17 @@ def _validate_dose(item):
     for key, value in item.items():
         if key == "reps":
             if isinstance(value, str):
-                match = re.fullmatch(r"([1-9]\d*)-([1-9]\d*)", value)
-                if not match or int(match[1]) > int(match[2]):
+                cleaned = re.sub(
+                    r"\s*(?:reps?|each(?:\s+side|\s+leg|\s+arm|\s+hand)?|"
+                    r"per\s+(?:side|leg|arm|hand)|/side)\s*$",
+                    "", value.strip(), flags=re.I)
+                single = re.fullmatch(r"[1-9]\d*", cleaned)
+                span = re.fullmatch(r"([1-9]\d*)\s*[-–]\s*([1-9]\d*)", cleaned)
+                if single:
+                    item[key] = int(cleaned)
+                elif span and int(span[1]) <= int(span[2]):
+                    item[key] = f"{span[1]}-{span[2]}"
+                else:
                     raise ValueError("reps must be a positive integer, ordered integer range, or null")
             else:
                 _number(value, key, 1, integer=True)
@@ -276,7 +295,9 @@ def parse_plans(text, preferences=(), today=None, existing_plans=(), require_pha
             if not isinstance(plan.get("objective"), str) or not plan["objective"].strip():
                 raise ValueError("plan needs an objective")
             if not isinstance(plan.get("reason"), str) or not plan["reason"].strip():
-                if day > today and plan.get("kind") == "rest":
+                if day > today and (plan.get("kind") == "rest"
+                                    or plan.get("detail_level") == "outline"
+                                    or not plan.get("exercises")):
                     plan["reason"] = plan["objective"]
                 else:
                     raise ValueError("plan needs a reason based on the available evidence")
@@ -315,7 +336,7 @@ def parse_plans(text, preferences=(), today=None, existing_plans=(), require_pha
             _validate_prescription(plan, require_phases, constraints)
             claims = unsupported_claims(render_plans([plan]))
             # Outlines omit their reason and guidance in the compact rendered card.
-            claims += unsupported_claims(json.dumps(plan, ensure_ascii=False))
+            claims += unsupported_claims(_plan_text(plan))
             if claims:
                 raise ValueError("; ".join(dict.fromkeys(claims)))
             plans.append(plan)

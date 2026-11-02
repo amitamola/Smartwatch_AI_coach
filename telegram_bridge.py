@@ -1641,7 +1641,7 @@ def _scheduling_context(plans=()):
     }
 
 
-def _plan_load_errors(plans):
+def _plan_load_errors(plans, required=()):
     errors = []
     observed = training_store().context()["latest_observed_per_movement"]
     feedback = [r for r in memory_store().records("anchor")
@@ -1652,7 +1652,8 @@ def _plan_load_errors(plans):
             recorded = observed.get(name, {}).get("recorded_sets", {})
             own_load = (isinstance(recorded.get("top_weight_kg"), (int, float))
                         and recorded["top_weight_kg"] > 0
-                        and recorded.get("weight_basis") == move.get("weight_basis")
+                        and (recorded.get("weight_basis") == move.get("weight_basis")
+                             or (name not in required and recorded.get("weight_basis") is None))
                         and move.get("weight_basis") not in (None, "unspecified"))
             basis_pattern = {"per_hand": r"\b(?:per|each) hand\b",
                              "machine_stack": r"\b(?:machine|stack)\b"}.get(move.get("weight_basis"))
@@ -1672,13 +1673,14 @@ def _plan_load_errors(plans):
 
 
 def _program_plan_errors(plans, reports=()):
-    errors = _plan_load_errors(plans) if plans else []
-    if not PROGRAM_ENABLED or (not plans and not reports):
+    active = program_store().peek_context().get("active") if PROGRAM_ENABLED else None
+    review = active["review"] if active else {}
+    required = {canonical_exercise(name) for name in _training_policy().get("required_exercises", [])}
+    required.update(canonical_exercise(d["exercise"]) for d in review.get("decisions", [])
+                    if d.get("action") == "introduce")
+    errors = _plan_load_errors(plans, required=required) if plans else []
+    if not PROGRAM_ENABLED or not active or (not plans and not reports):
         return errors
-    active = program_store().peek_context().get("active")
-    if not active:
-        return errors
-    review = active["review"]
     templates = {item["id"]: item for item in review["session_templates"]}
     pre_rotation = _rotation_context() if reports else None
     rotation = _rotation_context(reports=reports)

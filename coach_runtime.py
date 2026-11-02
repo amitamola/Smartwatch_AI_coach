@@ -20,6 +20,7 @@ class RuntimeStore:
     def __init__(self, path):
         self.path = str(path)
         with self.connection() as db:
+            db.execute("PRAGMA journal_mode=WAL")
             db.executescript("""
                 CREATE TABLE IF NOT EXISTS runtime_meta (
                     key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -53,7 +54,6 @@ class RuntimeStore:
     def connection(self):
         db = sqlite3.connect(self.path, timeout=30)
         db.row_factory = sqlite3.Row
-        db.execute("PRAGMA journal_mode=WAL")
         db.execute("PRAGMA busy_timeout=30000")
         try:
             with db:
@@ -74,6 +74,7 @@ class RuntimeStore:
         """Persist complete updates and their acknowledgement cursor in one transaction."""
         now = time.time() if now is None else now
         with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
             for update in updates:
                 update_id = int(update["update_id"])
                 inserted = db.execute("INSERT OR IGNORE INTO received_updates VALUES (?,?)",
