@@ -28,6 +28,7 @@ import json
 import hashlib
 import time
 import socket
+import sqlite3
 import logging
 import tempfile
 import subprocess
@@ -193,7 +194,9 @@ class RedactingFormatter(logging.Formatter):
     def format(self, record):
         rendered = super().format(record)
         rendered = re.sub(r"bot\d+:[A-Za-z0-9_-]+", "bot[REDACTED]", rendered)
-        return re.sub(r"\b(?:gh[pousr]_[A-Za-z0-9]+|github_pat_[A-Za-z0-9_]+)\b",
+        rendered = re.sub(r"\b\d{6,}:[A-Za-z0-9_-]{20,}", "[REDACTED]", rendered)
+        rendered = re.sub(r"(?i)\bBearer\s+\S+", "Bearer [REDACTED]", rendered)
+        return re.sub(r"\b(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+)\b",
                       "[REDACTED]", rendered)
 
 
@@ -207,7 +210,7 @@ from coach_memory import MemoryStore
 from coach_nutrition import NutritionStore, parse_food, midpoint, render_receipt
 from coach_plan import TrainingStore, canonical_exercise, parse_plans, render_plans, unsupported_claims
 from coach_program import ProgramStore, build_review_evidence, parse_program_review, render_program
-from coach_runtime import RuntimeStore, SnapshotCache, message_key
+from coach_runtime import RuntimeStore, SnapshotCache, database_busy, message_key
 from coach_context import (
     compact_workouts, plan_request_scope, schedule_claim_errors, strip_schedule_rendering,
 )
@@ -225,6 +228,7 @@ _current_request = None
 _send_sequence = 0
 _generation_sequence = 0
 _worker_started = None
+_storage_waiting = False
 _last_progress = time.time()
 _stop = threading.Event()
 _delivery_lock = threading.Lock()
@@ -4017,8 +4021,10 @@ def _health_report():
     components = {
         "poller": _poll_progress is not None and (_draining.is_set() or now - _poll_progress < 180),
         "outbox": _publisher_progress is not None and now - _publisher_progress < 30,
-        "worker": (now - (_worker_started or _last_progress)) < max(360, COPILOT_TIMEOUT * 2 + 60),
-        "scheduler": (now - (_worker_started or _last_progress)) < max(360, COPILOT_TIMEOUT * 2 + 60),
+        "worker": not _storage_waiting and (
+            now - (_worker_started or _last_progress)) < max(360, COPILOT_TIMEOUT * 2 + 60),
+        "scheduler": not _storage_waiting and (
+            now - (_worker_started or _last_progress)) < max(360, COPILOT_TIMEOUT * 2 + 60),
     }
     report = {
         "status": ("degraded" if _llm_last_error else
@@ -4026,6 +4032,7 @@ def _health_report():
         "ready": all(components.values()) and not _llm_last_error,
         "components": components,
         "worker_busy": busy,
+        "storage_waiting": _storage_waiting,
         "scheduled_jobs_busy": _scheduled_job is not None,
         "draining": _draining.is_set(),
         "model": COPILOT_MODEL, "reasoning": COPILOT_REASONING_EFFORT,
@@ -4078,6 +4085,16 @@ def _serve_health(listener):
                                    + f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
             except (OSError, ValueError):
                 log.exception("stage=health request failed")
+            except sqlite3.Error:
+                # Health must remain observable during a storage outage.
+                log.exception("stage=health storage unavailable")
+                body = b'{"ready":false,"status":"degraded","error":"storage_unavailable"}'
+                try:
+                    connection.sendall(
+                        b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\n"
+                        + f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
+                except OSError:
+                    log.warning("stage=health client disconnected during storage failure")
 
 
 def _process_request(item):
@@ -4091,6 +4108,25 @@ def _process_request(item):
         do_images(chat_id, [_photo_file_id(m) for m in messages], caption)
     else:
         dispatch(messages[0])
+
+
+def _claim_request():
+    global _storage_waiting
+    while not _stop.is_set():
+        try:
+            item = runtime_store().claim()
+        except sqlite3.OperationalError as exc:
+            if not database_busy(exc):
+                raise
+            _storage_waiting = True
+            log.warning("stage=worker storage_busy=true; request and cursor retained; retrying in 5s")
+            _stop.wait(5)
+        else:
+            if _storage_waiting:
+                log.info("stage=worker storage_busy=false; queue access recovered")
+            _storage_waiting = False
+            return item
+    return None
 
 
 def main():
@@ -4121,7 +4157,9 @@ def main():
     jobs = (maybe_program_review, maybe_auto_summary, maybe_red_flags, maybe_post_workout, maybe_meal_reminders,
             maybe_hydration_reminders, maybe_exercise_checkins)
     while not _stop.is_set():
-        item = runtime_store().claim()
+        item = _claim_request()
+        if _stop.is_set():
+            break
         if item:
             _current_request = item["id"]
             _send_sequence = _generation_sequence = 0
@@ -4171,6 +4209,17 @@ def main():
         if _draining.is_set():
             _last_progress = time.time()
         _stop.wait(1)
+
+
+def run_service():
+    try:
+        main()
+    except KeyboardInterrupt:
+        _stop.set()
+        log.info("stage=shutdown reason=keyboard_interrupt")
+    except Exception:
+        log.exception("stage=fatal bridge exiting; launcher recovery required")
+        raise
 
 
 if __name__ == "__main__":
@@ -4264,4 +4313,4 @@ if __name__ == "__main__":
         print("---- OUTPUT ----")
         print(text)
         sys.exit(0)
-    main()
+    run_service()

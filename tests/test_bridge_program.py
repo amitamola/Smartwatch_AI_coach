@@ -32,6 +32,7 @@ class ProgrammeBridgeTests(unittest.TestCase):
         b.STATE = str(self.state)
         b._memory_store = b._training_store = b._runtime_store = b._program_store = None
         b._current_request = None
+        b._storage_waiting = False
         b._send_sequence = b._generation_sequence = 0
         b._set_msg_sent_at(None)
         for name, value in (
