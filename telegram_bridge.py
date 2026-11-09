@@ -1672,8 +1672,7 @@ def _plan_load_errors(plans, required=()):
             recorded = observed.get(name, {}).get("recorded_sets", {})
             own_load = (isinstance(recorded.get("top_weight_kg"), (int, float))
                         and recorded["top_weight_kg"] > 0
-                        and (recorded.get("weight_basis") == move.get("weight_basis")
-                             or (name not in required and recorded.get("weight_basis") is None))
+                        and recorded.get("weight_basis") in (None, move.get("weight_basis"))
                         and move.get("weight_basis") not in (None, "unspecified"))
             basis_pattern = {"per_hand": r"\b(?:per|each) hand\b",
                              "machine_stack": r"\b(?:machine|stack)\b"}.get(move.get("weight_basis"))
@@ -1748,8 +1747,9 @@ def _program_plan_errors(plans, reports=()):
         return errors
     errors.extend(rotation_plan_errors(plans, rotation))
     for plan in plans:
-        if (plan["kind"] == "rest" or (plan.get("detail_level") == "outline"
-                                      and plan["date"] > coach_clock.today().isoformat())):
+        if ((_is_rest_or_recovery_plan(plan) and not plan.get("exercises"))
+                or (plan.get("detail_level") == "outline"
+                    and plan["date"] > coach_clock.today().isoformat())):
             continue
         template_id = plan.get("program_template_id")
         if template_id is not None and not isinstance(template_id, str):
@@ -2402,7 +2402,8 @@ def _generate_checked(prompt, source_text="", images=None, require_plan=False, s
                 p["date"] == coach_clock.today().isoformat() for p in plans):
             errors.append("today's structured SESSION_PLAN is required")
         if require_plan in (True, "today") and any(
-                p["date"] == coach_clock.today().isoformat() and p["kind"] != "rest"
+                p["date"] == coach_clock.today().isoformat()
+                and not (_is_rest_or_recovery_plan(p) and not p.get("exercises"))
                 and (p.get("detail_level") == "outline" or not p.get("exercises"))
                 and p.get("delivery") != "instructor_led"
                 for p in plans):
@@ -2570,7 +2571,8 @@ def generate_summary(auto=False):
                              show_schedule=completed_rotation, cache_scope=scope, expected_state=state)
     if text:
         current_plan = next((r for r in training_store().context()["plans"] if r["date"] == day), None)
-        if prior_plan and current_plan and prior_plan["revision"] != current_plan["revision"]:
+        if ((cached or (prior_plan and prior_plan["payload"].get("detail_level") != "outline"))
+                and prior_plan and current_plan and prior_plan["revision"] != current_plan["revision"]):
             before, after = prior_plan["payload"]["kind"], current_plan["payload"]["kind"]
             note = (f"**Plan revised: {before.title()} → {after.title()}.**"
                     if before != after else "**Today's saved plan was updated.**")
@@ -3661,23 +3663,23 @@ def maybe_hydration_reminders():
     due = hydration_slots_due(now, sent, today)
     if not due:
         return
-    logged_ml, goal_ml = _hydration_progress()
-    if logged_ml is None or goal_ml is None:
-        log.info("stage=hydration unknown intake/goal; no deficit-based nudge")
-        return
+    logged_ml, goal_ml = (_hydration_progress()
+                          if any(should for _, _, _, should in due) else (None, None))
     changed = False
     for idx, slot, hh, should in due:
-        if should and _hydration_on_pace(hh, logged_ml, goal_ml):
+        if not should:
+            log.info("Hydration %s missed window - skipping", slot)
+        elif logged_ml is None or goal_ml is None:
+            log.info("stage=hydration slot=%s unknown intake/goal; no deficit-based nudge", slot)
+        elif _hydration_on_pace(hh, logged_ml, goal_ml):
             log.info("Hydration %s skipped - on pace (%s/%s ml)", slot, logged_ml, goal_ml)
-        elif should:
+        else:
             log.info("Hydration reminder %s at %s (%s/%s ml)", slot,
                      now.strftime("%H:%M"), logged_ml, goal_ml)
             send_message(own, _hydration_nudge_text(
                 hh, logged_ml, goal_ml, HYDRATION_MESSAGES[idx % len(HYDRATION_MESSAGES)]),
                 expires_at=now.replace(hour=hh, minute=0, second=0).timestamp()
                 + HYDRATION_CATCHUP_MIN * 60)
-        else:
-            log.info("Hydration %s missed window - skipping", slot)
         sent[slot] = today
         changed = True
     if changed:

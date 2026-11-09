@@ -1062,6 +1062,27 @@ class BridgeTests(unittest.TestCase):
         self.assertTrue(b._program_plan_errors([plan]))
         plan["exercises"][0]["sets"][0]["weight_kg"] = None
         self.assertEqual(b._program_plan_errors([plan]), [])
+        b.training_store().record_activities([{
+            "activity_id": "curl-1", "start": date.today().isoformat(),
+            "type": "strength_training",
+            "logged_sets": [{"exercise": "Dumbbell Biceps Curl", "sets": 2,
+                             "reps": "10", "top_weight_kg": 8.0}]}])
+        observed_required = {"exercises": [{"name": "Dumbbell Biceps Curl",
+                                            "weight_basis": "per_hand",
+                                            "sets": [{"weight_kg": 8}]}]}
+        self.assertEqual(b._plan_load_errors([observed_required], required={"dumbbell biceps curl"}), [])
+
+    def test_hydration_unknown_intake_marks_slot_without_minute_by_minute_polling(self):
+        b = self.bridge
+        morning = datetime.now().astimezone().replace(hour=8, minute=10, second=0, microsecond=0)
+        with patch.object(b, "owner", return_value="123"), \
+                patch.object(b, "_reminders_allowed", return_value=True), \
+                patch.object(b.coach_clock, "now", return_value=morning), \
+                patch.object(b.coach_clock, "today", return_value=morning.date()), \
+                patch.object(b, "_hydration_progress", return_value=(None, None)) as progress:
+            b.maybe_hydration_reminders()
+            b.maybe_hydration_reminders()
+        progress.assert_called_once()
 
     def test_columnar_chronology_preserves_order_units_and_measurements(self):
         rows = [{"sequence_index": 0, "reps": 8, "weight_raw": 12000, "weight_kg": 12,
