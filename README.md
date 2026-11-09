@@ -305,6 +305,10 @@ an explicit configuration error rather than reverting to the previous estimate.
   make status `degraded` until a successful call. A null active model means no
   successful model call has been observed since startup, not verified availability.
   It is not exposed to the network and has no health records.
+- Temporary SQLite writer locks are retried at the worker's queue-claim boundary
+  without consuming the request. Health reports `storage_waiting` and is degraded
+  during the wait; unrelated database errors still fail explicitly. The health
+  server remains alive and returns HTTP 503 when storage cannot be read.
 
 ## Models and evaluation
 
@@ -339,7 +343,7 @@ For an existing Windows scheduled task, commit the reviewed code and deploy:
 Deployment archives the selected commit into a versioned release, runs its offline
 suite, refuses to interrupt an active model reply, stops only the bridge's confirmed
 processes, backs up private state, updates the task and waits for the release health
-endpoint. Startup failure restores the previous task action. Keep the old release
+endpoint. Startup failure restores the previous task action and triggers. Keep the old release
 and private backup for recovery; schema/data rollback requires the matching backup.
 An optional private `-BeforeStartScript` can perform an idempotent migration after
 the stopped-state backup. It receives `DataDir`, `ReleaseDir` and `PythonExe`; keep
@@ -355,6 +359,34 @@ those records before resuming coaching on an older release; never blindly restor
 a database over newly acknowledged messages.
 Raw meal/memory history is not automatically purged. Operational logs rotate with
 redaction; any broader retention/deletion policy requires a separate user decision.
+
+### Windows process recovery
+
+`run_bridge.ps1` supervises the Python worker rather than exiting when it crashes.
+An abnormal exit is logged and retried after 15 seconds, with backoff capped at
+60 seconds. A clean exit or Ctrl+C ends that launcher run. Startup errors, native
+stderr and exit codes are captured in private `logs\launcher.log`, rotated at
+5 MB with four backups and token redaction. Uncaught service errors also go to
+`logs\telegram_bridge.log`.
+
+Deployment preserves existing task triggers and adds one idempotent five-minute
+`AgBotStartIfStopped` trigger. It requires an enabled task with
+`MultipleInstances=IgnoreNew`, so a healthy running task is not restarted or
+interrupted. The task is temporarily disabled during cutover/rollback so the timer
+cannot restart a release while its state is being backed up. The original task XML
+is retained in the private deployment backup.
+
+The timer is a stopped-process safety net, not a watchdog that kills busy or hung
+requests. It does not change `WakeToRun`, power settings, managed idle policy or the
+task's Windows account. Hibernation pauses the whole machine; recovery runs when
+the machine is awake and the configured account can run the task. An interactive
+principal still requires a logged-on session, including a disconnected RDP session.
+This is not a guarantee of availability while the VM is hibernating or stopped.
+
+Use the deployment script for upgrades. For an intentional shutdown, disable the
+task first, then drain and wait for active requests/model processes before stopping
+it; otherwise the recovery trigger can start it again. Re-enable and start the
+task when maintenance is complete.
 
 Deployment runs the full suite, so install `requirements-dev.txt` (which includes
 `requirements.lock`) in the selected interpreter first. Optional voice/video

@@ -84,6 +84,48 @@ function Get-BridgeProcessTree {
     return $ownedProcesses
 }
 
+function Get-BridgeLauncher {
+    param($CapturedBridge, [string]$ExpectedArguments)
+    if ([string]::IsNullOrWhiteSpace($ExpectedArguments)) { return $null }
+    $processes = @(Get-CimInstance Win32_Process)
+    $child = $CapturedBridge
+    for ($hop = 0; $hop -lt 4; $hop++) {
+        $parent = $processes | Where-Object {
+            $_.ProcessId -eq $child.ParentProcessId -and $_.CreationDate -le $child.CreationDate
+        } | Select-Object -First 1
+        if (-not $parent) { return $null }
+        if ($parent.Name -match '^(powershell|pwsh)\.exe$' -and
+            $parent.CommandLine -and $parent.CommandLine.Contains($ExpectedArguments)) {
+            return $parent
+        }
+        # A Windows virtualenv can insert a Python forwarding process between the two.
+        if ($parent.Name -notmatch '^pythonw?\.exe$') { return $null }
+        $child = $parent
+    }
+    return $null
+}
+
+function Get-BridgeRecoveryTriggers {
+    param($Task)
+    if ([string]$Task.Settings.MultipleInstances -notin @('IgnoreNew', '2')) {
+        throw "The bot task must use IgnoreNew before enabling its start-if-stopped trigger."
+    }
+    $recovery = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(5) `
+        -RepetitionInterval (New-TimeSpan -Minutes 5)
+    $recovery.Id = 'AgBotStartIfStopped'
+    return @($Task.Triggers | Where-Object { $_.Id -ne $recovery.Id }) + @($recovery)
+}
+
+function Wait-BridgeStopped {
+    for ($attempt = 0; $attempt -lt 10; $attempt++) {
+        if (-not (Get-NetTCPConnection -LocalPort 49517 -State Listen -ErrorAction SilentlyContinue)) {
+            return
+        }
+        Start-Sleep -Milliseconds 500
+    }
+    throw "Bridge port is still occupied after shutdown; private state was not copied."
+}
+
 function Wait-BridgeDrain {
     param($CapturedBridge, [switch]$Legacy)
     for ($attempt = 0; $attempt -lt 30; $attempt++) {
@@ -158,7 +200,12 @@ if ($LASTEXITCODE -ne 0) { throw "Release compile preflight failed; running bot 
 & $PythonExe -B -m unittest discover -s (Join-Path $releaseDir "tests") -t $releaseDir
 if ($LASTEXITCODE -ne 0) { throw "Release regression suite failed; running bot unchanged." }
 $task = Get-ScheduledTask -TaskName $TaskName
+if (-not $task.Settings.Enabled) { throw "The bot task is disabled; running configuration unchanged." }
 $oldAction = $task.Actions[0]
+$oldTriggers = @($task.Triggers)
+$newTriggers = @(Get-BridgeRecoveryTriggers -Task $task)
+Export-ScheduledTask -TaskName $TaskName |
+    Set-Content -LiteralPath (Join-Path $backup "previous-task.xml") -Encoding UTF8
 [pscustomobject]@{ Execute = $oldAction.Execute; Arguments = $oldAction.Arguments;
                   WorkingDirectory = $oldAction.WorkingDirectory } |
     ConvertTo-Json | Set-Content -LiteralPath (Join-Path $backup "previous-task.json")
@@ -170,6 +217,8 @@ $oldHealth = $null
 $drainAttempted = $false
 $shutdownStarted = $false
 $legacyDrain = $false
+$taskDisabled = $false
+$oldLauncher = $null
 if ($listener) {
     $bridge = Get-CimInstance Win32_Process -Filter "ProcessId=$($listener[0].OwningProcess)"
     if (-not $bridge -or $bridge.CommandLine -notmatch 'telegram_bridge\.py') {
@@ -190,12 +239,18 @@ try {
         if (-not (Test-BridgeIdle -Health $oldHealth -Legacy:$legacyDrain) -or $owned.Count -ne 1) {
             throw "Bridge became busy before cutover; retry after drain."
         }
+        $oldLauncher = Get-BridgeLauncher -CapturedBridge $bridge -ExpectedArguments $oldAction.Arguments
     }
+    # Prevent a periodic recovery trigger from restarting the old release during cutover.
+    Disable-ScheduledTask -TaskName $TaskName | Out-Null
+    $taskDisabled = $true
     Stop-ScheduledTask -TaskName $TaskName
     $shutdownStarted = $true
+    if ($oldLauncher) { Stop-CapturedProcess -Captured $oldLauncher }
     foreach ($process in ($owned | Sort-Object CreationDate -Descending)) {
         Stop-CapturedProcess -Captured $process
     }
+    Wait-BridgeStopped
     Copy-Item -LiteralPath (Join-Path $DataDir "state") -Destination (Join-Path $backup "state") -Recurse
     Copy-Item -LiteralPath (Join-Path $DataDir "profile.md") -Destination $backup
     $envPath = Join-Path $DataDir ".env"
@@ -217,7 +272,9 @@ try {
     $arguments = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$launcher`" " +
                  "-DataDir `"$DataDir`" -PythonExe `"$PythonExe`" -Release $sha"
     $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $arguments
-    Set-ScheduledTask -TaskName $TaskName -Action $action | Out-Null
+    Set-ScheduledTask -TaskName $TaskName -Action $action -Trigger $newTriggers | Out-Null
+    Enable-ScheduledTask -TaskName $TaskName | Out-Null
+    $taskDisabled = $false
     Start-ScheduledTask -TaskName $TaskName
     $ready = $false
     for ($attempt = 0; $attempt -lt 30; $attempt++) {
@@ -237,6 +294,10 @@ try {
 } catch {
     $deploymentFailure = $_
     if (-not $shutdownStarted) {
+        if ($taskDisabled) {
+            Enable-ScheduledTask -TaskName $TaskName | Out-Null
+            $taskDisabled = $false
+        }
         if ($drainAttempted) {
             try { Resume-BridgeAdmission } catch {
                 Write-Warning "Could not clear the old bridge admission gate; POST /resume must be retried locally."
@@ -245,11 +306,17 @@ try {
         throw $deploymentFailure
     }
     try {
+        Disable-ScheduledTask -TaskName $TaskName | Out-Null
+        $taskDisabled = $true
         # Capture children before stopping their scheduled parent, which can orphan them.
         $processes = @(Get-CimInstance Win32_Process)
         $releaseScript = [regex]::Escape((Join-Path $releaseDir "telegram_bridge.py"))
         $newOwned = @($processes | Where-Object {
             $_.Name -match '^pythonw?\.exe$' -and $_.CommandLine -match $releaseScript
+        })
+        $newLaunchers = @($processes | Where-Object {
+            $_.Name -match '^(powershell|pwsh)\.exe$' -and $arguments -and
+            $_.CommandLine -and $_.CommandLine.Contains($arguments)
         })
         for ($index = 0; $index -lt $newOwned.Count; $index++) {
             $knownIds = @($newOwned.ProcessId)
@@ -258,6 +325,7 @@ try {
             })
         }
         Stop-ScheduledTask -TaskName $TaskName
+        foreach ($process in $newLaunchers) { Stop-CapturedProcess -Captured $process }
         foreach ($process in ($newOwned | Sort-Object CreationDate -Descending)) {
             Stop-CapturedProcess -Captured $process
         }
@@ -277,10 +345,14 @@ try {
                 }
             }
         } finally {
-            Set-ScheduledTask -TaskName $TaskName -Action $oldAction | Out-Null
+            Set-ScheduledTask -TaskName $TaskName -Action $oldAction -Trigger $oldTriggers | Out-Null
+            Enable-ScheduledTask -TaskName $TaskName | Out-Null
+            $taskDisabled = $false
             Start-ScheduledTask -TaskName $TaskName
         }
     }
     Write-Warning "Database state was NOT restored; additive migration compatibility is required. Matching backup: $backup"
     throw $deploymentFailure
+} finally {
+    if ($taskDisabled) { Enable-ScheduledTask -TaskName $TaskName | Out-Null }
 }

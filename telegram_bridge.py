@@ -28,6 +28,7 @@ import json
 import hashlib
 import time
 import socket
+import sqlite3
 import logging
 import tempfile
 import subprocess
@@ -193,7 +194,9 @@ class RedactingFormatter(logging.Formatter):
     def format(self, record):
         rendered = super().format(record)
         rendered = re.sub(r"bot\d+:[A-Za-z0-9_-]+", "bot[REDACTED]", rendered)
-        return re.sub(r"\b(?:gh[pousr]_[A-Za-z0-9]+|github_pat_[A-Za-z0-9_]+)\b",
+        rendered = re.sub(r"\b\d{6,}:[A-Za-z0-9_-]{20,}", "[REDACTED]", rendered)
+        rendered = re.sub(r"(?i)\bBearer\s+\S+", "Bearer [REDACTED]", rendered)
+        return re.sub(r"\b(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+)\b",
                       "[REDACTED]", rendered)
 
 
@@ -207,7 +210,7 @@ from coach_memory import MemoryStore
 from coach_nutrition import NutritionStore, parse_food, midpoint, render_receipt
 from coach_plan import TrainingStore, canonical_exercise, parse_plans, render_plans, unsupported_claims
 from coach_program import ProgramStore, build_review_evidence, parse_program_review, render_program
-from coach_runtime import RuntimeStore, SnapshotCache, message_key
+from coach_runtime import RuntimeStore, SnapshotCache, database_busy, message_key
 from coach_context import (
     compact_workouts, plan_request_scope, schedule_claim_errors, strip_schedule_rendering,
 )
@@ -225,6 +228,7 @@ _current_request = None
 _send_sequence = 0
 _generation_sequence = 0
 _worker_started = None
+_storage_waiting = False
 _last_progress = time.time()
 _stop = threading.Event()
 _delivery_lock = threading.Lock()
@@ -1668,8 +1672,7 @@ def _plan_load_errors(plans, required=()):
             recorded = observed.get(name, {}).get("recorded_sets", {})
             own_load = (isinstance(recorded.get("top_weight_kg"), (int, float))
                         and recorded["top_weight_kg"] > 0
-                        and (recorded.get("weight_basis") == move.get("weight_basis")
-                             or (name not in required and recorded.get("weight_basis") is None))
+                        and recorded.get("weight_basis") in (None, move.get("weight_basis"))
                         and move.get("weight_basis") not in (None, "unspecified"))
             basis_pattern = {"per_hand": r"\b(?:per|each) hand\b",
                              "machine_stack": r"\b(?:machine|stack)\b"}.get(move.get("weight_basis"))
@@ -1744,8 +1747,9 @@ def _program_plan_errors(plans, reports=()):
         return errors
     errors.extend(rotation_plan_errors(plans, rotation))
     for plan in plans:
-        if (plan["kind"] == "rest" or (plan.get("detail_level") == "outline"
-                                      and plan["date"] > coach_clock.today().isoformat())):
+        if ((_is_rest_or_recovery_plan(plan) and not plan.get("exercises"))
+                or (plan.get("detail_level") == "outline"
+                    and plan["date"] > coach_clock.today().isoformat())):
             continue
         template_id = plan.get("program_template_id")
         if template_id is not None and not isinstance(template_id, str):
@@ -2398,7 +2402,8 @@ def _generate_checked(prompt, source_text="", images=None, require_plan=False, s
                 p["date"] == coach_clock.today().isoformat() for p in plans):
             errors.append("today's structured SESSION_PLAN is required")
         if require_plan in (True, "today") and any(
-                p["date"] == coach_clock.today().isoformat() and p["kind"] != "rest"
+                p["date"] == coach_clock.today().isoformat()
+                and not (_is_rest_or_recovery_plan(p) and not p.get("exercises"))
                 and (p.get("detail_level") == "outline" or not p.get("exercises"))
                 and p.get("delivery") != "instructor_led"
                 for p in plans):
@@ -2566,7 +2571,8 @@ def generate_summary(auto=False):
                              show_schedule=completed_rotation, cache_scope=scope, expected_state=state)
     if text:
         current_plan = next((r for r in training_store().context()["plans"] if r["date"] == day), None)
-        if prior_plan and current_plan and prior_plan["revision"] != current_plan["revision"]:
+        if ((cached or (prior_plan and prior_plan["payload"].get("detail_level") != "outline"))
+                and prior_plan and current_plan and prior_plan["revision"] != current_plan["revision"]):
             before, after = prior_plan["payload"]["kind"], current_plan["payload"]["kind"]
             note = (f"**Plan revised: {before.title()} → {after.title()}.**"
                     if before != after else "**Today's saved plan was updated.**")
@@ -3657,23 +3663,23 @@ def maybe_hydration_reminders():
     due = hydration_slots_due(now, sent, today)
     if not due:
         return
-    logged_ml, goal_ml = _hydration_progress()
-    if logged_ml is None or goal_ml is None:
-        log.info("stage=hydration unknown intake/goal; no deficit-based nudge")
-        return
+    logged_ml, goal_ml = (_hydration_progress()
+                          if any(should for _, _, _, should in due) else (None, None))
     changed = False
     for idx, slot, hh, should in due:
-        if should and _hydration_on_pace(hh, logged_ml, goal_ml):
+        if not should:
+            log.info("Hydration %s missed window - skipping", slot)
+        elif logged_ml is None or goal_ml is None:
+            log.info("stage=hydration slot=%s unknown intake/goal; no deficit-based nudge", slot)
+        elif _hydration_on_pace(hh, logged_ml, goal_ml):
             log.info("Hydration %s skipped - on pace (%s/%s ml)", slot, logged_ml, goal_ml)
-        elif should:
+        else:
             log.info("Hydration reminder %s at %s (%s/%s ml)", slot,
                      now.strftime("%H:%M"), logged_ml, goal_ml)
             send_message(own, _hydration_nudge_text(
                 hh, logged_ml, goal_ml, HYDRATION_MESSAGES[idx % len(HYDRATION_MESSAGES)]),
                 expires_at=now.replace(hour=hh, minute=0, second=0).timestamp()
                 + HYDRATION_CATCHUP_MIN * 60)
-        else:
-            log.info("Hydration %s missed window - skipping", slot)
         sent[slot] = today
         changed = True
     if changed:
@@ -4017,8 +4023,10 @@ def _health_report():
     components = {
         "poller": _poll_progress is not None and (_draining.is_set() or now - _poll_progress < 180),
         "outbox": _publisher_progress is not None and now - _publisher_progress < 30,
-        "worker": (now - (_worker_started or _last_progress)) < max(360, COPILOT_TIMEOUT * 2 + 60),
-        "scheduler": (now - (_worker_started or _last_progress)) < max(360, COPILOT_TIMEOUT * 2 + 60),
+        "worker": not _storage_waiting and (
+            now - (_worker_started or _last_progress)) < max(360, COPILOT_TIMEOUT * 2 + 60),
+        "scheduler": not _storage_waiting and (
+            now - (_worker_started or _last_progress)) < max(360, COPILOT_TIMEOUT * 2 + 60),
     }
     report = {
         "status": ("degraded" if _llm_last_error else
@@ -4026,6 +4034,7 @@ def _health_report():
         "ready": all(components.values()) and not _llm_last_error,
         "components": components,
         "worker_busy": busy,
+        "storage_waiting": _storage_waiting,
         "scheduled_jobs_busy": _scheduled_job is not None,
         "draining": _draining.is_set(),
         "model": COPILOT_MODEL, "reasoning": COPILOT_REASONING_EFFORT,
@@ -4078,6 +4087,16 @@ def _serve_health(listener):
                                    + f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
             except (OSError, ValueError):
                 log.exception("stage=health request failed")
+            except sqlite3.Error:
+                # Health must remain observable during a storage outage.
+                log.exception("stage=health storage unavailable")
+                body = b'{"ready":false,"status":"degraded","error":"storage_unavailable"}'
+                try:
+                    connection.sendall(
+                        b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\n"
+                        + f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
+                except OSError:
+                    log.warning("stage=health client disconnected during storage failure")
 
 
 def _process_request(item):
@@ -4091,6 +4110,25 @@ def _process_request(item):
         do_images(chat_id, [_photo_file_id(m) for m in messages], caption)
     else:
         dispatch(messages[0])
+
+
+def _claim_request():
+    global _storage_waiting
+    while not _stop.is_set():
+        try:
+            item = runtime_store().claim()
+        except sqlite3.OperationalError as exc:
+            if not database_busy(exc):
+                raise
+            _storage_waiting = True
+            log.warning("stage=worker storage_busy=true; request and cursor retained; retrying in 5s")
+            _stop.wait(5)
+        else:
+            if _storage_waiting:
+                log.info("stage=worker storage_busy=false; queue access recovered")
+            _storage_waiting = False
+            return item
+    return None
 
 
 def main():
@@ -4121,7 +4159,9 @@ def main():
     jobs = (maybe_program_review, maybe_auto_summary, maybe_red_flags, maybe_post_workout, maybe_meal_reminders,
             maybe_hydration_reminders, maybe_exercise_checkins)
     while not _stop.is_set():
-        item = runtime_store().claim()
+        item = _claim_request()
+        if _stop.is_set():
+            break
         if item:
             _current_request = item["id"]
             _send_sequence = _generation_sequence = 0
@@ -4171,6 +4211,17 @@ def main():
         if _draining.is_set():
             _last_progress = time.time()
         _stop.wait(1)
+
+
+def run_service():
+    try:
+        main()
+    except KeyboardInterrupt:
+        _stop.set()
+        log.info("stage=shutdown reason=keyboard_interrupt")
+    except Exception:
+        log.exception("stage=fatal bridge exiting; launcher recovery required")
+        raise
 
 
 if __name__ == "__main__":
@@ -4264,4 +4315,4 @@ if __name__ == "__main__":
         print("---- OUTPUT ----")
         print(text)
         sys.exit(0)
-    main()
+    run_service()

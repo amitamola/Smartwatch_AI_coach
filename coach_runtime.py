@@ -16,6 +16,13 @@ class ArtifactConflictError(ValueError):
     """A stable artifact key was reused for different content."""
 
 
+def database_busy(error):
+    """Only retry SQLite lock contention, not corrupt databases or invalid SQL."""
+    code = getattr(error, "sqlite_errorcode", None)
+    return (isinstance(error, sqlite3.OperationalError) and isinstance(code, int)
+            and (code & 0xFF) in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED))
+
+
 class RuntimeStore:
     def __init__(self, path):
         self.path = str(path)

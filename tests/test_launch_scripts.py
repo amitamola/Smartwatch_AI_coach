@@ -2,6 +2,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,6 +10,67 @@ from pathlib import Path
 
 @unittest.skipUnless(os.name == "nt" and shutil.which("powershell"), "Windows launcher")
 class LauncherTests(unittest.TestCase):
+    def test_native_crash_restarts_preserve_state_and_capture_redacted_fatal_logs(self):
+        root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as folder:
+            data = Path(folder)
+            release = data / "release"
+            (release / "scripts").mkdir(parents=True)
+            shutil.copyfile(root / "scripts" / "run_bridge.ps1",
+                            release / "scripts" / "run_bridge.ps1")
+            token = "ghp_" + "synthetic" * 5
+            (release / "telegram_bridge.py").write_text(
+                "import os,sys\nfrom pathlib import Path\n"
+                "data=Path(os.environ['AGBOT_DATA_DIR'])\n"
+                "counter=data/'attempts.txt'\n"
+                "attempt=int(counter.read_text())+1 if counter.exists() else 1\n"
+                "counter.write_text(str(attempt))\n"
+                "print('synthetic stderr is not itself fatal',file=sys.stderr,flush=True)\n"
+                "if attempt==1: os._exit(7)\n"
+                f"sys.path.insert(0,{str(root)!r})\n"
+                "import telegram_bridge as bridge\n"
+                "def synthetic_main():\n"
+                f" if attempt==2: raise RuntimeError('synthetic fatal {token}')\n"
+                " print('SYNTHETIC_RECOVERY_OK',flush=True)\n"
+                "bridge.main=synthetic_main\nbridge.run_service()\n", encoding="utf-8")
+            sentinel = data / "retained-state.txt"
+            sentinel.write_text("must remain untouched", encoding="utf-8")
+            environment = dict(os.environ, AGBOT_LLM="synthetic", PYTHONIOENCODING="utf-8")
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                 str(release / "scripts" / "run_bridge.ps1"), "-DataDir", str(data),
+                 "-PythonExe", sys.executable, "-RestartDelaySeconds", "1"],
+                env=environment, capture_output=True, timeout=60)
+            self.assertEqual(result.returncode, 0, repr(result.stdout + result.stderr))
+            self.assertEqual((data / "attempts.txt").read_text(), "3")
+            self.assertEqual(sentinel.read_text(), "must remain untouched")
+            launcher = (data / "logs" / "launcher.log").read_text(encoding="utf-8-sig")
+            bridge = (data / "logs" / "telegram_bridge.log").read_text(encoding="utf-8")
+            self.assertIn("child_exit code=7", launcher)
+            self.assertIn("child_exit code=1", launcher)
+            self.assertIn("child_exit code=0", launcher)
+            self.assertIn("restarting delay_seconds=1", launcher)
+            self.assertIn("restarting delay_seconds=2", launcher)
+            self.assertIn("SYNTHETIC_RECOVERY_OK", launcher)
+            self.assertEqual(launcher.count("stage=launcher child_start"), 3)
+            self.assertIn("stage=fatal", bridge)
+            self.assertIn("Traceback", bridge)
+            self.assertNotIn(token, launcher + bridge)
+            self.assertNotIn(token.encode(), result.stdout + result.stderr)
+
+    def test_missing_explicit_interpreter_is_logged_without_silent_fallback(self):
+        root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as folder:
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                 str(root / "scripts" / "run_bridge.ps1"), "-DataDir", folder,
+                 "-PythonExe", str(Path(folder) / "missing-python.exe")],
+                capture_output=True, timeout=30)
+            self.assertNotEqual(result.returncode, 0)
+            log = (Path(folder) / "logs" / "launcher.log").read_text(encoding="utf-8-sig")
+            self.assertIn("stage=launcher fatal=Configured Python interpreter not found", log)
+            self.assertNotIn("child_start", log)
+
     def test_explicit_deployment_values_override_private_env(self):
         root = Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as folder:
@@ -249,6 +311,110 @@ $drainAttempted = $false
 $script:requests = @()
 try { Invoke-Expression $catchScript } catch {}
 if ($script:requests.Count) { throw 'Legacy abort sent an unsupported resume request.' }
+exit 0
+"""
+        environment = dict(os.environ, AGBOT_DEPLOY_TEST_SCRIPT=
+                           str(root / "scripts" / "deploy.ps1"))
+        result = subprocess.run(["powershell", "-NoProfile", "-Command", script],
+                                env=environment, capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_recovery_trigger_and_launcher_ownership_preserve_existing_configuration(self):
+        root = Path(__file__).resolve().parents[1]
+        script = r"""
+$ErrorActionPreference = 'Stop'
+$tokens = $null
+$errorsFound = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile(
+    $env:AGBOT_DEPLOY_TEST_SCRIPT, [ref]$tokens, [ref]$errorsFound)
+if ($errorsFound.Count) { throw 'Deployment script did not parse.' }
+foreach ($name in @('Get-BridgeRecoveryTriggers','Get-BridgeLauncher')) {
+    $definition = $ast.Find({
+        param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
+    }, $true)
+    Invoke-Expression $definition.Extent.Text
+}
+$logon = New-ScheduledTaskTrigger -AtLogOn
+$logon.Id = 'original-logon'
+$prior = New-ScheduledTaskTrigger -Once -At (Get-Date).AddHours(1)
+$prior.Id = 'AgBotStartIfStopped'
+$task = [pscustomobject]@{
+    Settings=[pscustomobject]@{MultipleInstances='IgnoreNew';WakeToRun=$false}
+    Triggers=@($logon,$prior)
+}
+$triggers = @(Get-BridgeRecoveryTriggers $task)
+if ($triggers.Count -ne 2) { throw 'Existing triggers lost or duplicated.' }
+$guard = @($triggers | Where-Object { $_.Id -eq 'AgBotStartIfStopped' })
+if ($guard.Count -ne 1 -or $guard[0].Repetition.Interval -ne 'PT5M') { throw 'Incorrect recovery interval.' }
+if ($guard[0].Repetition.Duration) { throw 'Recovery unexpectedly expires.' }
+if ($triggers[0].Id -ne 'original-logon' -or $task.Settings.WakeToRun) { throw 'Original task policy changed.' }
+$task.Triggers = $triggers
+if (@(Get-BridgeRecoveryTriggers $task).Count -ne 2) { throw 'Recovery setup is not idempotent.' }
+$task.Settings.MultipleInstances = 'Parallel'
+$caught = $false
+try { Get-BridgeRecoveryTriggers $task } catch { $caught = $true }
+if (-not $caught) { throw 'Parallel task instances allowed.' }
+
+$expected = '-File "C:\synthetic\run_bridge.ps1" -DataDir "C:\synthetic-data"'
+$bridge = [pscustomobject]@{ProcessId=30;ParentProcessId=20;CreationDate=3;Name='python.exe'}
+$shim = [pscustomobject]@{ProcessId=20;ParentProcessId=10;CreationDate=2;Name='python.exe'}
+$script:launcher = [pscustomobject]@{
+    ProcessId=10;ParentProcessId=1;CreationDate=1;Name='powershell.exe';CommandLine="powershell $expected"
+}
+$other = [pscustomobject]@{
+    ProcessId=99;ParentProcessId=1;CreationDate=1;Name='powershell.exe';CommandLine="powershell $expected"
+}
+function Get-CimInstance { param($ClassName) @($bridge,$shim,$script:launcher,$other) }
+if ((Get-BridgeLauncher $bridge $expected).ProcessId -ne 10) { throw 'Wrong launcher selected.' }
+$script:launcher.CommandLine = 'powershell -File unrelated.ps1'
+if (Get-BridgeLauncher $bridge $expected) { throw 'Unrelated launcher selected.' }
+exit 0
+"""
+        environment = dict(os.environ, AGBOT_DEPLOY_TEST_SCRIPT=
+                           str(root / "scripts" / "deploy.ps1"))
+        result = subprocess.run(["powershell", "-NoProfile", "-Command", script],
+                                env=environment, capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_failed_cutover_disables_recovery_then_restores_original_triggers(self):
+        root = Path(__file__).resolve().parents[1]
+        script = r"""
+$ErrorActionPreference = 'Stop'
+$tokens = $null
+$errorsFound = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile(
+    $env:AGBOT_DEPLOY_TEST_SCRIPT, [ref]$tokens, [ref]$errorsFound)
+$deploymentTry = @($ast.EndBlock.Statements | Where-Object {
+    $_ -is [System.Management.Automation.Language.TryStatementAst]
+})[0]
+$catchScript = "try { throw 'synthetic boot failure' } " + $deploymentTry.CatchClauses[0].Extent.Text
+$shutdownStarted = $true
+$prepared = $false
+$TaskName = 'SyntheticBotOnly'
+$releaseDir = 'C:\synthetic-release'
+$backup = 'C:\synthetic-backup'
+$arguments = '-File synthetic.ps1'
+$oldAction = [pscustomobject]@{Arguments='old-action'}
+$oldTriggers = @([pscustomobject]@{Id='old-trigger'})
+$script:events = @()
+function Get-CimInstance { param($ClassName) @() }
+function Disable-ScheduledTask { param($TaskName) $script:events += 'disable' }
+function Stop-ScheduledTask { param($TaskName) $script:events += 'stop' }
+function Enable-ScheduledTask { param($TaskName) $script:events += 'enable' }
+function Start-ScheduledTask { param($TaskName) $script:events += 'start' }
+function Set-ScheduledTask {
+    param($TaskName,$Action,$Trigger)
+    if ($Action.Arguments -ne 'old-action' -or @($Trigger).Count -ne 1 -or
+        $Trigger[0].Id -ne 'old-trigger') { throw 'Original configuration not restored.' }
+    $script:events += 'restore'
+}
+$caught = $false
+try { Invoke-Expression $catchScript } catch { $caught = $_.Exception.Message -eq 'synthetic boot failure' }
+if (-not $caught) { throw 'Original failure was lost.' }
+if (($script:events -join ',') -ne 'disable,stop,restore,enable,start') {
+    throw "Unsafe rollback order: $($script:events -join ',')"
+}
 exit 0
 """
         environment = dict(os.environ, AGBOT_DEPLOY_TEST_SCRIPT=

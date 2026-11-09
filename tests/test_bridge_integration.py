@@ -3,8 +3,11 @@ import importlib
 import json
 import logging
 import os
+import sqlite3
 import tempfile
+import threading
 import unittest
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -40,6 +43,7 @@ class BridgeTests(unittest.TestCase):
         b._llm_last_outage = False
         b._poll_progress = b._publisher_progress = b._last_progress = b.time.time()
         b._worker_started = b._request_deadline = b._scheduled_job = None
+        b._storage_waiting = False
         b._draining.clear()
         for name, value in (("COPILOT_MODEL", "primary-test"), ("COPILOT_FALLBACK_MODELS", ()),
                             ("PROGRAM_ENABLED", False)):
@@ -60,6 +64,71 @@ class BridgeTests(unittest.TestCase):
                 "objective": "Planned recovery", "reason": "User's agreed schedule",
                 "exercises": []}
         return "A recovery day is planned.\n[[SESSION_PLAN: " + json.dumps(plan) + "]]"
+
+    def test_worker_recovers_after_real_sqlite_writer_lock_without_consuming_request(self):
+        b = self.bridge
+        store = b.runtime_store()
+        store.ingest([{"update_id": 1, "message": {"chat": {"id": 123}, "text": "synthetic"}}])
+        holder = sqlite3.connect(store.path)
+        self.addCleanup(holder.close)
+        holder.execute("BEGIN IMMEDIATE")
+
+        @contextmanager
+        def immediate_connection():
+            db = sqlite3.connect(store.path, timeout=0)
+            db.row_factory = sqlite3.Row
+            try:
+                with db:
+                    yield db
+            finally:
+                db.close()
+
+        def unlock(_delay):
+            self.assertTrue(b._storage_waiting)
+            self.assertFalse(b._health_report()["ready"])
+            self.assertEqual(holder.execute("SELECT attempts FROM inbox").fetchone()[0], 0)
+            holder.commit()
+
+        with patch.object(store, "connection", immediate_connection), \
+                patch.object(b._stop, "wait", side_effect=unlock) as wait:
+            item = b._claim_request()
+        wait.assert_called_once_with(5)
+        self.assertEqual(item["id"], "update:1")
+        self.assertEqual(item["attempts"], 1)
+        self.assertFalse(b._storage_waiting)
+        self.assertTrue(b._health_report()["ready"])
+        self.assertEqual(store.offset(), 2)
+
+    def test_worker_does_not_hide_unrelated_sql_errors_or_retry_after_shutdown(self):
+        b = self.bridge
+        store = b.runtime_store()
+        with patch.object(store, "claim", side_effect=sqlite3.OperationalError("invalid SQL")), \
+                patch.object(b._stop, "wait") as wait, self.assertRaises(sqlite3.OperationalError):
+            b._claim_request()
+        wait.assert_not_called()
+        busy = sqlite3.OperationalError("synthetic writer lock")
+        busy.sqlite_errorcode = sqlite3.SQLITE_BUSY
+        stop = threading.Event()
+        with patch.object(b, "_stop", stop), \
+                patch.object(store, "claim", side_effect=busy) as claim, \
+                patch.object(stop, "wait", side_effect=lambda _: stop.set()):
+            self.assertIsNone(b._claim_request())
+        claim.assert_called_once()
+
+    def test_health_endpoint_survives_storage_error_and_reports_unready(self):
+        b = self.bridge
+        connection = unittest.mock.MagicMock()
+        connection.__enter__.return_value = connection
+        connection.recv.return_value = b"GET /health HTTP/1.1\r\n\r\n"
+        listener = unittest.mock.Mock()
+        listener.accept.return_value = (connection, ("127.0.0.1", 1))
+        with patch.object(b._stop, "is_set", side_effect=[False, True]), \
+                patch.object(b, "_health_report", side_effect=sqlite3.OperationalError("busy")):
+            b._serve_health(listener)
+        sent = connection.sendall.call_args.args[0]
+        self.assertIn(b"503 Service Unavailable", sent)
+        self.assertIn(b'"ready":false', sent)
+        self.assertIn(b"storage_unavailable", sent)
 
     def food_reply(self, source="I ate fruit and yogurt.", day=None, replaces=None):
         meal = {"date": day or date.today().isoformat(), "source_quote": source,
@@ -993,6 +1062,27 @@ class BridgeTests(unittest.TestCase):
         self.assertTrue(b._program_plan_errors([plan]))
         plan["exercises"][0]["sets"][0]["weight_kg"] = None
         self.assertEqual(b._program_plan_errors([plan]), [])
+        b.training_store().record_activities([{
+            "activity_id": "curl-1", "start": date.today().isoformat(),
+            "type": "strength_training",
+            "logged_sets": [{"exercise": "Dumbbell Biceps Curl", "sets": 2,
+                             "reps": "10", "top_weight_kg": 8.0}]}])
+        observed_required = {"exercises": [{"name": "Dumbbell Biceps Curl",
+                                            "weight_basis": "per_hand",
+                                            "sets": [{"weight_kg": 8}]}]}
+        self.assertEqual(b._plan_load_errors([observed_required], required={"dumbbell biceps curl"}), [])
+
+    def test_hydration_unknown_intake_marks_slot_without_minute_by_minute_polling(self):
+        b = self.bridge
+        morning = datetime.now().astimezone().replace(hour=8, minute=10, second=0, microsecond=0)
+        with patch.object(b, "owner", return_value="123"), \
+                patch.object(b, "_reminders_allowed", return_value=True), \
+                patch.object(b.coach_clock, "now", return_value=morning), \
+                patch.object(b.coach_clock, "today", return_value=morning.date()), \
+                patch.object(b, "_hydration_progress", return_value=(None, None)) as progress:
+            b.maybe_hydration_reminders()
+            b.maybe_hydration_reminders()
+        progress.assert_called_once()
 
     def test_columnar_chronology_preserves_order_units_and_measurements(self):
         rows = [{"sequence_index": 0, "reps": 8, "weight_raw": 12000, "weight_kg": 12,
