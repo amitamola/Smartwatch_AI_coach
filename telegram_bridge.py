@@ -1496,6 +1496,9 @@ def ensure_program_review(force=False):
         context = store.context(fingerprint=fingerprint)
     if not force and not context["review_due"]:
         return None
+    if not force and _scheduled_job and runtime_store().counts().get("inbox", {}).get("pending", 0) > 0:
+        log.info("stage=program_review deferred; pending user message takes priority")
+        return None
     snapshot = get_snapshot()
     if (not isinstance(snapshot, dict) or "__error__" in snapshot
             or snapshot.get("snapshot_cache", {}).get("stale")):
@@ -1503,6 +1506,9 @@ def ensure_program_review(force=False):
         return None
     history = garmin_coach.program_history()
     training_store().record_activities(history["activities"])
+    if not force and _scheduled_job and runtime_store().counts().get("inbox", {}).get("pending", 0) > 0:
+        log.info("stage=program_review deferred after history fetch; pending user message takes priority")
+        return None
     _rotation_context()
     training = _program_training_context()
     evidence = build_review_evidence(training, records, profile)
@@ -2274,6 +2280,10 @@ _COMPLETION_VERB_RE = re.compile(
     r"|(?:did|done)\s+(?:that|it|the|my|this|yesterday'?s|today'?s|all)\b"
     r"|(?:was|is|were|counts\s+as)\s+(?:that|the|my|indeed)\s+"
     r"(?:planned\s+|pending\s+|prescribed\s+)?(?:session|workout|run|running|ride|riding|bike|biking|cycling|exercise|training)\b"
+    r"|(?:session|workout|run|running|ride|riding|bike|biking|cycling|exercise|training)\s+"
+    r"(?:felt|went|was)\s+(?:good|great|easy|hard|tough|fine|alright|ok|okay|well|smooth|"
+    r"comfortable|solid|strong|light|heavy|manageable|difficult)\b"
+    r"|(?:did|added|performed)\s+(?:(?:a\s+)?little\s+|some\s+|more\s+|\d+\s*)?(?:reps?|sets?|kg|lbs?)\b"
     r"|ran|rode|cycled|biked|walked|swam|rowed|lifted|trained|worked\s+out|exercised"
     r")\b",
     re.I,
@@ -4000,6 +4010,13 @@ def _poll_messages():
             log.warning("stage=poll reconnecting error_type=%s; cursor retained", type(exc).__name__)
             _stop.wait(delay)
             delay = min(60, delay * 2)
+        except sqlite3.OperationalError as exc:
+            if database_busy(exc):
+                log.warning("stage=poll storage_busy=true; cursor retained; retrying")
+            else:
+                log.exception("stage=poll failed; durable cursor retained")
+            _stop.wait(delay)
+            delay = min(60, delay * 2)
         except Exception:
             log.exception("stage=poll failed; durable cursor retained")
             _stop.wait(delay)
@@ -4012,6 +4029,11 @@ def _publish_messages():
         try:
             flush_outbox()
             _publisher_progress = time.time()
+        except sqlite3.OperationalError as exc:
+            if database_busy(exc):
+                log.warning("stage=outbox storage_busy=true; pending messages retained")
+            else:
+                log.exception("stage=outbox failed; pending messages retained")
         except Exception:
             log.exception("stage=outbox failed; pending messages retained")
         _stop.wait(2)
@@ -4191,7 +4213,9 @@ def main():
                 _request_deadline = None
                 _last_progress = time.time()
             continue
-        if not _draining.is_set() and time.time() >= next_schedule:
+        if (not _draining.is_set() and time.time() >= next_schedule
+                and _poll_progress is not None
+                and time.time() - _poll_progress <= POLL_TIMEOUT + 20):
             _set_msg_sent_at(None)
             job = jobs[job_index]
             _scheduled_job = job.__name__

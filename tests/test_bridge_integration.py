@@ -1084,6 +1084,16 @@ class BridgeTests(unittest.TestCase):
             b.maybe_hydration_reminders()
         progress.assert_called_once()
 
+    def test_background_program_review_yields_to_pending_user_messages(self):
+        b = self.bridge
+        b.runtime_store().ingest([{"update_id": 1, "message": {"chat": {"id": 123}, "text": "GMS"}}])
+        with patch.object(b, "PROGRAM_ENABLED", True), \
+                patch.object(b, "_scheduled_job", "maybe_program_review"), \
+                patch.object(b.program_store(), "context", return_value={"review_due": True}), \
+                patch.object(b, "get_snapshot") as snap:
+            self.assertIsNone(b.ensure_program_review(force=False))
+        snap.assert_not_called()
+
     def test_columnar_chronology_preserves_order_units_and_measurements(self):
         rows = [{"sequence_index": 0, "reps": 8, "weight_raw": 12000, "weight_kg": 12,
                  "weight_unit_source": "recorded", "set_type": "active"},
@@ -1125,6 +1135,8 @@ class BridgeTests(unittest.TestCase):
         valid_cases = [
             ("Yes yesterday's run was that session and it felt great",
              "Yes yesterday's run was that session", ""),
+            ("Yesterday's session felt good and easy. It was little difficult to do 10kg of biceps dumbell curl",
+             "Yesterday's session felt good and easy.", ""),
             ("I infact did that after confirming with the bot here that it's too cold outside, "
              "can i do running inside in the gym",
              "I infact did that after confirming with the bot here that it's too cold outside, "
