@@ -2280,6 +2280,10 @@ _COMPLETION_VERB_RE = re.compile(
     r"|(?:did|done)\s+(?:that|it|the|my|this|yesterday'?s|today'?s|all)\b"
     r"|(?:was|is|were|counts\s+as)\s+(?:that|the|my|indeed)\s+"
     r"(?:planned\s+|pending\s+|prescribed\s+)?(?:session|workout|run|running|ride|riding|bike|biking|cycling|exercise|training)\b"
+    r"|(?:session|workout|run|running|ride|riding|bike|biking|cycling|exercise|training)\s+"
+    r"(?:felt|went|was)\s+(?:good|great|easy|hard|tough|fine|alright|ok|okay|well|smooth|"
+    r"comfortable|solid|strong|light|heavy|manageable|difficult)\b"
+    r"|(?:did|added|performed)\s+(?:(?:a\s+)?little\s+|some\s+|more\s+|\d+\s*)?(?:reps?|sets?|kg|lbs?)\b"
     r"|ran|rode|cycled|biked|walked|swam|rowed|lifted|trained|worked\s+out|exercised"
     r")\b",
     re.I,

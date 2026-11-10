@@ -1135,6 +1135,8 @@ class BridgeTests(unittest.TestCase):
         valid_cases = [
             ("Yes yesterday's run was that session and it felt great",
              "Yes yesterday's run was that session", ""),
+            ("Yesterday's session felt good and easy. It was little difficult to do 10kg of biceps dumbell curl",
+             "Yesterday's session felt good and easy.", ""),
             ("I infact did that after confirming with the bot here that it's too cold outside, "
              "can i do running inside in the gym",
              "I infact did that after confirming with the bot here that it's too cold outside, "
